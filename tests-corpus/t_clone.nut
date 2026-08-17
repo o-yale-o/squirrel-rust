@@ -1,0 +1,13 @@
+local t = { a = 1, b = [1,2,3] };
+local c = clone(t);
+c.a = 99;
+print(t.a + " " + c.a + "\n");
+local a2 = clone(t.b);
+a2.append(4);
+print(t.b.len() + " " + a2.len() + "\n");
+t.c <- 5;
+print("c" in t); print(" ");
+print("z" in t); print("\n");
+delete t.c;
+print("c" in t); print("\n");
+print(delete t.a + "\n");

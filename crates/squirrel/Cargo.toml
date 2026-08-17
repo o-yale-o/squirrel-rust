@@ -1,0 +1,8 @@
+[package]
+name = "squirrel"
+description = "Squirrel 3.2 scripting language engine, faithfully ported from the C++ reference implementation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

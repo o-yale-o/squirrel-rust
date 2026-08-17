@@ -1,0 +1,11 @@
+print(format("%d %i %s", 42, -7, "str") + "\n");
+print(format("%5d|%-5d|", 42, 42) + "\n");
+print(format("%05d", 42) + "\n");
+print(format("%x %X %o", 255, 255, 8) + "\n");
+print(format("%f", 3.14159) + "\n");
+print(format("%.2f", 3.14159) + "\n");
+print(format("%e", 12345.678) + "\n");
+print(format("%g", 0.00001234) + "\n");
+print(format("%c%c%c", 72, 105, 33) + "\n");
+print(format("%.3s", "abcdef") + "\n");
+printf("%s=%d\n", "x", 99);

@@ -1,0 +1,11 @@
+print(9223372036854775807 + 1); print("\n");
+print(-9223372036854775807 - 2); print("\n");
+print(7 / 2); print(" ");
+print(-7 / 2); print(" ");
+print(7 % 3); print(" ");
+print(-7 % 3); print("\n");
+print(1 << 10); print(" ");
+print(-8 >> 1); print(" ");
+print(-1 >>> 60); print(" ");
+print(0xFF ^ 0x0F); print(" ");
+print(~0); print("\n");

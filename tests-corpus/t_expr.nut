@@ -1,0 +1,16 @@
+local x = 5;
+x += 3; print(x + " ");
+x -= 2; print(x + " ");
+x *= 2; print(x + " ");
+x /= 3; print(x + " ");
+x %= 4; print(x + "\n");
+local i = 5;
+print(i++ + " ");
+print(i + " ");
+print(++i + " ");
+print(i-- + " ");
+print(i + "\n");
+local t = { n = 1 };
+t.n += 10; print(t.n + "\n");
+local a = [1];
+a[0] += 5; print(a[0] + "\n");

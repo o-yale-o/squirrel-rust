@@ -1,0 +1,12 @@
+local parent = {};
+parent.greet <- function() { return "hello"; };
+parent.val <- 10;
+local d = {};
+d.setdelegate(parent);
+print(d.greet() + "\n");
+print(d.val + "\n");
+d.val = 20;
+print(parent.val + "\n");
+print(d.rawin("val") + " ");
+print(d.rawin("greet") + "\n");
+print(d.getdelegate() == parent);

@@ -1,0 +1,9 @@
+[package]
+name = "squirrel-stdlib"
+description = "Standard library for the Squirrel Rust engine (math, string+regex, io+blob, system, aux)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+squirrel = { path = "../squirrel" }
