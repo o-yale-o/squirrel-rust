@@ -80,7 +80,8 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 | `baselib` | sqbaselib.cpp | base 库 + 11 张默认委托表 |
 | `serialization` | sqobject.cpp Save/Load | .cnut 读写（字节级兼容） |
 | `cformat` | — | CRT `%g/%f/%e` 兼容格式化 |
-| squirrel-stdlib | sqstdlib/* | math/system/io/string/blob/aux + 正则（含 `\m` 平衡匹配等扩展） |
+| squirrel-stdlib | sqstdlib/* | math/system/io/string/aux + 正则（含 `\m` 平衡匹配等扩展） |
+| squirrel-stdlib `stream` | sqstdstream/blob/file | `stream` 基类（readblob/readn/writeblob/writen/seek/tell/len/eos/flush）、`blob`（resize/swap2/swap4/索引/foreach/clone）、`file`（构造/close + stdout/stderr/stdin 实例） |
 | sq (bin) | sq/sq.c | CLI + REPL |
 
 ## 与 C++ 的关键差异（语义保持，实现不同）
@@ -102,6 +103,6 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 
 ## 已知限制
 
-- `file`/`stream` 类仅注册了骨架（readblob/writen 等待补全）；
 - `getstackinfos` 的 LOCALS 输出为简化格式；
-- `sqstd_loadfile` 的 UTF-8 BOM/UCS2 嗅探未实现（.cnut 嗅探已实现）。
+- `sqstd_loadfile` 的 UTF-8 BOM/UCS2 嗅探未实现（.cnut 嗅探已实现）；
+- `file` 的 stdin 读取为行缓冲近似（CRT 是完全缓冲，交互式逐字节读有差异）。

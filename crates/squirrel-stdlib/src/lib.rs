@@ -3,6 +3,7 @@
 //! 原生函数直接操作 `&mut VmData`（与 baselib 相同的方式）。
 
 pub mod regex;
+pub mod stream;
 
 use std::rc::Rc;
 
@@ -341,30 +342,21 @@ pub fn register_iolib(vm: &mut VmData) {
     reg_global(&ss, &root, "dofile", Rc::new(io_dofile), -2, Some(".sb"));
     reg_global(&ss, &root, "writeclosuretofile", Rc::new(io_writeclosuretofile), 3, Some("cs"));
 
-    // file 类（基于 userdata 持有 File 句柄）
-    let file_class = make_file_class(&ss);
-    let key = ss.intern(b"file");
-    root.borrow_mut().new_slot(&key, &file_class);
+    // ↔ declare_stream：stream 基类 + file/blob 派生类（含全部方法）
+    let (_stream_cls, file_cls, _blob_cls) = crate::stream::declare_stream_classes(vm);
 
-    // stdout/stderr/stdin
+    // ↔ sqstd_createfile(stdout/stdin/stderr)
     for (name, fd) in [("stdout", 1u8), ("stderr", 2u8), ("stdin", 0u8)] {
-        let inst = make_stream_instance(&ss, &file_class, StreamHandle::Fd(fd));
+        crate::stream::push_file_instance(vm, &file_cls, fd);
+        let inst = v_take(vm);
         let key = ss.intern(name.as_bytes());
         root.borrow_mut().new_slot(&key, &inst);
     }
-
-    // stream 基类（读 blob/readn 等）
-    let stream_class = make_stream_class(&ss);
-    let key = ss.intern(b"stream");
-    root.borrow_mut().new_slot(&key, &stream_class);
-    STREAM_CLASS.with(|c| *c.borrow_mut() = Some(match &stream_class {
-        Value::Table(t) => t.clone(),
-        _ => unreachable!(),
-    }));
 }
 
-thread_local! {
-    static STREAM_CLASS: std::cell::RefCell<Option<TableRef>> = const { std::cell::RefCell::new(None) };
+/// 取栈顶并弹出（注册辅助）
+fn v_take(vm: &mut VmData) -> Value {
+    vm.pop_get()
 }
 
 /// ↔ sqstd_loadfile：读文件 → 嗅探（.cnut/BOM 暂不支持）→ 编译 → 压栈闭包
@@ -455,73 +447,6 @@ fn io_writeclosuretofile(v: &mut VmData) -> SQInteger {
     } else {
         throw_error(v, "closure expected")
     }
-}
-
-// ---------------------------------------------------------------------------
-// stream/file 基础设施（Rust 用 userdata 持有 StreamHandle）
-// ---------------------------------------------------------------------------
-
-pub enum StreamHandle {
-    Fd(u8),
-    File(std::cell::RefCell<Option<std::fs::File>>),
-    Buffer(std::cell::RefCell<std::io::Cursor<Vec<u8>>>),
-}
-
-pub struct StreamData {
-    pub handle: StreamHandle,
-    pub eof: bool,
-}
-
-fn make_stream_instance(ss: &Rc<SharedState>, file_class: &Value, handle: StreamHandle) -> Value {
-    let ud = squirrel::userdata::SQUserData::create(ss, 0);
-    // 用 userdata 的 delegate 挂 file 类方法表；数据放在 typetag 指向的 Rc
-    let rc_data: Rc<std::cell::RefCell<StreamData>> = Rc::new(std::cell::RefCell::new(StreamData {
-        handle,
-        eof: false,
-    }));
-    STREAMS.with(|s| {
-        let mut b = s.borrow_mut();
-        b.push(rc_data.clone());
-        let id = b.len() - 1;
-        ud.borrow_mut().typetag = id;
-    });
-    if let Value::Table(fc) = file_class {
-        let m = fc.borrow().get(&ss.intern(b"__methods"));
-        if let Some(Value::Table(mt)) = m {
-            ud.borrow_mut().delegate = Some(mt);
-        }
-    }
-    Value::Userdata(ud)
-}
-
-thread_local! {
-    static STREAMS: std::cell::RefCell<Vec<Rc<std::cell::RefCell<StreamData>>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-
-fn make_file_class(ss: &Rc<SharedState>) -> Value {
-    let t = squirrel::table::SQTable::create(ss, 8);
-    reg_stream_methods(ss, &t);
-    Value::Table(t)
-}
-
-fn make_stream_class(ss: &Rc<SharedState>) -> Value {
-    let t = squirrel::table::SQTable::create(ss, 8);
-    reg_stream_methods(ss, &t);
-    Value::Table(t)
-}
-
-fn reg_stream_methods(ss: &Rc<SharedState>, t: &TableRef) {
-    let _ = ss;
-    // M9 后续：readblob/readn/writeblob/writen/seek/tell/len/eos/flush
-    t.borrow_mut().new_slot(&ss.intern(b"_typeof"), &{
-        let f: squirrel::closure::NativeFn = Rc::new(|v: &mut VmData| {
-            v.push(v.ss.intern(b"file"));
-            1
-        });
-        Value::NativeClosure(squirrel::closure::SQNativeClosure::create(ss, f, 1))
-    });
 }
 
 // ===========================================================================
