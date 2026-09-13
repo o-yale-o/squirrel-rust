@@ -28,9 +28,36 @@ print("eos=" + (f.eos() != null) + "\n");
 f.close();
 remove("diff_test_data.bin");
 
-// ---- 文件句柄共享模式：暂不对齐（见 TODO.md P14 的第二个子问题）----
-// 参考实现的 fopen 不含 FILE_SHARE_DELETE（句柄开着时 remove() 失败），我们这边
-// Rust 默认三种共享齐全（开着也能删）。P14 的注册表滞留已修，但还发现"实例可能在
-// 作用域结束前就被释放"（函数里 `local a = file(p,"wb+"); return try_remove(p);`
-// 我们给 ok、参考给 failed；中间加一次 a.len() 就两边一致），查清之前不打开 share-delete。
-print("share_note=deferred\n");
+// ---- 文件句柄共享模式（↔ CRT fopen 用 _SH_DENYNO，不含 FILE_SHARE_DELETE）----
+// 句柄开着时删不掉文件；Rust 的 std::fs::File 默认三种共享齐全（开着也能删），
+// 已显式去掉 share-delete（前提：后端随实例死亡释放，见 stream.rs 的 bind_backend_inst）。
+// 注意这里刻意**不用尾调用**：`return try_remove(p);` 在我们这边会把当前帧的局部提前释放
+// （参考实现保留到帧弹出），那是 TODO.md P14 子问题 2 的残留差异，别混进这条语料。
+class SubFile extends file { constructor(p, m) { base.constructor(p, m); } }
+function try_remove(p) { try { remove(p); return "ok"; } catch (e) { return "E:" + e; } }
+
+local h1 = file("diff_test_share.bin", "wb+");
+local h2 = file("diff_test_share.bin", "wb+");
+print("share_remove_while_open=" + try_remove("diff_test_share.bin") + "\n");
+h1.close();
+print("share_remove_after_one_close=" + try_remove("diff_test_share.bin") + "\n");
+h2.close();
+print("share_remove_after_all_close=" + try_remove("diff_test_share.bin") + "\n");
+
+// 同名 local 重复声明：旧值仍被旧槽持有（帧弹出才释放），所以同样删不掉。
+// 放进函数里、返回时帧弹出、句柄释放，顶层才删得掉（写在顶层的话顶层帧一直活着）。
+function shadow_case() {
+    local sh = SubFile("diff_test_share2.bin", "wb+");
+    local sh = SubFile("diff_test_share2.bin", "wb+");
+    local r = try_remove("diff_test_share2.bin");
+    return r;
+}
+print("shadow_remove_while_open=" + shadow_case() + "\n");
+
+// 用例结束（帧弹出、句柄释放）后清理，保证跑完不留文件
+function cleanup_share() {
+    local a = try_remove("diff_test_share.bin");
+    local b = try_remove("diff_test_share2.bin");
+    return "" + a + b;
+}
+print("share_cleanup=" + cleanup_share() + "\n");

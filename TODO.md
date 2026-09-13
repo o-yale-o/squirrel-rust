@@ -49,18 +49,18 @@ file/blob/stream 后端都被永久持有**：没显式 `close()` 的实例活�
 
 **子问题 1（已修）**：不可达实例的句柄何时释放 —— 见上，现在与参考实现一致。
 
-**子问题 2（待查）**：文件句柄共享模式仍**未对齐**。参考实现的 `fopen` 用 `_SH_DENYNO`
-（不含 `FILE_SHARE_DELETE`）→ 句柄开着时 `remove()` 失败；Rust 的 `std::fs::File` 默认三种
-共享齐全（开着也能删）。本轮试过显式 `share_mode(FILE_SHARE_READ|WRITE)`：探针 a/b/c/d/e
-四种组合全部对齐 ✓、语料也全绿 ✓，但随后发现**我们的实例可能"在作用域结束前"就被释放**：
+**子问题 2（已定位到具体形态，待修）**：文件句柄共享模式已**对齐**（`share_mode(FILE_SHARE_READ|WRITE)`，
+滞留修复之后 12 项回归全绿）。但顺带发现一处更深的差异：**尾调用会提前释放当前帧的局部**。
 
-    函数里 `local a = file(p,"wb+"); return try_remove(p);`
+    函数里 `local a = file(p,"wb+"); return try_remove(p);`      ← `return f(x)` 是尾调用
       我们 → remove=ok（句柄已关），参考 → remove() failed（句柄还开着）
-    中间加一次 `a.len()` 或 `a.tell()` → 两边一致（都 failed）
+    改成 `local r = try_remove(p); return r;`（非尾调用）→ 两边一致（都 failed）
+    同一函数里再插一句 `a.len()` 或 `a.tell()`，两边也一致
 
-也就是说打开 share-delete 限制会让这类脚本**反而**偏离参考实现，所以又回退了。下一步要查：
-为什么"创建后没有别的操作"的实例会被提前释放（GC 标记是遍历实例成员的 ✓、注册表滞留也修了 ✓，
-所以更像编译期/运行期的**槽位生命周期**问题：最后一次使用之后到帧弹出之间，谁把它释放了）。
+已排除的：`enter_frame` 的 tailcall 分支**没有**清任何槽（只更新 stackbase/top 与 ncalls）；
+参考实现的 `_OP_TAILCALL` 用的基址也是 `_stackbase`（和我们一样），参数也同样是搬到自己槽位。
+所以释放点还在别处（`start_call`/`close_outers`/`last_top` 的某一步），下一步继续查。
+语料 `t_file.nut` 刻意回避这一格（用非尾调用写法），避免把已知差异混进语料。
 
 
 >

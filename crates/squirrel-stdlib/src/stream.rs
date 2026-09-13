@@ -295,6 +295,13 @@ impl FileBackend {
         // （证据：函数里 `local a = file(p,"wb+"); return try_remove(p);` 我们给 ok、
         // 参考给 failed；中间加一次 `a.len()` 就两边一致）—— 那是下一个要查的点，
         // 在此之前去掉 share-delete 会让这类脚本行为反而偏离参考实现。
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
         match opts.open(filename) {
             Ok(f) => Some(FileBackend {
                 handle: Some(Rc::new(RefCell::new(f))),
