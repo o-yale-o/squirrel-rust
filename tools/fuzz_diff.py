@@ -382,9 +382,15 @@ def run(exe, path):
     """跑一个脚本；超时按"死循环"处理（变异会把有界循环改成死循环，实测踩到过）。
 
     超时必须是**可分类的结果**而不是异常：否则整轮扫描会直接崩在中间。
+
+    **cwd 一定用私有目录 WORK，不能用仓库根目录**：变异会把字符串字面量换成别的值，
+    如果那处恰好是文件路径，就会在 cwd 里建出文件来（实测在仓库根目录留下过一个
+    名为 `abc` 的空文件）；更要紧的是，语料里的临时文件名是固定的
+    （`streammap_tmp.bin` 之类），cwd 相同就会和同时跑的差分测试**互相踩**
+    （实测 t_streammap 因此出现 len 0/5/8 的乱序差异）。私有 cwd 把两类干扰都挡掉。
     """
     try:
-        p = subprocess.run([exe, path], capture_output=True, cwd=ROOT, timeout=TIMEOUT)
+        p = subprocess.run([exe, path], capture_output=True, cwd=WORK, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
         return TIMEOUT_RC, "", "timeout"
     out = p.stdout.decode("utf8", "replace").replace("\r", "")

@@ -19,15 +19,31 @@
 > | P8 | 随机差分模糊测试（结构化生成 + 语料变异，自动收缩） | ✅ 见下 |
 > | P9 | stream/blob「位置状态 × API」矩阵（1150 条，验证型） | ✅ 见下 |
 > | P10 | 验证入口入库 + 语料卫生（写文件审计）+ 模糊测试放大到 1000 | ✅ 见下 |
+> | P11 | 线程/生成器「状态 × API」矩阵（162 条）+ 把一处**安全偏离**测清楚 | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
-> 基线：语料 **72/72**、samples **17/17**、编译错误对拍 **60/60**、
-> `.cnut` **72/72**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **131/131**、lint 0。
+> 基线：语料 **73/73**、samples **17/17**、编译错误对拍 **60/60**、
+> `.cnut` **73/73**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **134/134**、lint 0。
 >
-> **一条命令跑完**：`python tools/check_all.py`（10 项，任一项失败退出码非 0；`--quick` 跳过 cargo test）。
+> **一条命令跑完**：`python tools/check_all.py`（11 项，任一项失败退出码非 0；`--quick` 跳过 cargo test）。
 >
 > **覆盖面扫描工具**：`tools/global_coverage.py` —— 把 62 个已注册全局函数逐个对照语料
 > 调用次数，直接列出"零覆盖/低覆盖"。P7 的 5 个项就是它扫出来的（当时只有这 5 个是 0 次）。
+
+### P11 完成情况（线程/生成器 状态 × API）
+
+沿用 P9 的方法论（差异常藏在**状态迁移**里）：8 个线程状态 + 4 个生成器状态 × 全部委托 API
+（`call`/`wakeup`/`wakeupthrow`/`getstatus`/`getstackinfos`/`weakref`/`tostring`），
+外加 10 条多步迁移序列。观测口径 **前置状态 | 返回值 | 错误 | 后置状态**。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P11-1 | `tools/gen_threadmatrix.py` → `tests-corpus/t_threadmap.nut`（162 条，带生成器自检） | 两侧逐字节一致（类型名归一化后，见下） |
+| P11-2 | 钉住的状态机语义 | 线程只有 **idle/suspended**（跑完**回 idle**，不是 dead）→ 对跑完的线程再 `call()` 会**重跑线程体**；`wakeup()` 无值也能唤醒且**返回线程体的返回值**；`wakeupthrow` 把错误抛给**调用方**；对 idle 线程 wakeup → `cannot wakeup a idle thread`（状态不变）；生成器有 **dead** 态、未 resume 过就是 `suspended`、**没有 `getstackinfos`** |
+| P11-3 | 复刻了参考实现的拼写错误 | `trying to resume a 'integer',only genenerator can be resumed`（**genenerator**）逐字一致 |
+| P11-4 | **把一处安全偏离测清楚**（本轮最重要的发现） | 对已挂起线程再 `call()`，参考实现拿被挂起帧里的**残留栈槽**当函数调，那个槽正好是 `suspend(x)` 的 `x`：实测 `42`→`'integer'`、`"s"`→`'string'`、`null`→`'null'`、`[1]`→`'array'`、`{}`→`'table'`、`1.5`→`'float'`、`true`→`'bool'`。**`x` 是闭包时参考实现会把它执行掉**（探针实测副作用发生、`call()` 返回闭包的返回值）；我们恒为可捕获的 `attempt to call 'table'` 且**绝不执行残留闭包** |
+| P11-5 | 守门测试 `crates/squirrel-stdlib/tests/thread_states.rs`（3 个） | 含安全性不变量 `second_call_does_not_run_stale_closure`；`cargo test` 131 → 134 |
+| P11-6 | 语料侧的处理 | 把那个类型名**归一化**成 `attempt to call <type>`（只比较"是否报 attempt to call"），既保住"会不会报错"的验证，又不钉一个不稳定的字符串 |
 
 ### P10 完成情况（验证入口 + 语料卫生 + 模糊测试放大）
 
