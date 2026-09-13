@@ -238,8 +238,12 @@ pub fn base_register(vm: &mut VmData) {
     });
     simple!("resurrectunreachable", 0, None, |v: &mut VmData| {
         let ss = v.ss.clone();
+        // ↔ 没有不可达对象时压 null（参考实现同样如此）
         let (_n, arr) = ss.resurrect_unreachable(v);
-        v.push(Value::Array(arr));
+        match arr {
+            Some(a) => v.push(Value::Array(a)),
+            None => v.push_null(),
+        }
         1
     });
 
@@ -1966,9 +1970,10 @@ fn thread_wakeupthrow(v: &mut VmData) -> NativeResult {
         let mut out = Value::Null;
         let ok = {
             let mut tv = t.borrow_mut();
-            // ↔ sq_throwobject(thread)：以栈顶对象为错误，再以 throw 恢复
+            // ↔ sq_throwobject(thread)：以栈顶对象为错误并弹出，再以 throw 恢复
             let e = tv.get_up(-1);
             tv.raise_error_obj(e);
+            tv.pop();
             wakeup_vm(&mut tv, false, true, true, true, &mut out)
         };
         if ok {

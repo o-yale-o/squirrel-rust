@@ -4,6 +4,20 @@
 //! %g 取 6 位有效数字、按指数切换定点/科学计数、去掉尾随零、指数至少两位。
 //! print/tostring 的输出必须逐字节一致（差分测试），故手工实现。
 
+/// ↔ MSVC printf 的 NaN 拼写：符号位为 0 → `nan`；负 NaN → `-nan`；
+/// x86 的「indefinite」QNaN（0xFFC00000，例如 `0.0/0.0`）→ `-nan(ind)`。
+fn nan_str(value: f64) -> &'static str {
+    let bits = value.to_bits();
+    if bits >> 63 == 0 {
+        "nan"
+    } else if bits == 0xFFF8_0000_0000_0000 {
+        // f32 0xFFC00000 提升到 f64 后的位模式
+        "-nan(ind)"
+    } else {
+        "-nan"
+    }
+}
+
 /// ↔ printf("%g", v)（默认精度 6）
 pub fn format_g(value: f64) -> String {
     format_g_prec(value, 6)
@@ -12,7 +26,7 @@ pub fn format_g(value: f64) -> String {
 /// ↔ printf("%.<prec>g", v)（prec=0 按 1 处理，同 C 标准）
 pub fn format_g_prec(value: f64, prec: usize) -> String {
     if value.is_nan() {
-        return "nan".to_string();
+        return nan_str(value).to_string();
     }
     if value.is_infinite() {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();
@@ -67,7 +81,7 @@ pub fn format_g_prec(value: f64, prec: usize) -> String {
 /// CRT 的 %e 与 %g 不同：%e 保留全部有效位（`format("%e", 1234.5)` → `1.234500e+03`）。
 pub fn format_e_crt(value: f64, prec: usize) -> String {
     if value.is_nan() {
-        return "nan".to_string();
+        return nan_str(value).to_string();
     }
     if value.is_infinite() {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();
@@ -84,7 +98,7 @@ pub fn format_e_crt(value: f64, prec: usize) -> String {
 /// ↔ printf("%.<prec>f", v)
 pub fn format_f(value: f64, prec: usize) -> String {
     if value.is_nan() {
-        return "nan".to_string();
+        return nan_str(value).to_string();
     }
     if value.is_infinite() {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();
@@ -95,7 +109,7 @@ pub fn format_f(value: f64, prec: usize) -> String {
 /// ↔ printf("%.<prec>e", v)（MSVC 指数至少 2 位）
 pub fn format_e(value: f64, prec: usize) -> String {
     if value.is_nan() {
-        return "nan".to_string();
+        return nan_str(value).to_string();
     }
     if value.is_infinite() {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();

@@ -491,7 +491,12 @@ impl SharedState {
 
     /// ↔ SQSharedState::ResurrectUnreachable（sqstate.cpp:267-319）
     /// 返回 (数量, 不可达对象数组)。
-    pub fn resurrect_unreachable(&self, current: &mut VmData) -> (SQInteger, crate::object::ArrayRef) {
+    /// ↔ SQSharedState::ResurrectUnreachable
+    ///
+    /// 返回 (被复活对象数, Some(数组)) —— 没有任何不可达对象时返回 None（脚本看到 null），
+    /// 与参考实现一致。**必须先把不可达对象快照下来再建返回数组**：返回数组自己也在
+    /// GC 链里且此刻尚未被任何根引用，否则会把自己也算进结果。
+    pub fn resurrect_unreachable(&self, current: &mut VmData) -> (SQInteger, Option<crate::object::ArrayRef>) {
         let mut roots = self.base_roots();
         let root_vm = self.root_vm.borrow().weakref_target();
         let is_current = match (&root_vm, current.self_ref()) {
@@ -507,25 +512,27 @@ impl SharedState {
         }
         let marked = self.run_mark(roots);
 
-        let mut n: SQInteger = 0;
-        let ret = SQArray::create(self, 0);
-        {
-            let entries: Vec<GcEntry> = std::mem::take(&mut *self.gc_chain.borrow_mut());
-            for e in entries.iter() {
-                if let Some(v) = e.value() {
-                    if !marked.contains(&v.identity()) {
-                        // ↔ FUNCPROTO/OUTER 不进入结果数组，但仍计入 n
-                        n += 1;
-                        let include = !matches!(v, Value::FuncProto(_) | Value::Outer(_));
-                        if include {
-                            ret.borrow_mut().append(&v);
-                        }
-                    }
-                }
-            }
-            *self.gc_chain.borrow_mut() = entries;
+        let unreachable: Vec<Value> = {
+            let entries = self.gc_chain.borrow();
+            entries
+                .iter()
+                .filter_map(|e| e.value())
+                .filter(|v| !marked.contains(&v.identity()))
+                .collect()
+        };
+        if unreachable.is_empty() {
+            return (0, None);
         }
-        (n, ret)
+        let ret = SQArray::create(self, 0);
+        let mut n: SQInteger = 0;
+        for v in unreachable {
+            n += 1;
+            // ↔ FUNCPROTO/OUTER 不进入结果数组，但仍计入 n
+            if !matches!(v, Value::FuncProto(_) | Value::Outer(_)) {
+                ret.borrow_mut().append(&v);
+            }
+        }
+        (n, Some(ret))
     }
 }
 

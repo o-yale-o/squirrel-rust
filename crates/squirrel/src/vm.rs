@@ -1987,8 +1987,8 @@ fn execute_inner(
     et: ExecutionType,
 ) -> Result<(), Value> {
     let mut traps: SQInteger = 0;
-    // ResumeThrowVm 注入的异常（SQ_THROW 语义）
-    let _pending_throw: Option<Value> = None;
+    // ResumeThrowVm 注入的异常（SQ_THROW 语义）：在进入主循环前先记下，循环首轮按抛出处理
+    let mut pending_throw = false;
 
     match et {
         ExecutionType::Call => {
@@ -2037,15 +2037,22 @@ fn execute_inner(
             vm.last_callinfo_mut().root = vm.suspended_root;
             vm.suspended = false;
             if et == ExecutionType::ResumeThrowVm {
-                // SQ_THROW()
-                return handle_exception(vm, outres, raiseerror, &mut traps);
+                // ↔ SQ_THROW()：注入的异常必须像本帧内的 throw 一样走 exception_trap
+                // （否则线程里的 try/catch 抓不到，异常会冒到唤醒方）
+                pending_throw = true;
             }
         }
     }
 
     // ---------------- 主循环（exception_restore 入口） ----------------
     'exception_restore: loop {
-        match run_instructions(vm, vm_rc, &mut traps, outres, raiseerror) {
+        let step = if pending_throw {
+            pending_throw = false;
+            Err(vm.lasterror.clone())
+        } else {
+            run_instructions(vm, vm_rc, &mut traps, outres, raiseerror)
+        };
+        match step {
             Ok(outcome) => match outcome {
                 ExecOutcome::Returned => return Ok(()),
                 ExecOutcome::Suspended(clo) => {
@@ -2115,15 +2122,6 @@ fn execute_inner(
 fn outres_slot_target(_vm: &VmData) -> SQInteger {
     // Resume 的 target 在调用方计算（对应 C++ &dest - &stack[stackbase]）
     0
-}
-
-fn handle_exception(
-    vm: &mut VmData,
-    _outres: &mut Value,
-    _raiseerror: bool,
-    _traps: &mut SQInteger,
-) -> Result<(), Value> {
-    Err(vm.lasterror.clone())
 }
 
 /// 单轮指令执行；Err = SQ_THROW（错误对象）
