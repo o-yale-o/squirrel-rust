@@ -17,7 +17,9 @@
 | `.cnut` 字节级一致 | `python tools/cnut_matrix.py` | samples **17/17**、语料 **51/51**（少数文件会被标成 `PAD-ONLY`：只差参考实现的未初始化填充，见第四节） |
 | `.cnut` 双向互通 | `python tools/cnut_matrix.py tests-corpus` | **51/51 一致**（含参考实现编译的字节码在本实现上执行） |
 | 指令覆盖 | `cargo test --test opcode_coverage` | **61/61 条指令被语料覆盖** |
-| 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` | **5/5 通过**，输出与 C++ minimal.c 一致 |
+| 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` + `python tools/minimal_diff.py` | **5/5 通过**；`minimal_diff.py` 把官方 `etc/minimal.c` 真编出来跑，stdout/退出码与本实现**逐字节一致**（`Called foo(), i=1, f=2.5, s='teststring'`） |
+| 流语义（file/blob 的 tell/len/eos/flush） | `python tools/line_diff.py tools/probes/stream_semantics.nut` | **逐行一致**（`cargo test --test stream_semantics` 守门） |
+| stdin / 管道语义 | `python tools/stdin_eof.py` | 文件重定向 **5/5 一致**；管道上 `tell()/eos()` 对齐，残留见第四节 |
 | 委托表成员 | `python tools/audit_delegates.py` | **10 张表 88 个成员全一致** |
 | 全局注册（nparamscheck + 掩码） | `python tools/audit_globals.py` | **62/62 全一致** |
 | 单元 + 集成 + 健壮性测试 | `cargo test` | **72/72 通过** |
@@ -261,10 +263,39 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 - 新增 `tools/line_diff.py`（按行定位差异）、`tools/bisect_cases.py`（把探针逐条单独跑，
   找出崩溃/差异的那一条）、`tools/cnut_fields.py`（按 `Save` 布局逐字段比对 `.cnut`）。
 
+## 三·补4、第四轮：计划书验收项与流语义
+
+计划书里两项一直没被**独立验证**的验收标准，这一轮补齐，并顺带把 README 里那句
+「stdin 行缓冲差异」查清楚——结论是它不是平台怪癖，而是三个真 bug。
+
+| 验收项 | 证据 |
+|---|---|
+| #5 用 Rust 宿主 API 复刻 `etc/minimal.c` | `crates/squirrel-stdlib/examples/minimal.rs`（注册 native/调用脚本函数/传参取返回值/错误处理）+ `tests/host_api.rs` 5 个测试；`tools/minimal_diff.py` 用 vswhere 找到 MSVC、**真的编译官方 `etc/minimal.c`**（链接 build-ref 的静态库），两边 stdout 与退出码逐字节一致 |
+| 61 条指令被差分语料覆盖 | `crates/squirrel/tests/opcode_coverage.rs`：语料 + samples 共 51 个文件，**覆盖 61/61**；`tests-corpus/t_ops.nut` 补的 `Inc/PInc/Not` 等缺失指令早已到位 |
+
+**「stdin 行缓冲差异」的真相**（`tools/stdin_eof.py` / `tools/stdin_blob.nut` 实测）：
+
+| 现象 | 根因 | 处理 |
+|---|---|---|
+| 文件流（含 stdin 重定向自文件）上 `tell()` 恒为 0、`len()` 恒为 0 | 本实现只对 `file()` 打开的句柄实现了位置查询，标准流直接返回 0 | 已修：`FileBackend` 自己维护逻辑读写位置（↔ CRT `ftell`），文件大小用 `GetFileSizeEx` 查询（不 seek，避免破坏管道状态）。**文件重定向 5/5 对齐** |
+| 管道里喂 `"A\nBC"` 后 `readblob(4)` 只返回 2 字节 | 早先按字节读、遇到 `'\n'` 就停——那是控制台的行语义，被错安到了管道上 | 已修：改成「读到填满请求长度或 EOF」（↔ CRT `fread`），并且不再把请求长度夹到不可信的 `len()` 上（管道上会夹成 0 → 永远 `no data left to read`） |
+| 管道上 `eos()` 恒为真（`while(!stdin.eos())` 一次都不进） | 同上，`tell()==len()` 恒成立 | 已修：`tell()` 现在给出已消费字节数，`eos()`/`len()` 随之与参考实现对齐 |
+
+修复后 `tools/stdin_eof.py`：文件重定向 **5/5 一致**；管道上「读满 → 越界读报 io error」
+的错误路径、`tell()`、`eos()` 都与参考实现一致，剩余差异只剩参考实现自己的
+`fseek(SEEK_END)` 失败残留（见第四节）。
+
+顺带对齐了两个「反直觉」的返回值（`crates/squirrel-stdlib/tests/stream_semantics.rs` 守门）：
+
+- `eos()` 真返回 **`1`**、假返回 **`null`**（不是 `true`/`false`）；
+- `flush()` 失败返回 `1`、成功返回 `null`；
+- `writen` 的参数顺序是 **`(值, 格式)`**，与 `readn(格式)` 相反（`sqstdstream.cpp` 读的是 arg3）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
 |---|---|
+| 不可 seek 流上 `len()`/`eos()`/`readblob` | 参考实现的 `EOS()` 是 `Tell()==Len()`，而 `Len()` 靠 `fseek(SEEK_END)`：管道上这次调用**失败**，之后 `ftell` 给出的是 CRT 内部状态（实测同一进程里 `readblob(4)` 之前 Len()≥4、之后 Len()=0；5000 字节管道上又变成 904=5000−4096）。更糟的是失败的 `fseek` 会**丢弃已缓冲的输入**：8 字节管道上读完 2 字节后剩下的 6 字节直接消失，于是 `readn` 报 io error。本实现给出确定性行为（`tell()`=已消费字节数、不可 seek 时 `len()`=0），不复刻这个数据丢失 |
 | `.cnut` 的 outer 类型字段 | 参考实现用 `sizeof(SQUnsignedInteger)`（8 字节）写一个 4 字节枚举，高 4 字节是**未初始化内存**：同一脚本连编两次字节都不同（实测 `ff245324…` vs `e4e3c42e…`），而 `e4e3c42e…` 恰好等于本实现的输出。因此含闭包的语料会有几个文件字节不同，`tools/cnut_matrix.py` 把这种只差高 4 字节的情况单独标成 `PAD-ONLY`（低 32 位类型仍逐位相同，其余字段全部一致）；本实现写确定的 0。加载侧已按低 32 位掩码，参考实现产出的字节码能正常执行（51/51 交叉执行一致） |
 | 坏字节码里的越界 outer 索引 | 参考实现不检查该索引，夹具 `ref_closures_badouter.cnut` 让 C++ 侧访问违例崩溃（0xC0000005）；本实现报可捕获的 `invalid outer value index`（`crates/squirrel-stdlib/tests/bytecode_interop.rs` 守门） |
 | `format` 规格串恰好 20 字符 | `validate_format` 的 `n-start > MAX_FORMAT_LEN` 差一，随后 `memcpy` 越界写 `fmt[20]`：`format("%" + 20 个 '+' + "d", 1)` 实测 `STATUS_STACK_BUFFER_OVERRUN` 崩溃。本实现从 20 起就报 `format too long`，不复刻 |

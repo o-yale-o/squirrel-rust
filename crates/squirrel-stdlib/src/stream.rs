@@ -35,6 +35,13 @@ pub trait StreamBackend {
     fn len(&mut self) -> SQInteger;
     fn seek(&mut self, offset: SQInteger, origin: SQInteger) -> SQInteger;
     fn is_valid(&self) -> bool;
+    /// `len()` 是否可信：不可 seek 的流（管道/控制台）上参考实现的 `Len()` 是
+    /// `fseek(SEEK_END)` 失败后的 CRT 内部状态（实测同一进程里先返回 4、后返回 0），
+    /// 属不可复刻的 UB。`_stream_readblob` 会用它把请求长度夹到 `Len()`，
+    /// 这里必须知道「能不能信」，否则管道上会夹成 0 → 永远报 no data left to read。
+    fn len_is_valid(&self) -> bool {
+        true
+    }
     /// ↔ SQBlob::Resize（file 返回 false）
     fn resize(&mut self, _n: SQInteger) -> bool {
         false
@@ -185,6 +192,49 @@ pub struct FileBackend {
     handle: Option<Rc<RefCell<std::fs::File>>>,
     /// ↔ stdin/stdout/stderr 句柄
     std_fd: Option<u8>,
+    /// 逻辑读写位置（↔ CRT 的 ftell：管道上就是已消费的字节数）
+    pos: SQInteger,
+    /// 标准流是否为可 seek 的磁盘文件（重定向自文件时为真）
+    std_disk_size: Option<SQInteger>,
+}
+
+/// 标准流句柄信息：是否是磁盘文件、文件多大
+///
+/// 只用 GetFileSizeEx 查询，**不** seek——参考实现的 `Len()` 靠 `fseek(SEEK_END)`，
+/// 在管道上会把 stdio 状态搞坏；磁盘文件上两者结果相同（都是文件总长度）。
+#[cfg(windows)]
+fn std_handle_info(fd: u8) -> (bool, Option<SQInteger>) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nstdhandle: u32) -> *mut core::ffi::c_void;
+        fn GetFileType(hfile: *mut core::ffi::c_void) -> u32;
+        fn GetFileSizeEx(hfile: *mut core::ffi::c_void, filesize: *mut i64) -> i32;
+    }
+    const FILE_TYPE_DISK: u32 = 1;
+    let n = match fd {
+        0 => -10i32, // STD_INPUT_HANDLE
+        1 => -11i32, // STD_OUTPUT_HANDLE
+        _ => -12i32, // STD_ERROR_HANDLE
+    } as u32;
+    let h = unsafe { GetStdHandle(n) };
+    if h.is_null() {
+        return (false, None);
+    }
+    let is_disk = unsafe { GetFileType(h) } == FILE_TYPE_DISK;
+    if !is_disk {
+        return (false, None);
+    }
+    let mut size: i64 = 0;
+    if unsafe { GetFileSizeEx(h, &mut size) } != 0 {
+        (true, Some(size as SQInteger))
+    } else {
+        (true, None)
+    }
+}
+
+#[cfg(not(windows))]
+fn std_handle_info(_fd: u8) -> (bool, Option<SQInteger>) {
+    (false, None)
 }
 
 impl FileBackend {
@@ -210,52 +260,54 @@ impl FileBackend {
             Ok(f) => Some(FileBackend {
                 handle: Some(Rc::new(RefCell::new(f))),
                 std_fd: None,
+                pos: 0,
+                std_disk_size: None,
             }),
             Err(_) => None,
         }
     }
     pub fn from_std(fd: u8) -> FileBackend {
+        let (_disk, size) = std_handle_info(fd);
         FileBackend {
             handle: None,
             std_fd: Some(fd),
+            pos: 0,
+            std_disk_size: size,
         }
     }
 }
 
 impl StreamBackend for FileBackend {
     fn read(&mut self, out: &mut [u8]) -> SQInteger {
-        if let Some(h) = &self.handle {
+        let n = if let Some(h) = &self.handle {
             match h.borrow_mut().read(out) {
                 Ok(n) => n as SQInteger,
                 Err(_) => 0,
             }
         } else if self.std_fd == Some(0) {
-            #[allow(unused_imports)]
-            use std::io::BufRead;
+            // ↔ CRT fread：一直读到填满请求长度或 EOF/出错为止。
+            // （早先按字节读、遇到 '\n' 就停下，那是把控制台的行语义错安到了管道上：
+            //   实测管道里喂 "A\nBC" 后 readblob(4)，参考实现返回 4 字节，不是 2。）
             let stdin = std::io::stdin();
             let mut lock = stdin.lock();
             let mut n = 0usize;
             while n < out.len() {
-                let mut byte = [0u8; 1];
-                match lock.read(&mut byte) {
+                match lock.read(&mut out[n..]) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        out[n] = byte[0];
-                        n += 1;
-                        if byte[0] == b'\n' {
-                            break;
-                        }
-                    }
+                    Ok(k) => n += k,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
             n as SQInteger
         } else {
             0
-        }
+        };
+        self.pos += n;
+        n
     }
     fn write(&mut self, data: &[u8]) -> SQInteger {
-        if let Some(h) = &self.handle {
+        let n = if let Some(h) = &self.handle {
             match h.borrow_mut().write(data) {
                 Ok(n) => n as SQInteger,
                 Err(_) => 0,
@@ -272,7 +324,9 @@ impl StreamBackend for FileBackend {
             }
         } else {
             0
-        }
+        };
+        self.pos += n;
+        n
     }
     fn flush(&mut self) -> SQInteger {
         if let Some(h) = &self.handle {
@@ -283,11 +337,15 @@ impl StreamBackend for FileBackend {
         0
     }
     fn tell(&mut self) -> SQInteger {
-        if let Some(h) = &self.handle {
-            h.borrow_mut().stream_position().map(|p| p as SQInteger).unwrap_or(-1)
-        } else {
-            0
+        // ↔ sqstd_ftell：文件上是真实偏移，管道上就是已消费的字节数（实测一致）
+        if self.handle.is_some() {
+            if let Some(h) = &self.handle {
+                if let Ok(p) = h.borrow_mut().stream_position() {
+                    self.pos = p as SQInteger;
+                }
+            }
         }
+        self.pos
     }
     fn len(&mut self) -> SQInteger {
         if let Some(h) = &self.handle {
@@ -296,10 +354,16 @@ impl StreamBackend for FileBackend {
             let _ = f.seek(SeekFrom::End(0));
             let size = f.stream_position().unwrap_or(0) as SQInteger;
             let _ = f.seek(SeekFrom::Start(prev.max(0) as u64));
+            self.pos = prev;
             size
         } else {
-            0
+            // 标准流：重定向自文件时是文件总长度；管道/控制台上参考实现的 Len() 是
+            // fseek(SEEK_END) 失败后的 CRT 内部状态（不可复刻），这里给 0
+            self.std_disk_size.unwrap_or(0)
         }
+    }
+    fn len_is_valid(&self) -> bool {
+        self.handle.is_some() || self.std_disk_size.is_some()
     }
     fn seek(&mut self, offset: SQInteger, origin: SQInteger) -> SQInteger {
         if let Some(h) = &self.handle {
@@ -309,8 +373,12 @@ impl StreamBackend for FileBackend {
                 SQ_SEEK_END => SeekFrom::End(offset),
                 _ => return -1,
             };
-            match h.borrow_mut().seek(pos) {
-                Ok(_) => 0,
+            let mut f = h.borrow_mut();
+            match f.seek(pos) {
+                Ok(p) => {
+                    self.pos = p as SQInteger;
+                    0
+                }
                 Err(_) => -1,
             }
         } else {
@@ -463,8 +531,14 @@ fn stream_readblob(v: &mut VmData) -> SQInteger {
         _ => return stream_err(v, "the stream is invalid"),
     };
     let mut size = v.stack_get(2).as_integer();
-    let len = self_.borrow_mut().len();
-    if size > len {
+    // ↔ _stream_readblob 的 `if(size > self->Len()) size = self->Len();`
+    // 那只是 scratchpad 的尺寸估计；不可 seek 的流上 Len() 不可信（管道上是 UB 值），
+    // 照夹会把请求夹成 0 → 管道上永远 "no data left to read"
+    let (len, valid) = {
+        let mut b = self_.borrow_mut();
+        (b.len(), b.len_is_valid())
+    };
+    if valid && size > len {
         size = len;
     }
     if size < 0 {

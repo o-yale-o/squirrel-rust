@@ -39,6 +39,8 @@ python tools/diff_test.py --no-stderr ...       # 只比 stdout（旧行为）
 python tools/line_diff.py tests-corpus/t_opmx.nut   # 大语料按行定位差异
 python tools/repl_diff.py                       # REPL 会话（tests-repl/*.txt）
 python tools/cnut_matrix.py tests-corpus        # .cnut 字节一致 + 双向交叉执行
+python tools/minimal_diff.py                    # 编出官方 etc/minimal.c 与示例对拍（验收 #5）
+python tools/stdin_eof.py                       # stdin 在管道/文件重定向下的原语行为
 python tools/audit_globals.py                   # 全局注册（名字/参数个数/类型掩码）
 python tools/audit_delegates.py                 # 11 张默认委托表成员
 python tools/lint_corpus.py                     # 语料语法陷阱 + 逐个试编译
@@ -132,9 +134,12 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 ## 已知限制
 
 - **不可 seek 流（stdin/stdout/stderr 走管道时）的 `eos()/tell()/len()`**：参考实现基于 CRT 的
-  `ftell`/`fseek`，在管道上 `fseek(SEEK_END)` 会失败并破坏流状态（其后 `readn` 报 `io error`），
-  `stdout.eos()` 返回 `null`。本实现返回正常值，不复刻这个平台副作用
-  （实测脚本：`python tools/eos_diff.py`、`tools/stdin_diff.py`）；
+  `ftell`/`fseek`，在管道上 `fseek(SEEK_END)` 会失败并**丢弃已缓冲的输入**
+  （8 字节管道读完 2 字节后剩的 6 字节直接消失，其后 `readn` 报 `io error`），
+  `len()` 返回的是 CRT 内部状态（实测同一进程里先 ≥4、后 0、5000 字节管道上 904）。
+  本实现给出确定性行为（`tell()`=已消费字节数、不可 seek 时 `len()`=0），
+  文件重定向与参考实现逐字节一致（实测脚本：`python tools/stdin_eof.py`、
+  `tools/stdin_diff.py`、`tools/probes/stream_semantics.nut`）；
 - 少数**参考实现自身越界/UB** 的场景取确定性行为（详见 `STATUS.md` 第四节）：
   `escape` 短字符串中的高位字节、`getstackinfos(-1)`、UCRT `date` 上界、
   在已挂起的线程上再次 `call()`、REPL 读到 EOF、空正则模式（参考实现会写 NULL 崩溃）、
@@ -155,6 +160,7 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 |---|---|
 | `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用（含 `format` 的宽度/精度/标志/`INT64_MIN` 边界）、畸形 `.cnut`、畸形正则、深递归、深嵌套值释放、超深嵌套编译 |
 | `crates/squirrel-stdlib/tests/bytecode_interop.rs` | 直接执行**参考实现编译出来的** `.cnut`；夹具被改成越界 outer 索引时必须报可捕获错误（参考实现会访问违例崩溃） |
+| `crates/squirrel-stdlib/tests/stream_semantics.rs` | file/blob 的 `tell/len/eos/flush` 与参考实现逐字一致（`eos()` 真为 `1`、假为 `null`；`writen` 的参数顺序是 `(值, 格式)`） |
 | `crates/squirrel/tests/deep_release.rs` | 释放循环嵌套深度 ≤ 3（10 万层数组/表/闭包/生成器/线程，含 1MB 栈线程） |
 
 对应实现：`crates/squirrel/src/release.rs`（迭代式释放）、编译器嵌套/栈预算守卫、
