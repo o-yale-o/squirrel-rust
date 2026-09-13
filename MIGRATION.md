@@ -110,6 +110,11 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `rstrip`/`strip`/`escape`/`startswith` 不受 NUL 影响 | 这些走**显式长度**：`rstrip("a\x00b ")` 长度 3、`strip("  a\x00b  ")` 长度 3、`escape("a\x00b")` 是 4 个字符 `a\0b` |
 | `escape` 不吃具名转义 `\t\n\r` | `scisprint` 为假 → 走 `\xNN`：`escape("a\tb")` 是 `a\x09b`（`\0` 是唯一例外，转成两个字符 `\0`） |
 | `print` 在**嵌入 NUL 处截断** | 两边一致（截断后连换行一起丢，下一行会接到同一行上）——所以语料里含 NUL 的用例改成打印各元素**字节长度**来观测 |
+| `RAND_MAX` 是 **32767** | MSVC 的 CRT 就这么定义，不是 `INT_MAX`；`rand()` 的序列也按 MSVC CRT 复刻 |
+| `abs()` 是 **32 位**的 | 参考实现写的是 `abs((int)n)`：先截成 int32 再取绝对值 —— `abs(2147483648)`→`-2147483648`、`abs(-2147483649)`→`2147483647`、`abs(INT64_MAX)`→`1`、`abs(INT64_MIN)`→`0`、`abs(-3000000000)`→`1294967296` |
+| `abs()` 只吃整数 | `abs(-7.9)`→`7`（先截断再绝对值，返回 **integer**）；浮点版是 `fabs`。`floor`/`ceil` 返回的也是 **float** 而不是 int |
+| 数学函数定义域外**不报错** | `sqrt(-1)`/`log(-1)`/`asin(2)`/`pow(-1,0.5)` → NaN（打印成 MSVC 的 `-nan(ind)`）、`log(0)`→`-inf`、`exp(f32::MAX)`→`inf` |
+| `format` 的数字走 **f32** | `format("%.17g", 2147483647)` 是 `2147483648`（整数被转成 `SQFloat`）——想精确打印整数就别套 `%g` |
 
 ## 5. 迁移检查清单
 
