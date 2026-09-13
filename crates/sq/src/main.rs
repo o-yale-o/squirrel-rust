@@ -25,7 +25,10 @@ Available options are:\n   \
 -c              compiles only\n   \
 -d              generates debug infos\n   \
 -v              displays version infos\n   \
--h              prints help\n"
+-h              prints help\n\
+(下面两个是本实现**额外**提供的加固选项，参考实现没有)\n   \
+--max-ops N     指令预算：超出报可捕获的 execution budget exceeded\n   \
+--mem-limit N   进程内存上限（MB，Windows Job Object）：超出由系统终止进程\n"
     );
 }
 
@@ -229,8 +232,94 @@ fn main() {
     }
 }
 
+/// 给**本进程**设内存上限（P3 加固，参考实现没有）：Windows 用 Job Object，
+/// 超限时由系统终止进程而不是把整台机器拖进 swap。
+///
+/// 失败只警告不退出 —— 这只是加固，不该让本来能跑的脚本跑不了。
+#[cfg(windows)]
+fn apply_memory_limit(mb: usize) {
+    use std::ffi::c_void;
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct JobObjectExtendedLimitInformation {
+        basic: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+    const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            eprintln!("warning: --mem-limit: CreateJobObject failed");
+            return;
+        }
+        let mut info = JobObjectExtendedLimitInformation::default();
+        info.basic.limit_flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.process_memory_limit = mb.saturating_mul(1024 * 1024);
+        if SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+        ) == 0
+        {
+            eprintln!("warning: --mem-limit: SetInformationJobObject failed");
+            return;
+        }
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            eprintln!("warning: --mem-limit: AssignProcessToJobObject failed");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_memory_limit(_mb: usize) {
+    eprintln!("warning: --mem-limit is only implemented on Windows");
+}
+
 fn real_main() {
     squirrel_stdlib::regex::set_stack_budget(REGEX_STACK_BUDGET);
+    // 编译器递归上限也放到与参考实现同级：它能编的（实测 500 层括号）我们都能编，
+    // 它崩的（800 层 STATUS_STACK_OVERFLOW）我们给可捕获的 nesting too deep
+    squirrel::compiler::set_compiler_limits(800, 8 * 1024 * 1024);
     let args: Vec<String> = std::env::args().collect();
     let mut retval: SQInteger = 0;
 
@@ -263,6 +352,27 @@ fn real_main() {
     let mut interactive_mode = true;
 
     while arg < args.len() {
+        // ---- P3 加固：本实现**额外**提供的两个长选项（参考实现没有）----
+        // --max-ops N   ：指令预算，超了报可捕获的 execution budget exceeded
+        // --mem-limit N ：进程内存上限（MB，Windows Job Object），超了由系统杀进程
+        if args[arg] == "--max-ops" || args[arg] == "--mem-limit" {
+            let is_ops = args[arg] == "--max-ops";
+            let val = args.get(arg + 1).cloned().unwrap_or_default();
+            let n: i64 = match val.parse() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    eprintln!("{} expects a positive integer, got {:?}", args[arg], val);
+                    std::process::exit(1);
+                }
+            };
+            if is_ops {
+                vm.data_mut().op_budget = n;
+            } else {
+                apply_memory_limit(n as usize);
+            }
+            arg += 2;
+            continue;
+        }
         if args[arg].starts_with('-') {
             let flag = args[arg].chars().nth(1).unwrap_or(' ');
             match flag {

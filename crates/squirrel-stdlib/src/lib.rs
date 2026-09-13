@@ -1204,6 +1204,17 @@ pub fn set_error_handlers(vm: &squirrel::api::Vm) {
     v.errorhandler = Value::NativeClosure(nc);
 }
 
+/// 调用栈 dump 的**帧数上限**（P3 加固，参考实现没有这个概念）。
+///
+/// 为什么需要：本实现给递归加了上限（`MAX_CALL_FRAMES = 20 万`），未捕获的
+/// `stack overflow` 会把**整条**调用栈逐帧打印出来 —— 实测脚本三行就能产出
+/// **12.3MB stderr**。参考实现到不了那么深（先 OOM），所以这不是保真问题，
+/// 而是"别让错误输出自己变成事故"。
+///
+/// 上限只影响超过 `MAX_DUMP_FRAMES` 的**病态深栈**；正常脚本
+/// （`tests-corpus/t_errtail.nut` 那种 2~3 层）逐字节与参考实现一致。
+const MAX_DUMP_FRAMES: SQInteger = 1000;
+
 /// ↔ sqstd_printcallstack：CALLSTACK（level 从 1 起，跳过本函数自身）
 /// + LOCALS（level 0..9 的 sq_getlocal 循环，按类型打印）
 fn print_callstack(v: &mut VmData) {
@@ -1212,10 +1223,16 @@ fn print_callstack(v: &mut VmData) {
     if let Some(ef) = ef_ {
         ef(v, b"\nCALLSTACK\n");
         let mut level: SQInteger = 1; // 1 is to skip this function that is level 0
+        let mut omitted: SQInteger = 0;
         loop {
             // ↔ sq_stackinfos(v, level, &si)
             let cssize = v.callsstack.len() as SQInteger;
             if !(level >= 0 && cssize > level) {
+                break;
+            }
+            if level > MAX_DUMP_FRAMES {
+                // 剩下的帧只报数量（见 MAX_DUMP_FRAMES 的注释）
+                omitted = cssize - level;
                 break;
             }
             let idx = (cssize - level - 1) as usize;
@@ -1237,6 +1254,10 @@ fn print_callstack(v: &mut VmData) {
             let line_txt = format!("*FUNCTION [{}()] {} line [{}]\n", fname, src, line);
             ef(v, line_txt.as_bytes());
             level += 1;
+        }
+        if omitted > 0 {
+            let txt = format!("…省略 {} 层（本实现调用栈上限 20 万帧；参考实现到不了这么深）\n", omitted);
+            ef(v, txt.as_bytes());
         }
         ef(v, b"\nLOCALS\n");
         for level in 0..10 {

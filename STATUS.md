@@ -1007,6 +1007,67 @@ wrong argument type, expected 'function' got 'function'
 `crates/squirrel-stdlib/tests/host_api_ext.rs`（4 个测试：member handle、
 `getfunctioninfo`、`setfreevariable`、userdata+refcount+foreignptr+resurrect）。
 
+## 三·补20、第二十轮（P3）：健壮性加固（参考实现没有的四项）
+
+这一档全部是**本实现主动多做**的：参考实现在这些场景下要么 OOM、要么直接崩、
+要么把宿主挂死。已在 `TODO.md` 标为"有意偏离"，不追求逐字复刻。
+
+### P3-1 未捕获 `stack overflow` 的调用栈 dump 限深
+
+本实现给递归加了上限（20 万帧），未捕获的 `stack overflow` 会把**整条**调用栈逐帧打印：
+
+```
+$ sq tmp-c2/p3_dump.nut          # 三行的非尾递归死循环
+修复前：stderr 12.3MB（20 万帧全打）  耗时 0.36s
+修复后：stderr 0.07MB               耗时 0.10s
+```
+
+现在超过 **1000 帧**就换成一行 `…省略 N 层（本实现调用栈上限 20 万帧；参考实现到不了这么深）`。
+**浅栈完全不受影响**：`tests-corpus/t_errtail.nut` 的 CALLSTACK/LOCALS 仍与参考实现逐字节一致
+（`tmp-c2/err_diff.py` 复核）。
+
+### P3-2 `--mem-limit N`（进程内存上限）
+
+Windows Job Object（`JOB_OBJECT_LIMIT_PROCESS_MEMORY`）。实测：
+
+```
+$ sq tmp-c2/p3_mem.nut                 → 峰值 127.5MB（无上限）
+$ sq --mem-limit 64 tmp-c2/p3_mem.nut  → 峰值  38.1MB，进程被截停
+```
+
+参考实现完全没有这个能力（只能被 OOM killer / 系统杀掉）。
+
+### P3-3 `--max-ops N`（指令预算）
+
+主循环里每 4096 条指令检查一次（摊薄成本）。**尾调用死循环**（`function loop(n){ return loop(n+1); }`）
+以前会把宿主挂死，现在：
+
+```
+$ sq --max-ops 500000 tmp-c2/p3_loop.nut
+AN ERROR HAS OCCURRED [execution budget exceeded]
+```
+
+错误是**可捕获**的（脚本里 try/catch 能接住），不是 abort。
+
+### P3-4 编译器递归上限（与参考实现对齐后反而更强）
+
+实测参考实现的编译递归：
+
+| 嵌套括号层数 | 参考实现 | 本实现（CLI） |
+|---|---|---|
+| 300 / 500 / 600 | 正常 | 正常 |
+| **790** | 正常 | 正常（以前 200 层就拒 ✗） |
+| 795 / 799 | **`0xC00000FD` 崩溃** | 正常 / 可捕获的 `nesting too deep` |
+
+做法：把编译器的「嵌套层数 + 实际栈预算」从常量改成**运行时可调**
+（`compiler::set_compiler_limits`），库默认仍是保守的 200 层 / 512KB（1MB 栈的调用方安全），
+CLI 在 16MB 栈线程上设成 800 层 / 8MB。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/robustness_p3.rs`（4 个测试：dump 有界、浅栈完整、
+指令预算、嵌套上限与放大后仍可编）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |

@@ -45,12 +45,39 @@ struct Scope {
     stacksize: SQInteger,
 }
 
-/// 递归嵌套上限：恶意/超深源码若不加限制会把宿主线程栈打爆（不可捕获的 abort）。
-/// 除了层数，还按**实际用掉的宿主栈字节**把关，这样在 release / debug / 各种
-/// 宿主栈大小下都不会溢出。
+/// 递归嵌套上限的**默认值**：恶意/超深源码若不加限制会把宿主线程栈打爆
+/// （不可捕获的 abort）。除了层数，还按**实际用掉的宿主栈字节**把关，
+/// 这样在 release / debug / 各种宿主栈大小下都不会溢出。
+///
+/// 默认取保守值（1MB 线程栈的库调用方也安全）；CLI 在大栈线程上会调大它，
+/// 详见 [`set_compiler_limits`] 与 `crates/sq`。
 pub const MAX_NESTING_DEPTH: usize = 200;
-/// 编译递归可用的宿主栈预算（默认 1MB 线程栈下留足余量）
-const MAX_STACK_BUDGET: usize = 512 * 1024;
+/// 编译递归可用的宿主栈预算默认值（默认 1MB 线程栈下留足余量）
+pub const MAX_STACK_BUDGET: usize = 512 * 1024;
+
+/// 运行时上限（默认同上）。用 AtomicUsize 是因为编译器没有共享状态可挂。
+static NESTING_DEPTH_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_NESTING_DEPTH);
+static STACK_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_STACK_BUDGET);
+
+/// 设置编译器的递归上限（层数 + 实际栈预算）。
+///
+/// 单线程解释器里这是全局量；CLI 在启动时按自己的栈大小设定一次。
+/// 参考实现实测：500 层括号能编、800 层栈溢出崩溃 —— 所以 CLI 取 700 层 / 8MB，
+/// 让"它能编的我们都能编"，而它崩的那档我们给可捕获的编译错误。
+pub fn set_compiler_limits(nesting_depth: usize, stack_budget_bytes: usize) {
+    NESTING_DEPTH_LIMIT.store(nesting_depth, std::sync::atomic::Ordering::Relaxed);
+    STACK_BUDGET.store(stack_budget_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn nesting_depth_limit() -> usize {
+    NESTING_DEPTH_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn stack_budget() -> usize {
+    STACK_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 取一个"当前栈位置"的近似值（独立帧，避免被优化掉）
 #[inline(never)]
@@ -501,10 +528,12 @@ impl Compiler {
 
     /// 递归深度守卫：超限时返回编译错误，而不是让宿主栈溢出
     fn enter_nesting(&mut self) -> Result<(), CompileError> {
+        let max_depth = nesting_depth_limit();
+        let budget = stack_budget();
         // 实际栈用量（当前栈位置与编译入口处的距离）
         let here = stack_probe();
         let used = (self.stack_base as i64 - here as i64).unsigned_abs() as usize;
-        if self.depth >= MAX_NESTING_DEPTH || used > MAX_STACK_BUDGET {
+        if self.depth >= max_depth || used > budget {
             return cerr("nesting too deep");
         }
         self.depth += 1;

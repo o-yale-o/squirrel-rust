@@ -89,6 +89,8 @@ pub struct VmData {
     pub reserve_stack_headroom: SQInteger,
     /// 打开的 outer 对应的共享单元：栈槽索引 → 单元（↔ `_valptr` 指向的槽）
     pub open_cells: Vec<(usize, std::rc::Rc<std::cell::RefCell<Value>>)>,
+    /// 指令预算（<0 = 无限制）。宿主可用于给脚本封顶，见 execute 主循环的检查。
+    pub op_budget: SQInteger,
     /// 进入本 VM 执行前，**调用方 VM** 的根快照（`mark_roots()` 的结果）。
     ///
     /// 为什么需要：线程由另一个 VM 调起时，那个宿 VM 的 `RefCell` 被外层执行路径
@@ -178,6 +180,7 @@ impl VmData {
             nmetamethodscall: 0,
             reserve_stack_headroom: 0,
             open_cells: Vec::new(),
+            op_budget: -1,
             outer_roots: std::cell::RefCell::new(Vec::new()),
             releasehook: None,
             suspended: false,
@@ -2279,6 +2282,15 @@ fn run_instructions(
     _raiseerror: bool,
 ) -> Result<ExecOutcome, Value> {
     loop {
+        // 指令预算（P3 加固，参考实现没有）：宿主可以用 `--max-ops` 给脚本封顶，
+        // 免得死循环把宿主挂住。用"每 4096 条检查一次"摊薄成本。
+        if vm.op_budget >= 0 {
+            vm.op_budget -= 4096;
+            if vm.op_budget < 0 {
+                vm.raise_error_str("execution budget exceeded");
+                throw!(vm)
+            }
+        }
         // 取指（ci->_ip++）
         let (instr, proto) = {
             let ci = vm.last_callinfo();
