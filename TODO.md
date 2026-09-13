@@ -3,6 +3,27 @@
 > 本文是**按当前实测**排的待办清单（不是猜测）。每条都给：为什么排这个位置、怎么验证、
 > 大致工作量（"轮" ≈ 一次 生成矩阵 → 差分 → 修 → 进语料 → 加测试 → 提交 的循环）。
 > 盘点脚本全部可重跑，见文末"复现命令"。
+>
+> **进度（最新）**：P1 十项**全部完成**（详见 STATUS 三·补9 ~ 三·补18）；
+> 语料 57 → **69 个文件**、Rust 测试 85 → **105**，全程未回退任何既有绿灯。
+> 下一步：P2（宿主 API 补齐）→ P3（健壮性加固）→ P4（文档与迁移指南）。
+> **P0（C ABI）仍在等用户确认宿主形态**（纯解释器用则不需要）。
+
+## P1 完成情况（2026-09 本轮）
+
+| # | 面 | 语料 | 结果 |
+|---|---|---|---|
+| P1-1 | 数值/运算符边界 | `t_nummatrix.nut` 4533 条 | 修**移位计数掩码**（x86 低 6 位）；定位 `INT64_MIN / -1` 硬件陷（参考实现崩） |
+| P1-2 | weakref / GC | `t_weakmap.nut` 63 条 | 零差异；`collectgarbage()` 回收计数逐一对齐 |
+| P1-3 | 词法/编译面 | `t_lexmatrix.nut` 203 条 + `errmsg_matrix.py` 60 条 | 修**字符串下标有符号性**（`"\xff"[0]` == -1）；编译错误文本全一致 |
+| P1-4 | blob / stream 二进制 | `t_blobmap.nut` 133 条 | 修**非法文件模式**（参考实现 `0xC0000409` 崩，改成白名单校验） |
+| P1-5 | io / system / date | `t_sysmap.nut` 45 条 | 修 `remove`/`rename`（抛错 + 返回 null）、`system`（继承 stdio）、`clock`（CPU 时间） |
+| P1-6 | 异常机制 | `t_errmap.nut` 81 条 + `t_errtail.nut` | 零语义差异；未捕获错误的 CALLSTACK/LOCALS dump **逐字节一致** |
+| P1-7 | 类属性 `</ … />` | `t_attrmap.nut` 40 条 | 修 `setattributes(null, …)` 设类级属性（返回旧值） |
+| P1-8 | suspend 穿透 native | `t_suspmap.nut` 16 条 + `t_suspend_main.nut` | 零差异；`_get` 里 suspend 报的是"元方法不能扩栈" |
+| P1-9 | 多线程 × GC | `t_gcx.nut` 16 条 | 修 **panic**（线程里 `collectgarbage()` 撞 RefCell）+ **当前 VM 根集合缺失**（线程栈对象被误回收） |
+| P1-10 | 序列化往返 | `t_sermap.nut` 25 条 | 修 native closure 错误文本；确认默认参数值往返丢失（两侧一致） |
+
 
 ---
 
