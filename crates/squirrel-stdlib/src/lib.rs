@@ -640,7 +640,16 @@ fn io_writeclosuretofile(v: &mut VmData) -> SQInteger {
             Err(_) => SQ_ERROR,
         }
     } else {
-        throw_error(v, "closure expected")
+        // ↔ sq_aux_gettypedarg：native closure 过得了 `.sc` 掩码、但过不了 OT_CLOSURE 检查，
+        // 报的是 `wrong argument type, expected 'function' got '<PrintObjVal>'`
+        // —— 后者对 native closure 就是类型名，于是出现那句
+        // "expected 'function' got 'function'"
+        let got = match &clo {
+            Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
+            other => squirrel::object::get_type_name(other).unwrap_or("unknown").to_string(),
+        };
+        let got: String = got.chars().take(50).collect();
+        throw_error(v, &format!("wrong argument type, expected 'function' got '{}'", got))
     }
 }
 

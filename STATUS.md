@@ -932,6 +932,41 @@ GC 标记根集合时要 `borrow()` **宿 VM**（线程的调用方），而宿 
 
 `crates/squirrel-stdlib/tests/gc_thread_semantics.rs`（1 个测试，10 条断言）。
 
+## 三·补18、第十八轮（P1-10）：序列化往返（脚本侧 `writeclosuretofile`）
+
+`tools/gen_ser.py` → `tests-corpus/t_sermap.nut`：**25 条**，两侧只差指针文本。
+
+### 修出的差异：native closure 的错误文本
+
+`writeclosuretofile(P, print)`（native closure）过得了注册项的 `.sc` 类型掩码
+（掩码 = closure|nativeclosure），但过不了 `sq_aux_gettypedarg(OT_CLOSURE)`：
+
+```text
+wrong argument type, expected 'function' got 'function'
+```
+
+后半段是参考实现的 `PrintObjVal`（对 native closure 退化成类型名），
+于是出现这句"expected 'function' got 'function'"。本实现原来只报 `closure expected`。
+
+### 顺带确认的语义（两侧一致）
+
+| 形态 | 结果 |
+|---|---|
+| 普通闭包 / 带参 / varargs / 字符串（含 `\u00e9`、`\xff`）/ 浮点 / 类 / 嵌套函数 / 控制流 / 内部生成器 | 往返后**都能正常调用**且结果一致 |
+| **默认参数值** | 往返后**丢失**（`g(1)` 里 `b` 是 `null` → `arith op + on between 'integer' and 'null'`）——参考实现同样如此，被忠实复刻 |
+| 带自由变量（outer）的闭包 | `a closure with free variables bound cannot be serialized` |
+| 往返后的闭包再写出 | 可以（`double_roundtrip=12`） |
+| 非闭包 / 表 | 类型掩码先拦：`parameter 2 has an invalid type '…' ; expected: 'function|function'` |
+| 路径打不开 | `cannot open the file` |
+| `loadfile` 读**文本/空文件** | 当作源码编译，返回闭包（`typeof` = `function`） |
+
+`.cnut` 的**字节一致**另有 `tools/cnut_matrix.py` 守门（69/69 字节一致 + 双向交叉执行）。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/serialization_semantics.rs`（2 个测试：
+闭包往返与错误文本、`loadfile` 的文本/空文件嗅探）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
