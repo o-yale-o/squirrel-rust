@@ -99,7 +99,8 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | 属性块 `</ … />` | **必须独占一行**；成员之后写、单行写第二个块都是语法错 |
 | `function named() {}` | 只能作**语句**：`local f = function named(){}` 报 `expected '('` |
 | `dofile`/`loadfile` 第 2 参 | 是 `printerror` **布尔**，不是脚本实参 |
-| 序列化默认参数 | 往返**会丢**默认值（`g(1)` 里缺省参数变 `null`） |
+| 序列化默认参数 | 往返**会丢**默认值，但**只丢"被直接序列化的那个闭包自己"的**：`writeclosuretofile(P, function(a, b = 100) {...})` 读回后 `g(1)` 里 `b` 是 `null`；而闭包**内部**嵌套函数的默认值（`f(1)` → `b=100`）、它**返回出去**的内部闭包（`inner=77`）、以及 varargs（`vargv.len()`）都完好 |
+| `writeclosuretofile` 的**检查顺序**与残留文件 | 顺序是"掩码 → 开文件 → 序列化"：① 第 3 参过不了 `.sc` 掩码（传整数）→ 参数类型错，**不会建文件**；② 过了掩码**先 `fopen(...,"wb+")`**：路径不可写 → `cannot open the file`（**哪怕第 3 参是 native closure、后面还会类型不符**）；③ 路径可写则文件**立刻建出来**，之后无论序列化失败（自由变量）还是 native closure 不匹配，那个 **0 字节文件都会留在磁盘上**。写脚本时别用 `writeclosuretofile` 的返回值判断"文件有没有生成"，要自己检查 |
 | 未捕获错误的退出码 | 是 0（`retval` 不被错误覆盖）；CLI 加载失败才是 −2 |
 | tail call | `return inner()` 会**复用当前帧**，出错时调用栈里看不到这一层 |
 | string 库是**全局函数**，不是字符串方法 | `strip/lstrip/rstrip/split/escape/startswith/endswith/format/printf` 都要写成 `startswith("abc","a")`；`"abc".startswith("a")` 报 `the index 'startswith' does not exist` |

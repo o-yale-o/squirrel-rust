@@ -378,19 +378,36 @@ def mutate_program(seed):
     return "\n".join(lines) + "\n", name
 
 
+def _side_dir(exe):
+    """每个引擎一个**独立且干净**的工作目录。
+
+    为什么不能共用：变异会把语料的写入改成追加、或把读取挪到写入之前，
+    于是第二个引擎会读到第一个引擎留下的文件，输出随之不同 —— 实测在序列化语料上
+    刷出一批"2 行不同"的**偶发差异**（同一条用例再跑一次就没了）。两个引擎各自
+    从相同初态出发，这类假差异就消失了。
+    """
+    d = os.path.join(WORK, "rust" if exe == RUST else "ref")
+    return d
+
+
+def _reset_side_dirs():
+    for name in ("rust", "ref"):
+        d = os.path.join(WORK, name)
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+
+
 def run(exe, path):
     """跑一个脚本；超时按"死循环"处理（变异会把有界循环改成死循环，实测踩到过）。
 
     超时必须是**可分类的结果**而不是异常：否则整轮扫描会直接崩在中间。
 
-    **cwd 一定用私有目录 WORK，不能用仓库根目录**：变异会把字符串字面量换成别的值，
-    如果那处恰好是文件路径，就会在 cwd 里建出文件来（实测在仓库根目录留下过一个
-    名为 `abc` 的空文件）；更要紧的是，语料里的临时文件名是固定的
-    （`streammap_tmp.bin` 之类），cwd 相同就会和同时跑的差分测试**互相踩**
-    （实测 t_streammap 因此出现 len 0/5/8 的乱序差异）。私有 cwd 把两类干扰都挡掉。
+    cwd 用各自私有的空地：既避免污染仓库根目录（变异把字符串换成 "abc" 时若那处是
+    文件路径就会建出文件来），也避免两个引擎之间通过文件系统互相影响。
     """
     try:
-        p = subprocess.run([exe, path], capture_output=True, cwd=WORK, timeout=TIMEOUT)
+        p = subprocess.run([exe, path], capture_output=True, cwd=_side_dir(exe),
+                           timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
         return TIMEOUT_RC, "", "timeout"
     out = p.stdout.decode("utf8", "replace").replace("\r", "")
@@ -411,7 +428,9 @@ def compare(src, tag, require_done=True):
     path = os.path.join(WORK, "case_%s.nut" % tag)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(src)
+    _reset_side_dirs()   # 两个引擎从相同的空目录出发（见 _side_dir 的说明）
     rc_r, out_r, err_r = run(RUST, path)
+    _reset_side_dirs()
     rc_f, out_f, err_f = run(REF, path)
     if rc_r == TIMEOUT_RC or rc_f == TIMEOUT_RC:
         # 变异把有界循环/有界递归改成死循环是常事。

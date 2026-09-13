@@ -627,19 +627,38 @@ fn io_writeclosuretofile(v: &mut VmData) -> SQInteger {
     let fname = v.get_up(-2);
     let clo = v.get_up(-1);
     let filename = String::from_utf8_lossy(fname.as_bytes()).into_owned();
+    // ↔ sqstd_writeclosuretofile：**先 fopen("wb+")，再交给 sq_writeclosure**。
+    // 顺序是实测出来的（模糊测试在私有工作目录里暴露的差异），而且很反直觉：
+    //   - 第 3 参过不了 `.sc` 掩码时（比如传整数），掩码错误先报，**不会**建文件；
+    //   - 过了掩码之后先开文件：路径不可写 → "cannot open the file"（哪怕第 3 参是
+    //     native closure、后面还会类型不符）；
+    //   - 路径可写则文件立刻建出来，之后无论序列化失败（自由变量）还是类型检查失败
+    //     （native closure 不匹配 OT_CLOSURE），那个 **0 字节文件都会留在磁盘上**。
+    let mut f = match std::fs::File::create(&filename) {
+        Ok(f) => f,
+        Err(_) => return throw_error(v, "cannot open the file"),
+    };
     if let Value::Closure(c) = &clo {
         match squirrel::serialization::write_closure(v, c) {
             Ok(bytes) => {
-                if std::fs::write(&filename, bytes).is_err() {
-                    return throw_error(v, "cannot open the file");
+                if std::io::Write::write_all(&mut f, &bytes).is_err() {
+                    // 参考实现这一步**不查** file_write 的返回值，等于静默成功。
+                    // 按本仓库的健壮性约定，这里报可捕获错误；该路径在差分里触发不到
+                    // （要磁盘满之类的环境），属于有意保留的差异。
+                    return throw_error(v, "cannot write the file");
                 }
+                drop(f);
                 // C++ 返回 1 且栈顶仍是闭包：返回值就是被写出的闭包本身
                 v.push(clo);
                 1
             }
+            // 错误已由 write_closure 设置；文件留着（与参考实现一致）
             Err(_) => SQ_ERROR,
         }
     } else {
+        // ↔ sq_writeclosure 的 OT_CLOSURE 检查：native closure / 其它类型走到这里，
+        // 文件此时已经建出来并会留下（与参考实现一致）
+        drop(f);
         // ↔ sq_aux_gettypedarg：native closure 过得了 `.sc` 掩码、但过不了 OT_CLOSURE 检查，
         // 报的是 `wrong argument type, expected 'function' got '<PrintObjVal>'`
         // —— 后者对 native closure 就是类型名，于是出现那句
