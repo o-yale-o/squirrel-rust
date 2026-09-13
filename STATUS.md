@@ -725,6 +725,37 @@ file(p, "rx")  file(p, "rw")  file(p, "rbb")  file(p, "trash")  file(p, "r\tb")
 `writen/readn` 类型分派与字节序、非法模式可捕获（`ref-crash-skip`）、
 外加原有的文件/blob 流语义与 `readblob` 夹取。
 
+## 三·补13、第十三轮（P1-5）：io / system / date 矩阵
+
+`tools/gen_sysmap.py` → `tests-corpus/t_sysmap.nut`：**45 条**，两侧逐字节一致
+（`date` 用固定时间戳、本地与 UTC 各一套；`system` 只跑无害命令；
+`getenv`/`time`/`clock` 只比类型与范围；`loadfile`/`dofile` 覆盖成功/编译错/缺文件）。
+
+### 抓到的两处真实差异
+
+| 位置 | 参考实现 | 本实现（改前） | 现在 |
+|---|---|---|---|
+| `remove(路径)` | 失败**抛错** `remove() failed`；成功返回 **0 个值**（脚本看到 `null`） | 失败返回 `-1`、成功返回 `0` | 一致 |
+| `rename(旧,新)` | 失败抛错 `rename() failed`；成功返回 `null` | 返回 `-1` / `0` | 一致 |
+| `system(命令)` | ↔ CRT `system()`：子进程**继承**父进程 stdio，`system("echo X")` 会把 `X` 打到脚本 stdout | 用 `.output()` 把子进程输出捕获后丢掉 | 一致（改 `.status()`） |
+| `clock()` | **进程 CPU 时间**（`clock()/CLOCKS_PER_SEC`） | 墙上时间（`SystemTime` 差值）—— 类型上测不出来，语义是错的 | 一致（`GetProcessTimes`） |
+
+### 复核过但**不是**差异的两点
+
+* `dofile(p, x)` 的第 2 个参数是 **`printerror` 布尔**（注册项 `-2, ".sb"`），
+  不是脚本实参 —— 传字符串会得到
+  `parameter 2 has an invalid type 'string' ; expected: 'bool'`。起初以为我们注册错了，
+  翻 `sqstdio.cpp` 的 `_DECL_GLOBALIO_FUNC` 后确认**与参考实现一致**，
+  是我们的测试期望写错了；`loadfile` 额外实参被忽略、`typeof loadfile(p)` 是
+  `function`、缺文件报 `cannot open the file`，都已实测对齐。
+* `system()` 的子进程输出与脚本自身 `print` 的**行序**取决于 stdout 缓冲策略
+  （参考实现块缓冲、退出时才 flush），不是语义差异；语料里改成重定向到文件再读回。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/system_semantics.rs`（3 个测试：`date` 的 UTC 字段、
+`remove/rename/system/getenv`、`loadfile/dofile`），期望值先经参考实现实测确认。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |

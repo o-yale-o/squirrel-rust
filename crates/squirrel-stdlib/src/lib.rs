@@ -189,6 +189,52 @@ thread_local! {
 // system（↔ sqstdsystem.cpp）
 // ===========================================================================
 
+/// ↔ `clock()/CLOCKS_PER_SEC`：进程占用的 CPU 秒数（user + kernel）。
+///
+/// MSVC 的 `CLOCKS_PER_SEC` 是 1000，`clock()` 返回毫秒级的 CPU 时间；
+/// 这里用 `GetProcessTimes` 拿同样的量（Windows）。其它平台退回墙上时间。
+#[cfg(windows)]
+fn process_cpu_seconds() -> f64 {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn GetProcessTimes(
+            h: *mut core::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let ft = |f: FileTime| -> u64 { ((f.high as u64) << 32) | f.low as u64 };
+    let (mut c, mut e, mut k, mut u) = (
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    );
+    unsafe {
+        if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) != 0 {
+            // FILETIME 单位是 100ns
+            return (ft(k) + ft(u)) as f64 / 1.0e7;
+        }
+    }
+    0.0
+}
+
+#[cfg(not(windows))]
+fn process_cpu_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 pub fn register_systemlib(vm: &mut VmData) {
     let ss = vm.ss.clone();
     let root = match &vm.roottable {
@@ -210,23 +256,23 @@ pub fn register_systemlib(vm: &mut VmData) {
 
     reg_global(&ss, &root, "system", Rc::new(|v: &mut VmData| {
         let cmd = v.stack_get(2);
+        // ↔ CRT `system()`：子进程**继承**父进程的 stdin/stdout/stderr。
+        // 原来用 `.output()` 把子进程输出捕获后丢掉 —— 实测 `system("echo SQTEST")`
+        // 参考实现会把 SQTEST 打到脚本 stdout 上，我们什么都不打（P1-5 抓到的差异）。
         let out = std::process::Command::new("cmd")
             .args(["/C", &String::from_utf8_lossy(cmd.as_bytes())])
-            .output();
+            .status();
         match out {
-            Ok(o) => v.push(Value::Integer(o.status.code().unwrap_or(-1) as SQInteger)),
+            Ok(o) => v.push(Value::Integer(o.code().unwrap_or(-1) as SQInteger)),
             Err(_) => v.push(Value::Integer(-1)),
         }
         1
     }), 2, Some(".s"));
 
     reg_global(&ss, &root, "clock", Rc::new(|v: &mut VmData| {
-        // ↔ clock()/CLOCKS_PER_SEC
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        v.push(Value::Float(t as SQFloat));
+        // ↔ `clock()/CLOCKS_PER_SEC`：这是**进程 CPU 时间**，不是墙上时间。
+        // 原来用 SystemTime 差值（墙上时间）——类型上测不出来，语义上是错的。
+        v.push(Value::Float(process_cpu_seconds() as SQFloat));
         1
     }), 0, None); // ↔ _DECL_FUNC(clock,0,NULL)：不做参数个数检查
 
@@ -245,24 +291,25 @@ pub fn register_systemlib(vm: &mut VmData) {
 
     reg_global(&ss, &root, "remove", Rc::new(|v: &mut VmData| {
         let p = v.stack_get(2);
-        let r = std::fs::remove_file(String::from_utf8_lossy(p.as_bytes()).as_ref())
-            .map(|_| 0)
-            .unwrap_or(-1);
-        v.push(Value::Integer(r));
-        1
+        // ↔ `_system_remove`：失败**抛错** `remove() failed`，成功返回 0 个值
+        // （脚本看到的是 null）。原来返回 -1/0，语义不同（P1-5 抓到）。
+        match std::fs::remove_file(String::from_utf8_lossy(p.as_bytes()).as_ref()) {
+            Ok(()) => 0,
+            Err(_) => throw_error(v, "remove() failed"),
+        }
     }), 2, Some(".s"));
 
     reg_global(&ss, &root, "rename", Rc::new(|v: &mut VmData| {
         let a = v.stack_get(2);
         let b = v.stack_get(3);
-        let r = std::fs::rename(
+        // ↔ `_system_rename`：失败抛错 `rename() failed`，成功返回 0 个值
+        match std::fs::rename(
             String::from_utf8_lossy(a.as_bytes()).as_ref(),
             String::from_utf8_lossy(b.as_bytes()).as_ref(),
-        )
-        .map(|_| 0)
-        .unwrap_or(-1);
-        v.push(Value::Integer(r));
-        1
+        ) {
+            Ok(()) => 0,
+            Err(_) => throw_error(v, "rename() failed"),
+        }
     }), 3, Some(".ss"));
 }
 
