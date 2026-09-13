@@ -8,6 +8,13 @@ pub struct SQArray {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
+/// 迭代式释放：深嵌套数组不能靠递归 Drop（见 crate::release）
+impl Drop for SQArray {
+    fn drop(&mut self) {
+        crate::release::release_values(std::mem::take(&mut self.values));
+    }
+}
+
 impl SQArray {
     /// ↔ SQArray::Create
     pub fn create(ss: &crate::state::SharedState, initial_size: SQInteger) -> crate::object::ArrayRef {

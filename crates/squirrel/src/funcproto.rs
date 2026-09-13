@@ -67,8 +67,19 @@ pub struct SQFunctionProto {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
-impl SQFunctionProto {
-    /// 构造空结构（字段由编译器随后填充）
+/// 迭代式释放：字面量/子原型里可能嵌着容器（见 crate::release）
+impl Drop for SQFunctionProto {
+    fn drop(&mut self) {
+        let mut kids: Vec<Value> = std::mem::take(&mut self.literals);
+        kids.append(&mut self.functions);
+        kids.append(&mut self.parameters);
+        kids.push(std::mem::replace(&mut self.name, Value::Null));
+        kids.push(std::mem::replace(&mut self.sourcename, Value::Null));
+        crate::release::release_values(kids);
+    }
+}
+
+impl SQFunctionProto {    /// 构造空结构（字段由编译器随后填充）
     pub fn empty(sourcename: Value, name: Value) -> SQFunctionProto {
         SQFunctionProto {
             sourcename,

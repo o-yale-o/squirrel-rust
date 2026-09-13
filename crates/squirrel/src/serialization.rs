@@ -201,9 +201,14 @@ impl<'a> Reader<'a> {
         Some(f32::from_le_bytes(b.try_into().unwrap()))
     }
     fn raw(&mut self, n: usize) -> Option<&'a [u8]> {
-        let b = self.buf.get(self.pos..self.pos + n)?;
+        let b = self.buf.get(self.pos..self.pos.checked_add(n)?)?;
         self.pos += n;
         Some(b)
+    }
+
+    /// 剩余可读字节数（用于在循环/长度算术之前做上界校验）
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
     fn tag(&mut self, expect: u32) -> bool {
         match self.u32() {
@@ -234,8 +239,25 @@ fn read_object(vm: &VmData, r: &mut Reader) -> Option<Value> {
     Some(v)
 }
 
+/// .cnut 里函数原型的最大嵌套层数（防御畸形文件把递归变成宿主栈溢出）
+const MAX_PROTO_DEPTH: usize = 64;
+/// 函数栈大小上限（防御畸形文件里的天文数字导致分配 abort）
+const MAX_STACKSIZE: SQInteger = 1 << 20;
+
 /// ↔ SQFunctionProto::Load
 fn proto_load(vm: &VmData, r: &mut Reader, ss: &Rc<crate::state::SharedState>) -> Option<FuncProtoRef> {
+    proto_load_depth(vm, r, ss, 0)
+}
+
+fn proto_load_depth(
+    vm: &VmData,
+    r: &mut Reader,
+    ss: &Rc<crate::state::SharedState>,
+    depth: usize,
+) -> Option<FuncProtoRef> {
+    if depth > MAX_PROTO_DEPTH {
+        return None;
+    }
     if !r.tag(SQ_CLOSURESTREAM_PART) {
         return None;
     }
@@ -256,6 +278,21 @@ fn proto_load(vm: &VmData, r: &mut Reader, ss: &Rc<crate::state::SharedState>) -
     let nfunctions = r.i64()?;
     if nliterals < 0 || nparameters < 0 || noutervalues < 0 || nlocalvarinfos < 0
         || nlineinfos < 0 || ndefaultparams < 0 || ninstructions < 0 || nfunctions < 0
+    {
+        return None;
+    }
+    // 先按「每个元素的最小字节数」校验所有计数不超过剩余字节：
+    // 恶意 .cnut 里的巨大计数会在这里被拒，后面的长度算术与循环都不可能溢出/爆内存
+    let rem = r.remaining() as u128;
+    let fits = |n: SQInteger, per: u128| (n as u128).saturating_mul(per) <= rem;
+    if !fits(nliterals, 4)
+        || !fits(nparameters, 4)
+        || !fits(noutervalues, 12)
+        || !fits(nlocalvarinfos, 25)
+        || !fits(nlineinfos, 16)
+        || !fits(ndefaultparams, 8)
+        || !fits(ninstructions, 8)
+        || !fits(nfunctions, 1)
     {
         return None;
     }
@@ -313,7 +350,9 @@ fn proto_load(vm: &VmData, r: &mut Reader, ss: &Rc<crate::state::SharedState>) -
     if !r.tag(SQ_CLOSURESTREAM_PART) {
         return None;
     }
-    let ins_bytes = r.raw(ninstructions as usize * 8)?;
+    // 计数上界已在前面按剩余字节校验过，这里的乘法不会溢出
+    let ins_len = (ninstructions as usize).checked_mul(8)?;
+    let ins_bytes = r.raw(ins_len)?;
     for chunk in ins_bytes.chunks_exact(8) {
         f.instructions.push(unsafe {
             std::mem::transmute::<[u8; 8], SQInstruction>(chunk.try_into().unwrap())
@@ -323,12 +362,16 @@ fn proto_load(vm: &VmData, r: &mut Reader, ss: &Rc<crate::state::SharedState>) -
         return None;
     }
     for _ in 0..nfunctions {
-        let sub = proto_load(vm, r, ss)?;
+        let sub = proto_load_depth(vm, r, ss, depth + 1)?;
         f.functions.push(Value::FuncProto(sub));
     }
     f.stacksize = r.i64()?;
     f.bgenerator = r.u8()? != 0;
     f.varparams = r.i64()?;
+    // 栈大小必须落在合理范围内：畸形文件里的天文数字会让后续 resize 直接 abort
+    if !(0..=MAX_STACKSIZE).contains(&f.stacksize) {
+        return None;
+    }
     Some(SQFunctionProto::register(ss, f))
 }
 

@@ -24,8 +24,11 @@ pub fn format_g_prec(value: f64, prec: usize) -> String {
 
     // 先按 p 位有效数字做科学计数舍入，取指数 X
     let formatted_e = format!("{:.*e}", p - 1, value);
-    let (mant, exp) = formatted_e.split_once('e').unwrap();
-    let x: i32 = exp.parse().unwrap();
+    let (mant, exp) = match formatted_e.split_once('e') {
+        Some(v) => v,
+        None => return formatted_e, // 理论上不可达：格式化输出必含 'e'
+    };
+    let x: i32 = exp.parse().unwrap_or(0);
 
     if x < -4 || x >= p as i32 {
         // e 风格：精度 p-1，去尾随零；MSVC 指数至少 2 位（如 1e+010）
@@ -70,8 +73,11 @@ pub fn format_e_crt(value: f64, prec: usize) -> String {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();
     }
     let s = format!("{:.*e}", prec, value);
-    let (m, e) = s.split_once('e').unwrap();
-    let x: i32 = e.parse().unwrap();
+    let (m, e) = match s.split_once('e') {
+        Some(v) => v,
+        None => return s,
+    };
+    let x: i32 = e.parse().unwrap_or(0);
     format!("{}e{}{:02}", m, if x < 0 { "-" } else { "+" }, x.abs())
 }
 
@@ -95,8 +101,11 @@ pub fn format_e(value: f64, prec: usize) -> String {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();
     }
     let s = format!("{:.*e}", prec, value);
-    let (m, e) = s.split_once('e').unwrap();
-    let x: i32 = e.parse().unwrap();
+    let (m, e) = match s.split_once('e') {
+        Some(v) => v,
+        None => return s,
+    };
+    let x: i32 = e.parse().unwrap_or(0);
     let mut mant = m.to_string();
     if mant.contains('.') {
         while mant.ends_with('0') {

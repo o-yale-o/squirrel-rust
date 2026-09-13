@@ -114,4 +114,21 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 - `file` 的 stdin 读取为行缓冲近似（CRT 是完全缓冲，交互式逐字节读有差异）；
 - 少数**参考实现自身越界/UB** 的场景取确定性行为（详见 `STATUS.md` 第四节）：
   `escape` 短字符串中的高位字节、`getstackinfos(-1)`、UCRT `date` 上界、
-  在已挂起的线程上再次 `call()`、REPL 读到 EOF。
+  在已挂起的线程上再次 `call()`、REPL 读到 EOF、空正则模式（参考实现会写 NULL 崩溃）。
+
+## 健壮性约定（硬约束）
+
+> 任何对象在执行 / 解引用 / 索引之前，先做**非空、范围、类型**校验。
+> 内部不变式被破坏时必须退化为**可捕获的脚本错误或 `Err`**，
+> 不允许 `panic!` / `unreachable!` / 越界索引 / 算术溢出 / 递归爆栈——
+> 那是宿主进程的 abort，脚本无法捕获。
+
+已按此约定硬化并加测试守门（`cargo test` 会跑）：
+
+| 测试 | 覆盖 |
+|---|---|
+| `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用、畸形 `.cnut`、畸形正则、深递归、深嵌套值释放、超深嵌套编译 |
+| `crates/squirrel/tests/deep_release.rs` | 释放循环嵌套深度 ≤ 3（10 万层数组/表/闭包/生成器/线程，含 1MB 栈线程） |
+
+对应实现：`crates/squirrel/src/release.rs`（迭代式释放）、编译器嵌套/栈预算守卫、
+反序列化长度上界校验。

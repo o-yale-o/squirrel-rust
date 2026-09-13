@@ -15,6 +15,15 @@ pub struct SQUserData {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
+/// 迭代式释放：delegate 可能链得很深（见 crate::release）
+impl Drop for SQUserData {
+    fn drop(&mut self) {
+        if let Some(d) = self.delegate.take() {
+            crate::release::release_value(Value::Table(d));
+        }
+    }
+}
+
 impl SQUserData {
     /// ↔ SQUserData::Create
     pub fn create(ss: &crate::state::SharedState, size: SQInteger) -> crate::object::UserdataRef {

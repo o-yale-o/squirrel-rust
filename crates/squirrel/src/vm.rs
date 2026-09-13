@@ -2061,9 +2061,14 @@ fn execute_inner(
                     vm.call_error_handler(&currerror);
                 }
                 while !vm.callsstack.is_empty() {
-                    let has_traps = vm.last_callinfo().etraps > 0;
+                    let has_traps = vm.last_callinfo().etraps > 0 && !vm.etraps.is_empty();
                     if has_traps {
-                        let et_trap = vm.etraps.last().unwrap().clone();
+                        // 上面已确认两侧都非空：trap 栈与 ci.etraps 失配（畸形字节码）时
+                        // 退化为「无 trap」继续出栈，而不是 panic
+                        let et_trap = match vm.etraps.last() {
+                            Some(t) => t.clone(),
+                            None => break,
+                        };
                         {
                             let ci = vm.last_callinfo_mut();
                             ci.ip = et_trap.ip;
@@ -2623,7 +2628,14 @@ fn run_instructions(
                     if !vm.openouters.is_empty() {
                         vm.close_outers(vm.stackbase as usize);
                     }
-                    let gen = vm.last_callinfo().generator.clone().unwrap();
+                    // 帧上没有生成器（畸形字节码 / 伪造 bgenerator 标志）时按普通 yield 报错
+                    let gen = match vm.last_callinfo().generator.clone() {
+                        Some(g) => g,
+                        None => {
+                            vm.raise_error_str("trying to yield a 'null',only genenerator can be yielded");
+                            throw!(vm)
+                        }
+                    };
                     let ok = gen.borrow_mut().r#yield(vm, arg2);
                     if !ok {
                         throw!(vm)

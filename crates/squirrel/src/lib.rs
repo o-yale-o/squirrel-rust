@@ -29,6 +29,7 @@ pub mod funcstate;
 pub mod lexer;
 pub mod object;
 pub mod opcodes;
+pub mod release;
 pub mod serialization;
 pub mod state;
 pub mod table;

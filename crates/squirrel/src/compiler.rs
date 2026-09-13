@@ -45,6 +45,20 @@ struct Scope {
     stacksize: SQInteger,
 }
 
+/// 递归嵌套上限：恶意/超深源码若不加限制会把宿主线程栈打爆（不可捕获的 abort）。
+/// 除了层数，还按**实际用掉的宿主栈字节**把关，这样在 release / debug / 各种
+/// 宿主栈大小下都不会溢出。
+pub const MAX_NESTING_DEPTH: usize = 200;
+/// 编译递归可用的宿主栈预算（默认 1MB 线程栈下留足余量）
+const MAX_STACK_BUDGET: usize = 512 * 1024;
+
+/// 取一个"当前栈位置"的近似值（独立帧，避免被优化掉）
+#[inline(never)]
+fn stack_probe() -> usize {
+    let x: usize = 0;
+    &x as *const usize as usize
+}
+
 fn cerr<T>(msg: impl Into<String>) -> Result<T, CompileError> {
     Err(CompileError { msg: msg.into() })
 }
@@ -61,6 +75,10 @@ pub struct Compiler {
     ss: Rc<SharedState>,
     /// 参数解析期间暂存默认参数槽位（create_function 用）
     pending_default_params: Vec<SQInteger>,
+    /// 当前语句/表达式递归深度（↔ 防御超深嵌套）
+    depth: usize,
+    /// 编译入口处的栈地址（用于估算递归已用掉的宿主栈）
+    stack_base: usize,
 }
 
 /// ↔ bool Compile(SQVM*, SQLEXREADFUNC, up, sourcename, out, raiseerror, lineinfo)
@@ -88,7 +106,10 @@ pub fn compile(
         },
         ss,
         pending_default_params: Vec::new(),
+        depth: 0,
+        stack_base: 0,
     };
+    c.stack_base = stack_probe();
     match c.run() {
         Ok(proto) => Ok(proto),
         Err(e) => {
@@ -233,8 +254,15 @@ impl Compiler {
         Ok(())
     }
 
-    /// ↔ Statement(bool closeframe)
+    /// ↔ Statement(bool closeframe)（进入前做递归深度校验）
     fn statement(&mut self, closeframe: bool) -> Result<(), CompileError> {
+        self.enter_nesting()?;
+        let r = self.statement_inner(closeframe);
+        self.depth -= 1;
+        r
+    }
+
+    fn statement_inner(&mut self, closeframe: bool) -> Result<(), CompileError> {
         let curline = self.lex.currentline;
         let li = self.lineinfo;
         self.fs().add_line_infos(curline, li, false)?;
@@ -463,8 +491,27 @@ impl Compiler {
         Ok(())
     }
 
-    /// ↔ Expression
+    /// ↔ Expression（进入前做递归深度校验）
     fn expression(&mut self) -> Result<(), CompileError> {
+        self.enter_nesting()?;
+        let r = self.expression_inner();
+        self.depth -= 1;
+        r
+    }
+
+    /// 递归深度守卫：超限时返回编译错误，而不是让宿主栈溢出
+    fn enter_nesting(&mut self) -> Result<(), CompileError> {
+        // 实际栈用量（当前栈位置与编译入口处的距离）
+        let here = stack_probe();
+        let used = (self.stack_base as i64 - here as i64).unsigned_abs() as usize;
+        if self.depth >= MAX_NESTING_DEPTH || used > MAX_STACK_BUDGET {
+            return cerr("nesting too deep");
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn expression_inner(&mut self) -> Result<(), CompileError> {
         let es = self.es;
         self.es.etype = EXPR;
         self.es.epos = -1;
@@ -2108,7 +2155,10 @@ mod tests {
             },
             ss,
             pending_default_params: Vec::new(),
+            depth: 0,
+            stack_base: 0,
         };
+        c.stack_base = stack_probe();
         // run() 里错误路径用到 raiseerror/compilererrorhandler——测试里 raiseerror=false 安全
         // 但 run 的错误分支访问 self.ss.compilererrorhandler；此处直接调用内部 run
         c.run_test()

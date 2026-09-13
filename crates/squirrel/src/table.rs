@@ -25,10 +25,24 @@ fn null_node() -> HashNode {
     }
 }
 
+/// 迭代式释放：深嵌套表不能靠递归 Drop（见 crate::release）
+impl Drop for SQTable {
+    fn drop(&mut self) {
+        let mut kids: Vec<Value> = Vec::with_capacity(self.nodes.len() * 2 + 1);
+        for n in self.nodes.drain(..) {
+            kids.push(n.key);
+            kids.push(n.val);
+        }
+        if let Some(d) = self.delegate.take() {
+            kids.push(Value::Table(d));
+        }
+        crate::release::release_values(kids);
+    }
+}
+
 pub struct SQTable {
     pub firstfree: usize,
-    pub nodes: Vec<HashNode>,
-    pub numofnodes: SQInteger,
+    pub nodes: Vec<HashNode>,    pub numofnodes: SQInteger,
     pub usednodes: SQInteger,
     pub delegate: Option<crate::object::TableRef>,
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,

@@ -20,6 +20,18 @@ pub struct SQClosure {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
+/// 迭代式释放：outer 值链可能很深（见 crate::release）
+impl Drop for SQClosure {
+    fn drop(&mut self) {
+        let mut kids: Vec<Value> = std::mem::take(&mut self.outervalues);
+        kids.append(&mut self.defaultparams);
+        if let Some(b) = self.base.take() {
+            kids.push(Value::Class(b));
+        }
+        crate::release::release_values(kids);
+    }
+}
+
 impl SQClosure {
     /// ↔ SQClosure::Create
     pub fn create(
@@ -122,6 +134,15 @@ pub struct SQGenerator {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
+/// 迭代式释放：挂起栈里可能压着很深的值（见 crate::release）
+impl Drop for SQGenerator {
+    fn drop(&mut self) {
+        let mut kids: Vec<Value> = std::mem::take(&mut self.stack);
+        kids.push(std::mem::replace(&mut self.closure, Value::Null));
+        crate::release::release_values(kids);
+    }
+}
+
 impl SQGenerator {
     pub fn create(ss: &crate::state::SharedState, closure: &ClosureRef) -> GeneratorRef {
         let rc = GeneratorRef::new(std::cell::RefCell::new(SQGenerator {
@@ -173,7 +194,11 @@ impl SQGenerator {
         self.ci = vm.last_callinfo().clone();
         self.ci.generator = None;
         for _ in 0..self.ci.etraps {
-            let mut et = vm.etraps.pop().unwrap();
+            // trap 栈为空（畸形字节码）时停止搬运，绝不 panic
+            let mut et = match vm.etraps.pop() {
+                Some(et) => et,
+                None => break,
+            };
             // 存相对栈基，resume 时可能恢复到不同的 _top
             et.stackbase -= vm.stackbase;
             et.stacksize -= vm.stackbase;
@@ -211,7 +236,11 @@ impl SQGenerator {
         }
 
         for _ in 0..self.ci.etraps {
-            let mut et = self.etraps.pop().unwrap();
+            // 恢复时若自身 trap 栈已空（畸形字节码），停止搬运，绝不 panic
+            let mut et = match self.etraps.pop() {
+                Some(et) => et,
+                None => break,
+            };
             // 恢复绝对栈基
             et.stackbase += newbase;
             et.stacksize += newbase;

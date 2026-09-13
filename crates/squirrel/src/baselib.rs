@@ -1025,8 +1025,8 @@ fn array_pop(v: &mut VmData) -> NativeResult {
     let self_ = v.stack_get(1);
     if let Value::Array(a) = &self_ {
         let mut ab = a.borrow_mut();
-        if ab.size() > 0 {
-            let t = ab.values.pop().unwrap();
+        // 先判空再取（↔ C++ Pop 前的 size 检查）
+        if let Some(t) = ab.values.pop() {
             drop(ab);
             v.push(t);
             return 1;

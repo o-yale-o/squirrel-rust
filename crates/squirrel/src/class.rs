@@ -49,6 +49,30 @@ pub fn member_idx(o: &Value) -> usize {
 
 pub const MT_LAST: usize = 18;
 
+/// 迭代式释放：深嵌套类/实例不能靠递归 Drop（见 crate::release）
+impl Drop for SQClass {
+    fn drop(&mut self) {
+        let mut kids: Vec<Value> = Vec::new();
+        kids.push(Value::Table(self.members.clone()));
+        if let Some(b) = self.base.take() {
+            kids.push(Value::Class(b));
+        }
+        for m in self.defaultvalues.drain(..) {
+            kids.push(m.val);
+            kids.push(m.attrs);
+        }
+        for m in self.methods.drain(..) {
+            kids.push(m.val);
+            kids.push(m.attrs);
+        }
+        for mm in self.metamethods.drain(..) {
+            kids.push(mm);
+        }
+        kids.push(std::mem::replace(&mut self.attributes, Value::Null));
+        crate::release::release_values(kids);
+    }
+}
+
 /// ↔ SQClass
 pub struct SQClass {
     pub members: TableRef,
@@ -66,8 +90,7 @@ pub struct SQClass {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
-impl SQClass {
-    /// ↔ SQClass::SQClass(ss, base)（sqclass.cpp:13-34）
+impl SQClass {    /// ↔ SQClass::SQClass(ss, base)（sqclass.cpp:13-34）
     pub fn create(ss: &crate::state::SharedState, base: Option<ClassRef>) -> ClassRef {
         let members = match &base {
             Some(b) => b.borrow().members.borrow().clone_table(ss),
@@ -258,6 +281,20 @@ pub struct SQInstance {
     pub(crate) weakref_slot: std::cell::RefCell<Option<Value>>,
 }
 
+/// 迭代式释放：实例字段可能嵌套很深（见 crate::release）
+impl Drop for SQInstance {
+    fn drop(&mut self) {
+        let mut kids: Vec<Value> = std::mem::take(&mut self.values);
+        if let Some(c) = self.class.take() {
+            kids.push(Value::Class(c));
+        }
+        if let Some(d) = self.delegate.take() {
+            kids.push(Value::Table(d));
+        }
+        crate::release::release_values(kids);
+    }
+}
+
 impl SQInstance {
     /// ↔ SQInstance::Create
     pub fn create(ss: &crate::state::SharedState, theclass: &ClassRef) -> InstanceRef {
@@ -294,23 +331,30 @@ impl SQInstance {
         rc
     }
 
-    fn the_class(&self) -> &ClassRef {
-        self.class.as_ref().expect("instance finalized by GC")
+    /// 取类引用；实例已被 GC finalize（class 为 None）时返回 None，
+    /// 由调用方退化为「成员不存在」的普通错误，绝不 panic
+    fn the_class(&self) -> Option<&ClassRef> {
+        self.class.as_ref()
     }
 
     /// ↔ SQInstance::Get
     pub fn get(&self, key: &Value) -> Option<Value> {
-        let idx = self.the_class().borrow().members.borrow().get(key)?;
+        let c = self.the_class()?.clone();
+        let idx = c.borrow().members.borrow().get(key)?;
         if is_field(&idx) {
             Some(self.values[member_idx(&idx)].realval())
         } else {
-            Some(self.the_class().borrow().methods[member_idx(&idx)].val.clone())
+            Some(c.borrow().methods[member_idx(&idx)].val.clone())
         }
     }
 
     /// ↔ SQInstance::Set
     pub fn set(&mut self, key: &Value, val: &Value) -> bool {
-        let idx = self.the_class().borrow().members.borrow().get(key);
+        let c = match self.the_class() {
+            Some(c) => c.clone(),
+            None => return false,
+        };
+        let idx = c.borrow().members.borrow().get(key);
         if let Some(idx) = idx {
             if is_field(&idx) {
                 self.values[member_idx(&idx)] = val.clone();
@@ -322,8 +366,9 @@ impl SQInstance {
 
     /// ↔ SQInstance::GetMetaMethod（类上找 metamethod）
     pub fn get_metamethod(&self, mm: usize) -> Option<Value> {
-        let c = self.the_class().borrow();
-        let v = c.metamethods[mm].clone();
+        let c = self.the_class()?.clone();
+        let cb = c.borrow();
+        let v = cb.metamethods.get(mm)?.clone();
         if v.is_null() {
             None
         } else {
