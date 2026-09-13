@@ -309,6 +309,16 @@ SEM = [
     ("b_write_read", 'local b = blob(2); b.seek(0); b.writen(65, 0x62); b.seek(0); return b.readn(0x62);'),
     ("b_writeblob", 'local b = blob(4); local src = blob(2); src.seek(0); src.writen(1, 0x62); src.writen(2, 0x62); src.seek(0); b.seek(0); b.writeblob(src); b.seek(0); local r = b.readblob(2); return r[0] + "," + r[1];'),
     ("b_swap2", 'local b = blob(2); b.seek(0); b.writen(0x0102, 0x77); b.seek(0); b.swap2(); b.seek(0); return b.readn(0x77);'),
+    # swap2/swap4 是"整块缓冲区交换、完全不动读写位置"（参考实现直接改 GetBuf()）。
+    # 模糊测试就是靠 swap2 之后 tell() 变了 4/8 抓到这个差异的（见 P8）。
+    ("b_swap2_tell", 'local b = blob(4); b.writen(0x1234, 0x77); b.swap2(); return b.tell();'),
+    ("b_swap2_tell_after_seek", 'local b = blob(4); b.writen(0x1234, 0x77); b.seek(1); b.swap2(); return b.tell();'),
+    ("b_swap4_tell", 'local b = blob(8); b.writen(0x12345678, 0x69); b.swap4(); return b.tell();'),
+    ("b_swap4_tell_after_seek", 'local b = blob(8); b.writen(0x12345678, 0x69); b.seek(3); b.swap4(); return b.tell();'),
+    ("b_swap2_whole_buf", 'local b = blob(4); b.writen(0x0102, 0x77); b.writen(0x0304, 0x77); b.seek(1); b.swap2(); b.seek(0); return b.readn(0x69);'),
+    ("b_swap4_whole_buf", 'local b = blob(8); b.writen(0x01020304, 0x69); b.writen(0x05060708, 0x69); b.seek(5); b.swap4(); b.seek(0); return b.readn(0x69);'),
+    ("b_swap2_read_after_pos", 'local b = blob(4); b.writen(0x1234, 0x77); b.seek(1); b.swap2(); return b.readn(0x77);'),
+    ("b_swap2_odd_len", 'local b = blob(3); b.writen(0x0102, 0x77); b.seek(0); b.swap2(); b.seek(0); return b.readn(0x77);'),
     ("b_swap4", 'local b = blob(4); b.seek(0); b.writen(0x01020304, 0x69); b.seek(0); b.swap4(); b.seek(0); return b.readn(0x69);'),
     ("b_index", 'local b = blob(2); b[0] = 7; return b[0];'),
     ("b_foreach", 'local b = blob(3); b[0] = 1; b[1] = 2; local s = 0; foreach (v in b) s += v; return s;'),

@@ -179,3 +179,89 @@ fn invalid_file_modes_are_catchable_errors() {
         "w:ok\nwb:ok\na:ok\nw+b:ok\nr:ok\nrb:ok\n:E\nz:E\nzz:E\nR:E\nRB:E\nrbb:E\ntrash:E\n"
     );
 }
+
+/// `blob.swap2/swap4` 是"**整块缓冲区**交换、**完全不动读写位置**"（↔ `_blob_swap2/4`：
+/// 参考实现直接对 `self->GetBuf()` 循环 `__swap_word/__swap_dword`，从不碰 `_ptr`）。
+///
+/// 本实现原来用 snapshot → 改 → `seek(0)` + `write(&buf)` 写回，而 `write` 会把 `_ptr`
+/// 推到末尾，于是 `swap2()` 之后 `tell()` 变成 4/8。**这是随机差分模糊测试（变异模式）
+/// 抓到的真实差异**：变异 `tests-corpus/t_writeread.nut` 时，`swap2()` 之后 `seek(-1)` 失败、
+/// 位置却停在末尾，接着 `readn` 越界报 `io error`，而参考实现正常返回原值。
+#[test]
+fn blob_swap_keeps_position_and_covers_whole_buffer() {
+    let (out, err) = run_capture(
+        r#"
+        local b = blob(4);
+        b.writen(0x1234, 'w');
+        print("tell_after_write=" + b.tell() + "\n");
+        b.swap2();
+        print("tell_after_swap2=" + b.tell() + "\n");
+        b.seek(1, 'b');
+        b.swap2();
+        print("tell_after_swap2_at1=" + b.tell() + "\n");
+        local c = blob(8);
+        c.writen(0x12345678, 'i');
+        c.swap4();
+        print("tell_after_swap4=" + c.tell() + "\n");
+        // 整块交换：位置在 1 时 swap2 也交换了 [0..4)
+        // writen 是**小端**写：0x0102 → [02,01]，0x0304 → [04,03]，
+        // 整块 swap2 后变回 [01,02,03,04]，按小端读成 int 就是 0x04030201
+        local d = blob(4);
+        d.writen(0x0102, 'w');
+        d.writen(0x0304, 'w');
+        d.seek(1, 'b');
+        d.swap2();
+        d.seek(0, 'b');
+        print("whole=" + d.readn('i') + "\n");
+        d.seek(0, 'b');
+        print("first_byte=" + d.readn('b') + "\n");
+        "#,
+    );
+    assert!(err.is_empty(), "不该有错误输出：{err:?}");
+    assert_eq!(
+        out,
+        "tell_after_write=2\ntell_after_swap2=2\ntell_after_swap2_at1=1\n\
+         tell_after_swap4=4\nwhole=67305985\nfirst_byte=1\n"
+    );
+}
+
+/// 文件流上的**负绝对偏移必须失败**（↔ CRT 的 `fseek(f, -1, SEEK_SET)` 返回非 0，
+/// 参考实现据此返回 `-1`）。本实现原来把负偏移 `max(0)` 夹成 0 再当成功返回 0，
+/// 同样是模糊测试变异 `t_writeread` 抓到的差异。
+///
+/// 注意与另外两种 origin 的区别（实测参考实现）：`'c'` 负偏移会失败（位置加上后为负）、
+/// `'e'` 负偏移只要不越界就成功；而**越过末尾**的绝对偏移在文件上**是成功的**
+/// （CRT 允许 seek 到文件尾之后），blob 上则失败（见上面的 blob seek 语义）。
+#[test]
+fn file_seek_negative_absolute_offset_fails() {
+    let dir = std::env::temp_dir().join("sqrust_seekneg.bin");
+    let _ = std::fs::remove_file(&dir);
+    let p = dir.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        r#"
+        local w = file("{p}", "wb+");
+        local b = blob(2);
+        b.writen(0x1234, 'w');
+        w.writeblob(b);
+        w.flush();
+        w.seek(0, 'b');
+        print("neg_abs=" + w.seek(-1, 'b') + "\n");
+        print("tell_after_neg=" + w.tell() + "\n");
+        print("read_ok=" + w.readn('w') + "\n");
+        print("past_end=" + w.seek(99, 'b') + "\n");
+        print("tell_past=" + w.tell() + "\n");
+        w.seek(0, 'b');
+        print("neg_cur=" + w.seek(-1, 'c') + "\n");
+        print("neg_end=" + w.seek(-1, 'e') + "\n");
+        print("far_end=" + w.seek(-99, 'e') + "\n");
+        w.close();
+    "#
+    );
+    let (out, _err) = run_capture(&src);
+    assert_eq!(
+        out,
+        "neg_abs=-1\ntell_after_neg=0\nread_ok=4660\npast_end=0\ntell_past=99\n\
+         neg_cur=-1\nneg_end=0\nfar_end=-1\n"
+    );
+    let _ = std::fs::remove_file(&dir);
+}

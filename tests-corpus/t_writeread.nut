@@ -40,3 +40,22 @@ print(casti2f(0x40200000) + "\n");
 function tt(tag, f) { try { print(tag + "=" + f() + "\n"); } catch (e) { print(tag + "!" + e + "\n"); } }
 tt("bad_casti2f", function() { return casti2f("x"); });
 tt("bad_swap2", function() { return swap2(); });
+
+// 文件流上的负绝对偏移：CRT 的 fseek(f, -1, SEEK_SET) 是**失败**（返回 -1），
+// 原来我们把负偏移夹成 0 再当成功返回 —— 变异 t_writeread 时抓到的差异（见 P8）。
+local wneg = file("diff_test_seekneg.txt", "wb+");
+local bneg = blob(2);
+bneg.writen(0x1234, 'w');
+wneg.writeblob(bneg);
+wneg.flush();
+wneg.seek(0, 'b');
+print("seekneg_ret=" + wneg.seek(-1, 'b') + "\n");
+print("seekneg_tell=" + wneg.tell() + "\n");
+print("seekneg_read=" + wneg.readn('w') + "\n");
+print("seekneg_past_ret=" + wneg.seek(99, 'b') + "\n");
+print("seekneg_past_tell=" + wneg.tell() + "\n");
+print("seekneg_cur_neg=" + wneg.seek(-1, 'c') + "\n");
+print("seekneg_end_neg=" + wneg.seek(-1, 'e') + "\n");
+print("seekneg_end_far=" + wneg.seek(-99, 'e') + "\n");
+wneg.close();
+remove("diff_test_seekneg.txt");

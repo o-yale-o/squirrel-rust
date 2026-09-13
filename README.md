@@ -11,14 +11,15 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 | 验证项 | 结果 |
 |---|---|
 | 官方 samples/ 全部 17 个脚本差分 | **17/17 一致** |
-| 自建边界语料 **69** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM/弱引用/正则/线程×GC/序列化…） | **69/69 一致** |
-| 自动生成的组合矩阵（合计 **5600+ 条**）：运算符 × 类型（3181）、metamethod（343）、格式串（1305）、委托方法（2870）、类/实例（249）、**数值/运算符边界（4533）**、**正则语义（500）**、**生成器/线程（130）**、**词法/优先级/作用域（203）**、**weakref/GC（63）**、**blob/stream 二进制（133）**、**io/system/date（45）**、**异常机制（81）**、**类属性（40）**、**suspend 穿透（16）**、**多线程×GC（16）**、**序列化往返（25）**、根表顺序 | **逐行/逐字节一致** |
+| 自建边界语料 **71** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM/弱引用/正则/线程×GC/序列化…） | **71/71 一致** |
+| 自动生成的组合矩阵（合计 **7000+ 条**）：运算符 × 类型（3181）、metamethod（343）、格式串（1305）、委托方法与 string 库全局（3099）、类/实例（249）、**数值/运算符边界（4533）**、**正则语义（500）**、**生成器/线程（130）**、**词法/优先级/作用域（203）**、**math 定义域/边界（377）**、**base 库全局（90）**、**weakref/GC（63）**、**blob/stream 二进制（133）**、**io/system/date（45）**、**异常机制（81）**、**类属性（40）**、**suspend 穿透（16）**、**多线程×GC（16）**、**序列化往返（25）**、根表顺序 | **逐行/逐字节一致** |
+| **随机差分模糊测试**（`tools/fuzz_diff.py`：随机生成确定性合法程序 + 对语料做变异，自动收缩） | 结构化生成 **820 个程序 / 约 1.6 万条用例** 0 差异；**语料变异 400 个 → 抓到 2 个真实差异**（`blob.swap2/4` 多推进了读写位置、文件流负绝对偏移被夹成 0），已修并进语料 |
 | 语法/词法非法源码的**编译错误文本**对拍 | **60/60 一致**（`tools/errmsg_matrix.py`） |
 | REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
-| `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **69/69 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
-| `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **69/69 通过** |
+| `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **71/71 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
+| `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **71/71 通过** |
 | 宿主 API：用参考实现的静态库编 C 探针做同序对拍（member handle / `getfunctioninfo` / `setfreevariable` / userdata…） | 报告逐项一致（`tools/hostapi/`） |
-| `cargo test`（单元 + 集成 + 健壮性 + 字节码互通 + 各语义矩阵） | **113/113 通过** |
+| `cargo test`（单元 + 集成 + 健壮性 + 字节码互通 + 各语义矩阵） | **131/131 通过** |
 
 > 「字节级一致」这条要小心理解：参考实现保存闭包的 outer 值时写 8 字节、字段只有 4 字节，
 > 高 4 字节是未初始化内存，**同一个脚本连编两次输出都不同**。本实现写确定的 0，
@@ -188,16 +189,25 @@ cargo run --example embed -p squirrel-stdlib
 
 ## 性能
 
-与 C++ 参考实现的实测对照（同一脚本、clock() 内部计时 + 墙钟最小值）在
-[\PERF.md\](PERF.md)：**整体慢 3.1×~4.9×**，短串/表/数组 1.5×~3.7×，
+与 C++ 参考实现的实测对照（同一脚本、`clock()` 内部计时 + 墙钟最小值）在
+[`PERF.md`](PERF.md)：**整体慢 3.2×~4.8×**（A 档优化后），短串/表/数组 1.5×~3.7×，
 长串拼接 9×~12×（已定位到字符串实习表的清理策略，未优化）。
-复现：\python tools/bench/run.py\。
+
+**这不是"Rust 比 C++ 慢"**：同一台机器上，把"每条指令两次不内联方法调用"这个最保守的
+形态单独测出来，Rust 是 **1.77 ns**、MSVC 是 **5.98 ns**（裸指针形态两边都 ~0.2/1.5 ns）。
+差距来自**每条指令固定多付 ~30 周期**（用 `--max-ops` 精确计数：最简 4 条指令的循环
+多付 6.34 ns/指令，含算术的 9 条指令多付 7.07 ns/指令，与操作码无关），机制是主循环被
+编成 3 万条指令的巨型函数（69% 是数据搬运、1.7KB 栈帧、1624 个 call）导致的寄存器分配，
+**不是某个操作码或某次调用慢**。逐条消融数据与被排除的六个假设都记在 `PERF.md`。
+
+复现：`python tools/bench/run.py`、`python tools/perf/opcost.py tools/perf/opmin.nut 8000000`。
 
 ## 从 C++ 版迁移过来
 
 有一类地方是**故意与参考实现不一致**的（参考实现在那些输入上会崩溃 / 内存损坏 /
 把宿主吃光，我们给可捕获的错误），逐条带最小复现整理在 [`MIGRATION.md`](MIGRATION.md)；
-另有 15 条"看着像 bug、其实两边一致"的怪癖清单也在那份文档里。
+另有 **35 条**"看着像 bug、其实两边一致"的怪癖清单（`abs` 的 32 位截断、`assert(0)` 为假、
+`split`/`lstrip` 遇嵌入 NUL 的截断、`RAND_MAX`=32767、`format` 的数字走 f32…）也在那份文档里。
 
 ## 已知限制
 
@@ -239,6 +249,9 @@ cargo run --example embed -p squirrel-stdlib
 | 测试 | 覆盖 |
 |---|---|
 | `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用（含 `format` 的宽度/精度/标志/`INT64_MIN` 边界）、畸形 `.cnut`、畸形正则、深递归、**失控递归（必须可捕获且有界，不许吃光宿主内存）**、深嵌套值释放、超深嵌套编译 |
+| `crates/squirrel-stdlib/tests/string_semantics.rs` | string 库**全局函数**（不是字符串方法）的语义：`split` 按 C 字符串扫描遇 NUL 即停、`lstrip` 走 `strlen` 在 NUL 处截断、`rstrip`/`strip`/`escape`/`startswith` 走显式长度 |
+| `crates/squirrel-stdlib/tests/math_semantics.rs` | math 库定义域边界（NaN/±inf 不报错）、**中间 double 结果 f32 的逐位一致**、`abs` 的 **32 位截断**、`floor`/`ceil` 返回 float、`RAND_MAX`=32767 |
+| `crates/squirrel-stdlib/tests/baselib_semantics.rs` | `assert` 的假值集合（`0`/`0.0` 为假、`""`/`[]`/`{}` 为真）、`error` 不抛异常只打印、`array` 的 `tointeger` 截断、`type`/`dummy` |
 | `crates/squirrel-stdlib/tests/bytecode_interop.rs` | 直接执行**参考实现编译出来的** `.cnut`；夹具被改成越界 outer 索引时必须报可捕获错误（参考实现会访问违例崩溃） |
 | `crates/squirrel-stdlib/tests/stream_semantics.rs` | file/blob 的 `tell/len/eos/flush` 与参考实现逐字一致（`eos()` 真为 `1`、假为 `null`；`writen` 的参数顺序是 `(值, 格式)`） |
 | `crates/squirrel/tests/deep_release.rs` | 释放循环嵌套深度 ≤ 3（10 万层数组/表/闭包/生成器/线程，含 1MB 栈线程） |

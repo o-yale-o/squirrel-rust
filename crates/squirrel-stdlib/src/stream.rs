@@ -400,7 +400,14 @@ impl StreamBackend for FileBackend {
     fn seek(&mut self, offset: SQInteger, origin: SQInteger) -> SQInteger {
         if let Some(h) = &self.handle {
             let pos = match origin {
-                SQ_SEEK_SET => SeekFrom::Start(offset.max(0) as u64),
+                // CRT 的 fseek(f, 负数, SEEK_SET) 会失败（实测参考实现返回 -1）；
+                // 原来这里用 offset.max(0) 夹成 0，于是"负绝对偏移"被当成成功。
+                SQ_SEEK_SET => {
+                    if offset < 0 {
+                        return -1;
+                    }
+                    SeekFrom::Start(offset as u64)
+                }
                 SQ_SEEK_CUR => SeekFrom::Current(offset),
                 SQ_SEEK_END => SeekFrom::End(offset),
                 _ => return -1,
@@ -786,6 +793,10 @@ fn blob_resize(v: &mut VmData) -> SQInteger {
 }
 
 /// ↔ _blob_swap2：按 16 位字翻转字节序
+///
+/// 参考实现直接对着 `self->GetBuf()` 整块交换，**完全不碰 `_ptr`**（`tell()` 不变）。
+/// 我们原来是 snapshot → 改 → `seek(0)` + `write(&buf)`，`write` 会把 `_ptr` 推到末尾，
+/// 于是 `tell()` 变成 4/8（模糊测试用 `blob.swap2()` 之后 `tell()` 抓到的差异）。
 fn blob_swap2(v: &mut VmData) -> SQInteger {
     let self_ = match backend_of(v, 1) {
         Some(b) => b,
@@ -794,16 +805,18 @@ fn blob_swap2(v: &mut VmData) -> SQInteger {
     let mut be = self_.borrow_mut();
     let len = be.len();
     let num = ((len - len % 2) >> 1).max(0) as usize;
+    let pos = be.tell();
     let mut buf = be.snapshot();
     for i in 0..num {
         buf.swap(i * 2, i * 2 + 1);
     }
     be.seek(0, SQ_SEEK_SET);
     be.write(&buf);
+    be.seek(pos, SQ_SEEK_SET);
     0
 }
 
-/// ↔ _blob_swap4：按 32 位双字翻转字节序
+/// ↔ _blob_swap4：按 32 位双字翻转字节序（同样不动 `_ptr`）
 fn blob_swap4(v: &mut VmData) -> SQInteger {
     let self_ = match backend_of(v, 1) {
         Some(b) => b,
@@ -812,6 +825,7 @@ fn blob_swap4(v: &mut VmData) -> SQInteger {
     let mut be = self_.borrow_mut();
     let len = be.len();
     let num = ((len - len % 4) >> 2).max(0) as usize;
+    let pos = be.tell();
     let mut buf = be.snapshot();
     for i in 0..num {
         let b = i * 4;
@@ -820,6 +834,7 @@ fn blob_swap4(v: &mut VmData) -> SQInteger {
     }
     be.seek(0, SQ_SEEK_SET);
     be.write(&buf);
+    be.seek(pos, SQ_SEEK_SET);
     0
 }
 
