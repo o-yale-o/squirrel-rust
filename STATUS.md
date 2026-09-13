@@ -756,6 +756,62 @@ file(p, "rx")  file(p, "rw")  file(p, "rbb")  file(p, "trash")  file(p, "r\tb")
 `crates/squirrel-stdlib/tests/system_semantics.rs`（3 个测试：`date` 的 UTC 字段、
 `remove/rename/system/getenv`、`loadfile/dofile`），期望值先经参考实现实测确认。
 
+## 三·补14、第十四轮（P1-6）：异常机制矩阵
+
+* `tools/gen_errmap.py` → `tests-corpus/t_errmap.nut`：**81 条**（`throw` 15 种类型、
+  VM 错误 23 种文本、嵌套 trap/重抛/作用域 12 条、`seterrorhandler` 3 条、
+  `getstackinfos` 12 条、生成器/线程里的错误 5 条、元方法与构造器抛错 6 条）。
+* `tests-corpus/t_errtail.nut`（手写）：脚本末尾制造一个**未捕获**错误，
+  用来对比完整 stderr 与退出码。
+
+### 结果
+
+**未捕获错误的 stderr 逐字节一致**（这是本轮最有价值的一条）：
+
+```
+AN ERROR HAS OCCURRED [the index 'nonexistent_global_call' does not exist]
+
+CALLSTACK
+*FUNCTION [inner()] D:\...\t_errtail.nut line [4]
+*FUNCTION [main()] D:\...\t_errtail.nut line [12]
+
+LOCALS
+[arr] ARRAY
+[c] 3
+[b] 2
+[a] 1
+[this] TABLE
+[vargv] ARRAY
+[this] TABLE
+```
+
+84 条探针里**没有语义差异**，只有两类"不是差异"的：指针文本（语料归一化）
+与下面这条已知 UB。
+
+### 固化的几条容易想当然的语义
+
+| 点 | 实测（两侧一致） |
+|---|---|
+| `catch (e)` 拿到的 | **原始对象**（`throw "boom"` → `e` 就是字符串；表就是表），不是包装过的错误结构 |
+| `attempt to call 'X'` | 每种不可调用类型都有：`integer`/`string`/`table`/`null`/`array` |
+| 算术类型错 | `arith op + on between 'table' and 'integer'`（注意 "on between"） |
+| 数组越界 | `the index '5' does not exist`（**不是** `index out of range`） |
+| `getstackinfos(0)` | 第 0 层是 **`getstackinfos` 这个 native 自己**（不是调用者），所以 `func` 恒为 `"getstackinfos"` |
+| `getstackinfos(1)` | 在顶层是 `main` 的帧；越界层（2/50）返回 `null` |
+| `seterrorhandler` | **被 catch 住的错误不会调用**错误处理器 |
+
+### 已知 UB（沿用第四节）
+
+`getstackinfos(-1)`：参考实现 `_callsstack[cssize]` 越界读（实测返回一个表），
+本实现返回 `null` —— 语料里剔除，由 `exception_semantics.rs::getstackinfos_negative_level_is_null`
+单独守门（`ref-crash-skip`）。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/exception_semantics.rs`（4 个测试）；
+`tools/errmsg_matrix.py` 补 2 条（`local f = function named() {}` 在表达式位置
+是语法错 `expected '('`），现 **57/57 一致**。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |

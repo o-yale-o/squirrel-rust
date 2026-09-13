@@ -60,6 +60,8 @@ CASES = [
     ("foreach_bad", "foreach (x) { }\n"),
     ("switch_bad", "switch (1) { case }\n"),
     ("function_no_name", "function () { }\n"),
+    ("named_fn_expr", "local f = function named() { return 1; };\n"),
+    ("named_fn_expr2", "local t = { f = function named() { } };\n"),
     ("function_no_body", "function f()\n"),
     ("class_no_body", "class C\n"),
     ("class_bad_member", "class C { x }\n"),
