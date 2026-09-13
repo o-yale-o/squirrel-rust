@@ -16,6 +16,8 @@
   lint          语料自检（文件能编译、不残留副作用文件等）
   health        语料"假绿"体检：用例是否真的执行到了（详见 tools/corpus_health.py）
   writes        语料里的"写文件"用例是否都配了删除（静态看：写之后有没有 remove）。
+  generators    生成式语料与生成器是否一致（跑一遍全部 tools/gen_*.py，比对内容哈希；
+                含生成器自带的自检。已知漂移在白名单里，新漂移会 FAIL）
                 **静态看不够** —— "remove 在一条走不到的路径上"（比如写到一半就抛错）
                 只能靠下面这个动态检查发现：每一步跑完都会对比仓库根目录的文件集合，
                 多出文件就把该步判为 FAIL。
@@ -39,6 +41,7 @@ STEPS = [
     ("lint", [PY, "tools/lint_corpus.py"]),
     ("health", [PY, "tools/corpus_health.py", "--terse"]),
     ("writes", [PY, "tools/audit_corpus_writes.py"]),
+    ("generators", [PY, "tools/check_generators.py"]),
     ("audit-globals", [PY, "tools/audit_globals.py"]),
     ("audit-delegates", [PY, "tools/audit_delegates.py"]),
     ("audit-regorder", [PY, "tools/audit_regorder.py"]),
