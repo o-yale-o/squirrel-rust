@@ -126,6 +126,9 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `error(msg)` **不抛异常** | 只调 errorfunc（打到 stderr）然后返回 `null`，脚本继续往下跑；参数个数严格为 2 |
 | `array(size, fill?)` | `size` 走 `tointeger` 截断（`array(2.9)` 长度 2、`array(0.5)` 空）；多余实参忽略；`array` 没有 `getclass` |
 | 非引用类型的 `weakref()` 返回**自身** | `(5).weakref()` 还是 `5`（`type()` 给 `integer`）；只有 table/array/… 才真给 weakref |
+| **字符串 → 数字**（`"…".tointeger()` / `.tofloat()`） | 先扫 `'.'`/`'e'`/`'E'` 决定走浮点还是整数（`iseintbase = base > 13`；扫描是 **C 字符串**，第一个 NUL 之后不看）。整数路径是 MSVC `_strtoi64`：**溢出按符号饱和**，`"9223372036854775808"`→`INT64_MAX`、`"-9223372036854775809"`→`INT64_MIN`（不是回绕）；非法字符只是"停止"，所以 `"42abc"`→`42`、`"0x10"`→`0`。**`tofloat` 也走同一条路**：没有 `.`/`e` 就先当整数，于是 `"99999999999999999999999999".tofloat()` 是 `9.2233720368547758e+18`（饱和后的 INT64_MAX），**不是** 1e26 |
+| `"…".tointeger(base)` | 第二参是**进制**（`"ff".tointeger(16)`→255），且字符串的委托表 `nparamscheck = -1` —— 多传实参不报错；`base` 只接受 **0 或 2..36**：base 0 自动识别（`0x`→16、前导 `0`→8），**base 1 / 负数 / >36 会让参考实现直接崩溃**（CRT invalid parameter handler），本实现给可捕获的 `cannot convert the string`。`tofloat` **没有** base 参数（传了就是 `wrong number of parameters`） |
+| 浮点路径是 MSVC `strtod` | 十进制、**十六进制浮点**（`"0x1.8p3"`→12、`"0x1.8"`→1.5、`"0x.8p3"`→4，`p` 指数可缺可残缺）、`inf`/`nan`（大小写不敏感，`"inf.e"`→inf、`"nan.0"`→nan）都在其列 —— 但**只有含 `.` 或 `e` 时才走浮点路径**：`"inf".tofloat()` 走整数路径 → 转换失败。strtod 给的 NaN 是**全 1 尾数**（f32 `0x7FFFFFFF`/`0xFFFFFFFF`），打印成 `nan`/`-nan`，与 `0.0/0.0` 的 x86 indefinite（`0xFFC00000` → `-nan(ind)`）**不是同一个 NaN** |
 | `dummy(...)` 不做参数个数检查 | 它是 `nparams=0`，`dummy(1,2,3,…)` 恒返回 `null` |
 | **更新流（`"wb+"`）写入后必须先定位再读** | C 标准（C11 7.21.5.3）规定更新流"输出后不能直接输入"，中间必须有 `fflush` 或文件定位调用；少了这一步就是 UB —— **实测参考实现会给出"读越界却把文件撑大"的怪行为**（4 字节文件 `readn('l')` 之后 `len()` 变 12，而且同一段代码只因"读完后是否调用 `len()`"就一个报错一个成功）。本实现在这种序列上给确定行为（`io error`），但**不要依赖任何一侧**：写脚本时老老实实 `seek` 或 `flush` |
 

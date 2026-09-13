@@ -1,9 +1,9 @@
-//! base 库"零覆盖全局函数"回归（`squirrel/sqbaselib.cpp`）。
+//! base 库回归（`squirrel/sqbaselib.cpp`）。
 //!
-//! 这 5 个是 `tools/global_coverage.py` 扫出来的、62 个已注册全局里**仅有的**
-//! 语料 0 覆盖项：`assert` / `error` / `array` / `type` / `dummy`。本轮补齐后
-//! 矩阵 `tests-corpus/t_baselibmap.nut`（90 行，stdout 与 stderr 都逐字节一致）
-//! 与参考实现**没有差异**，属于验证型收获；测试把这些容易想当然的点钉住：
+//! 前 5 个测试覆盖 `tools/global_coverage.py` 扫出来的、62 个已注册全局里
+//! **仅有的**语料 0 覆盖项：`assert` / `error` / `array` / `type` / `dummy`。
+//! 补齐后矩阵 `tests-corpus/t_baselibmap.nut`（90 行，stdout 与 stderr 都逐字节
+//! 一致）与参考实现**没有差异**，属于验证型收获；测试把这些容易想当然的点钉住：
 //!
 //! 1. **`assert` 的判假是 `SQVM::IsFalse`：`null` / `false` / `0` / `0.0` 为假，
 //!    而 `""` / `[]` / `{}` / `function(){}` / `blob(0)` 都是真。**
@@ -17,6 +17,12 @@
 //! 5. `type` 就是 `typeof` 的别名；blob/regexp 都是 `instance`；
 //!    **非引用类型的 `weakref()` 返回自身**（`(5).weakref()` 还是 integer）。
 //! 6. `dummy(...)` 的 `nparams=0` 表示**不做参数个数检查**，任何参数都返回 `null`。
+//!
+//! 第 6 个测试（`string_to_number_follows_crt_str2num`）是**修差异**型：语料里
+//! 的 `tointeger`/`tofloat` 用例全是参数掩码测试，"字符串解析"是结构性空白，
+//! 于是 `str2num`（↔ `sqbaselib.cpp::str2num`）里的溢出饱和、`base > 13` 的
+//! `'e'` 语义、NUL 截断、CRT `strtod` 的十六进制浮点/`inf`/`nan` 都没被测到 ——
+//! 详见该测试的文档注释与 `MIGRATION.md`。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -261,4 +267,181 @@ t("d_type", function() { return typeof dummy; });
     assert_eq!(line(&out, "d_none"), "d_none=null|null");
     assert_eq!(line(&out, "d_many"), "d_many=null|null", "dummy 不检查参数个数");
     assert_eq!(line(&out, "d_type"), "d_type=\"function\"|string");
+}
+
+/// **字符串 → 数字**（`default_delegate_tointeger/-tofloat` ↔ `sqbaselib.cpp` 的 `str2num`）。
+///
+/// 语料 `t_delmatrix.nut` 里的 `tointeger`/`tofloat` 用例全是**参数掩码**测试，
+/// 字符串**解析**本身是结构性空白；新矩阵 `tests-corpus/t_tonummap.nut`
+/// （1152 个字符串 × 3 种观测 + base 矩阵，3859 行）把这四条语义钉住：
+///
+/// 1. **溢出按符号饱和**（MSVC `_strtoi64`），不是回绕：
+///    `"9223372036854775808"`→INT64_MAX、`"-9223372036854775809"`→INT64_MIN。
+///    注意饱和由**符号**决定 —— 负号 + 超出量级也返回 INT64_MIN，而不是"往回绕"。
+/// 2. **`tofloat` 也走整数路径**：字符串里没有 `.`/`e` 就先当整数解析，
+///    所以 `"99999999999999999999999999".tofloat()` 是 `9.2233720368547758e+18`
+///    （饱和后的 INT64_MAX），**不是** 1e26。
+/// 3. **扫描在第一个 NUL 处停止**（C 字符串）：`"12\x00.5"` 走整数路径。
+/// 4. **`base` 的 `iseintbase = base > 13`**：base 16 时 `'e'` 是数字，
+///    `"1e3".tointeger(16)` = 483；base 14 及以上同理，base 13 仍是科学计数法。
+///    base 只吃 0 或 2..36（1/负数/>36 会让参考实现直接崩溃，本实现报可捕获错误）。
+///
+/// 解析器还复刻了 CRT `strtod` 的十进制/十六进制浮点/`inf`/`nan` 三条分支，
+/// 连 NaN 的**位模式**都对齐（MSVC 给全 1 尾数 → 打印 `nan`/`-nan`，
+/// 而 `0.0/0.0` 的 x86 indefinite 是 `-nan(ind)`）。
+#[test]
+fn string_to_number_follows_crt_str2num() {
+    let src = format!(
+        r#"
+function obs(v) {{
+    local ty = typeof v;
+    if (ty == "float") return format("%.17g", v);
+    return "" + v;
+}}
+function t(tag, f) {{
+    try {{ local v = f(); print(tag + "=" + obs(v) + "|" + typeof v + "\n"); }}
+    catch (e) {{ print(tag + "!" + e + "\n"); }}
+}}
+{}
+"#,
+        r#"
+t("plain", function() { return "42".tointeger(); });
+t("spaces", function() { return "  42  ".tointeger(); });
+t("plus", function() { return "+42".tointeger(); });
+t("trailing", function() { return "42abc".tointeger(); });
+t("hex_like_base10", function() { return "0x10".tointeger(); });
+t("hex_base16", function() { return "0x10".tointeger(16); });
+t("ff_base16", function() { return "ff".tointeger(16); });
+t("ff_base15", function() { return "ff".tointeger(15); });
+t("ff_base14", function() { return "ff".tointeger(14); });
+t("e3_base16", function() { return "1e3".tointeger(16); });
+t("e3_base15", function() { return "1e3".tointeger(15); });
+t("e3_base14", function() { return "1e3".tointeger(14); });
+t("e3_base13", function() { return "1e3".tointeger(13); });
+t("e3_base10", function() { return "1e3".tointeger(); });
+t("e3_float", function() { return "1e3".tofloat(); });
+t("dot_hex", function() { return "1.5".tointeger(16); });
+t("base0_hex", function() { return "0x10".tointeger(0); });
+t("base0_oct", function() { return "010".tointeger(0); });
+t("base2", function() { return "101".tointeger(2); });
+t("base2_bad", function() { return "2".tointeger(2); });
+t("base36", function() { return "z".tointeger(36); });
+t("base37_crash", function() { return "ff".tointeger(37); });
+t("base1_crash", function() { return "ff".tointeger(1); });
+
+t("ov_max", function() { return "9223372036854775807".tointeger(); });
+t("ov_max1", function() { return "9223372036854775808".tointeger(); });
+t("ov_min", function() { return "-9223372036854775808".tointeger(); });
+t("ov_min1", function() { return "-9223372036854775809".tointeger(); });
+t("ov_2p64", function() { return "18446744073709551616".tointeger(); });
+t("ov_neg2p64", function() { return "-18446744073709551616".tointeger(); });
+t("ov_long", function() { return "99999999999999999999999999".tointeger(); });
+t("ov_long_float", function() { return "99999999999999999999999999".tofloat(); });
+t("ov_hex16", function() { return "ffffffffffffffff".tointeger(16); });
+t("ov_hex16_neg", function() { return "-ffffffffffffffff".tointeger(16); });
+
+t("nul_int", function() { return "12\x00.5".tointeger(); });
+t("nul_dot_only", function() { return ".5\x0012".tointeger(); });
+t("nul_e", function() { return "12\x00e5".tointeger(); });
+
+t("hexfloat", function() { return "0x1.8p3".tofloat(); });
+t("hexfloat_noexp", function() { return "0x1.8".tofloat(); });
+t("hexfloat_frac", function() { return "0x.8p3".tofloat(); });
+t("hexfloat_partial_p", function() { return "0x1.8p+".tofloat(); });
+t("hexfloat_dot_only", function() { return "0x.p1".tofloat(); });
+t("hexfloat_big", function() { return "0x1.fffffffffffffp1023".tofloat(); });
+t("hexfloat_tiny", function() { return "0x1p-1074".tofloat(); });
+
+t("inf_dot", function() { return "inf.0".tofloat(); });
+t("ninf_dot", function() { return "-inf.0".tofloat(); });
+t("infinity_e", function() { return "infinity.e".tofloat(); });
+t("nan_dot", function() { return "nan.0".tofloat(); });
+t("nnan_dot", function() { return "-nan.0".tofloat(); });
+t("inf_plain", function() { return "inf".tofloat(); });
+t("inf_toint", function() { return "inf.0".tointeger(); });
+t("nan_toint", function() { return "-nan.0".tointeger(); });
+t("nan_bits", function() { local b = blob(4); b.writen("nan.0".tofloat(), 'f'); b.seek(0, 'b'); local s = ""; for (local i = 0; i < 4; i++) s += format("%02x", b.readn('b')); return s; });
+t("nnan_bits", function() { local b = blob(4); b.writen("-nan.0".tofloat(), 'f'); b.seek(0, 'b'); local s = ""; for (local i = 0; i < 4; i++) s += format("%02x", b.readn('b')); return s; });
+t("div00_bits", function() { local b = blob(4); b.writen(0.0 / 0.0, 'f'); b.seek(0, 'b'); local s = ""; for (local i = 0; i < 4; i++) s += format("%02x", b.readn('b')); return s; });
+"#,
+    );
+    let out = run_capture(&src).0;
+    macro_rules! chk {
+        ($tag:expr, $want:expr) => {
+            assert_eq!(line(&out, $tag), $want, "{}", $tag)
+        };
+        ($tag:expr, $want:expr, $msg:expr) => {
+            assert_eq!(line(&out, $tag), $want, "{}: {}", $tag, $msg)
+        };
+    }
+    chk!("plain", "plain=42|integer");
+    chk!("spaces", "spaces=42|integer");
+    chk!("plus", "plus=42|integer");
+    chk!("trailing", "trailing=42|integer");
+    chk!("hex_like_base10", "hex_like_base10=0|integer", "base 10 下 0x 只是前缀");
+    chk!("hex_base16", "hex_base16=16|integer");
+    chk!("ff_base16", "ff_base16=255|integer");
+    chk!(
+        "ff_base15",
+        "ff_base15!cannot convert the string",
+        "'f'=15 不是合法的 base15 数字 → 一个数字都没读到"
+    );
+    chk!("ff_base14", "ff_base14!cannot convert the string");
+    chk!(
+        "e3_base16",
+        "e3_base16=483|integer",
+        "base>13 → 'e' 当数字（iseintbase）"
+    );
+    chk!("e3_base15", "e3_base15=438|integer");
+    chk!("e3_base14", "e3_base14=1|integer", "'e'=14 在 base14 里非法 → 停在 '1'");
+    chk!("e3_base13", "e3_base13=1000|integer", "base=13 仍是科学计数法");
+    chk!("e3_base10", "e3_base10=1000|integer");
+    chk!("e3_float", "e3_float=1000|float");
+    chk!("dot_hex", "dot_hex=1|integer", "'.' 一定走浮点路径");
+    chk!("base0_hex", "base0_hex=16|integer");
+    chk!("base0_oct", "base0_oct=8|integer");
+    chk!("base2", "base2=5|integer");
+    chk!("base2_bad", "base2_bad!cannot convert the string");
+    chk!("base36", "base36=35|integer");
+    chk!("base37_crash", "base37_crash!cannot convert the string", "参考实现在这里崩溃");
+    chk!("base1_crash", "base1_crash!cannot convert the string");
+    chk!("ov_max", "ov_max=9223372036854775807|integer");
+    chk!("ov_max1", "ov_max1=9223372036854775807|integer", "饱和，不是回绕");
+    chk!("ov_min", "ov_min=-9223372036854775808|integer");
+    chk!("ov_min1", "ov_min1=-9223372036854775808|integer", "负号决定饱和方向");
+    chk!("ov_2p64", "ov_2p64=9223372036854775807|integer");
+    chk!("ov_neg2p64", "ov_neg2p64=-9223372036854775808|integer");
+    chk!("ov_long", "ov_long=9223372036854775807|integer");
+    chk!(
+        "ov_long_float",
+        "ov_long_float=9.2233720368547758e+18|float",
+        "tofloat 也先走整数路径 → 饱和后再转 float"
+    );
+    chk!("ov_hex16", "ov_hex16=9223372036854775807|integer");
+    chk!("ov_hex16_neg", "ov_hex16_neg=-9223372036854775808|integer");
+    chk!("nul_int", "nul_int=12|integer");
+    chk!("nul_dot_only", "nul_dot_only=0|integer");
+    chk!("nul_e", "nul_e=12|integer");
+    chk!("hexfloat", "hexfloat=12|float");
+    chk!("hexfloat_noexp", "hexfloat_noexp=1.5|float");
+    chk!("hexfloat_frac", "hexfloat_frac=4|float");
+    chk!("hexfloat_partial_p", "hexfloat_partial_p=1.5|float");
+    chk!("hexfloat_dot_only", "hexfloat_dot_only=0|float");
+    chk!("hexfloat_big", "hexfloat_big=inf|float");
+    chk!("hexfloat_tiny", "hexfloat_tiny=0|float", "2^-1074 转 f32 下溢成 0");
+    chk!("inf_dot", "inf_dot=inf|float");
+    chk!("ninf_dot", "ninf_dot=-inf|float");
+    chk!("infinity_e", "infinity_e=inf|float");
+    chk!("nan_dot", "nan_dot=nan|float");
+    chk!("nnan_dot", "nnan_dot=-nan|float");
+    chk!(
+        "inf_plain",
+        "inf_plain!cannot convert the string",
+        "没有 '.'/'e' → 走整数路径，strtol 认不了 inf"
+    );
+    chk!("inf_toint", "inf_toint=-9223372036854775808|integer");
+    chk!("nan_toint", "nan_toint=-9223372036854775808|integer");
+    chk!("nan_bits", "nan_bits=ffffff7f|string", "MSVC strtod 的 NaN 是全 1 尾数");
+    chk!("nnan_bits", "nnan_bits=ffffffff|string");
+    chk!("div00_bits", "div00_bits=0000c0ff|string", "x86 indefinite：不是同一个 NaN");
 }

@@ -26,25 +26,33 @@ fn throw_error(vm: &mut VmData, msg: &str) -> NativeResult {
 }
 
 /// ↔ str2num
+///
+/// 三条容易漏掉的语义（对着 `sqbaselib.cpp` 的 `str2num` 写）：
+/// 1. 决定走浮点还是整数的扫描是 `while((c = *e) != '\0')` —— **C 字符串**，
+///    第一个 NUL 之后不再看。`"12\x00.5".tointeger()` 因此走整数路径。
+/// 2. `iseintbase = base > 13`：base 16 时 `'e'` 是数字而不是科学计数法。
+/// 3. 浮点路径是 `strtod`（十进制 + 十六进制浮点 + `inf`/`nan`），
+///    整数路径是 MSVC `_strtoi64`（溢出按符号饱和）。
 fn str2num(s: &[u8], base: SQInteger) -> Option<Value> {
+    // ↔ C 字符串语义：第一个 NUL 处截断
+    let cstr = match s.iter().position(|&c| c == 0) {
+        Some(i) => &s[..i],
+        None => s,
+    };
     let iseintbase = base > 13;
     let mut isfloat = false;
-    for &c in s {
+    for &c in cstr {
         if c == b'.' || (!iseintbase && (c == b'E' || c == b'e')) {
             isfloat = true;
             break;
         }
     }
-    let txt = String::from_utf8_lossy(s);
+    let txt = String::from_utf8_lossy(cstr);
     if isfloat {
-        let t = txt.trim_start();
         // CRT strtod 接受前导空白与正负号
-        match parse_c_strtod(t) {
-            Some(f) => Some(Value::Float(f as SQFloat)),
-            None => None,
-        }
+        parse_c_strtod(&txt).map(|f| Value::Float(f as SQFloat))
     } else {
-        let t = txt.trim_start();
+        let t = skip_c_ws(&txt);
         let (neg, digits) = match t.strip_prefix('-') {
             Some(r) => (true, r),
             None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -75,8 +83,16 @@ fn str2num(s: &[u8], base: SQInteger) -> Option<Value> {
         } else {
             (base, digits)
         };
-        let mut r: SQInteger = 0;
+        // ↔ scstrtol = MSVC `_strtoi64`：溢出时**按符号饱和**，不是回绕 ——
+        //   "9223372036854775808"/"18446744073709551616"/"999…9" → INT64_MAX；
+        //   "-9223372036854775809"/"-18446744073709551616" → INT64_MIN。
+        //   这一点在语料里一直没暴露（`t_delmatrix` 的 `tointeger` 用例测的是参数掩码，
+        //   字符串解析只用过能放进 int64 的值），是"字符串→数字"矩阵抓到的。
+        //   注意饱和由**符号**决定，与累加时往哪个方向溢出无关。
+        let mut acc: u64 = 0;
+        let mut sat = false;
         let mut any = false;
+        let radix_u = radix as u64;
         for c in digits.bytes() {
             let v = match c {
                 b'0'..=b'9' => (c - b'0') as SQInteger,
@@ -87,25 +103,219 @@ fn str2num(s: &[u8], base: SQInteger) -> Option<Value> {
             if v >= radix {
                 break;
             }
-            r = r.wrapping_mul(radix).wrapping_add(v);
             any = true;
+            if sat {
+                continue;
+            }
+            match acc.checked_mul(radix_u).and_then(|x| x.checked_add(v as u64)) {
+                Some(x) => acc = x,
+                None => sat = true,
+            }
         }
         if !any {
             return None;
         }
-        Some(Value::Integer(if neg { r.wrapping_neg() } else { r }))
+        let r: SQInteger = if sat {
+            if neg {
+                SQInteger::MIN
+            } else {
+                SQInteger::MAX
+            }
+        } else if neg {
+            // acc == 2^63 正好是 INT64_MIN；再大就饱和到 INT64_MIN
+            if acc > (1u64 << 63) {
+                SQInteger::MIN
+            } else {
+                (acc as SQInteger).wrapping_neg()
+            }
+        } else if acc > SQInteger::MAX as u64 {
+            SQInteger::MAX
+        } else {
+            acc as SQInteger
+        };
+        Some(Value::Integer(r))
     }
 }
 
-/// CRT strtod 的近似（前后空白已去除；支持 1.5e3 形式）
-fn parse_c_strtod(t: &str) -> Option<f64> {
-    let mut normalized = String::new();
+/// ↔ C 的 `isspace`（**不是** Unicode 空白：`trim_start()` 会多吃掉 U+00A0 之类，
+/// 而 CRT 在那些字符上直接判定"转换失败"）
+fn is_c_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+fn skip_c_ws(t: &str) -> &str {
     let b = t.as_bytes();
     let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        normalized.push(b[i] as char);
+    while i < b.len() && is_c_space(b[i]) {
         i += 1;
     }
+    &t[i..]
+}
+
+fn starts_ci(b: &[u8], pat: &[u8]) -> bool {
+    b.len() >= pat.len() && b[..pat.len()].eq_ignore_ascii_case(pat)
+}
+
+fn hexval(c: u8) -> u32 {
+    match c {
+        b'0'..=b'9' => (c - b'0') as u32,
+        b'a'..=b'f' => (c - b'a' + 10) as u32,
+        _ => (c - b'A' + 10) as u32,
+    }
+}
+
+/// 2^e（e ∈ [-1074, 1023]，正好是 f64 的规格化/次正规范围）
+fn pow2(e: i32) -> f64 {
+    if e >= -1022 {
+        f64::from_bits(((e + 1023) as u64) << 52)
+    } else {
+        f64::from_bits(1u64 << (e + 1074))
+    }
+}
+
+/// `v * 2^e`：用**精确的** 2 的幂分步乘，避免中间结果下溢/上溢
+fn scale_pow2(mut v: f64, mut e: i32) -> f64 {
+    while e > 1023 {
+        v *= pow2(1023);
+        e -= 1023;
+        if v.is_infinite() {
+            return v;
+        }
+    }
+    while e < -1074 {
+        v *= pow2(-1074);
+        e += 1074;
+        if v == 0.0 {
+            return v;
+        }
+    }
+    v * pow2(e)
+}
+
+/// ↔ MSVC `strtod` 的**十六进制浮点**路径（C99 的超集：`p` 指数可以缺、可以残缺）。
+///
+/// 实测（`tmp-c2/probe_hexq.nut`）：`"0x1.8p3"`→12、`"0x1.8"`→1.5、`"0x.8p3"`→4、
+/// `"0x1.8p"`/`"0x1.8p+"`→1.5（残缺的 `p` 连带后面一起忽略）、`"0x1.p3"`→8、
+/// `"0x1.8p-3g"`→0.1875。`"0x."`/`"0x.p1"` 一个十六进制位都没有 → 主题串退化成
+/// 开头那个 `'0'`（返回 `None`，由调用方给 0）。
+fn parse_hex_float(b: &[u8]) -> Option<f64> {
+    let mut i = 0usize;
+    let mut mant: u128 = 0;
+    let mut sticky = false; // 被丢掉的低位里有非零位
+    let mut exp2: i32 = 0;
+    let mut any = false;
+    while i < b.len() && b[i].is_ascii_hexdigit() {
+        let d = hexval(b[i]);
+        if mant < (1u128 << 120) {
+            mant = (mant << 4) | d as u128;
+        } else {
+            exp2 = exp2.saturating_add(4); // 整数部分丢低位只影响精度，量级靠 exp2 补
+        }
+        any = true;
+        i += 1;
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_hexdigit() {
+            let d = hexval(b[i]);
+            if mant < (1u128 << 120) {
+                mant = (mant << 4) | d as u128;
+                exp2 -= 4;
+            } else if d != 0 {
+                sticky = true;
+            }
+            any = true;
+            i += 1;
+        }
+    }
+    if !any {
+        return None;
+    }
+    if matches!(b.get(i), Some(&b'p') | Some(&b'P')) {
+        let mut j = i + 1;
+        let mut eneg = false;
+        if b.get(j) == Some(&b'+') {
+            j += 1;
+        } else if b.get(j) == Some(&b'-') {
+            j += 1;
+            eneg = true;
+        }
+        let start = j;
+        let mut e: i64 = 0;
+        while j < b.len() && b[j].is_ascii_digit() {
+            e = (e * 10 + (b[j] - b'0') as i64).min(1 << 40);
+            j += 1;
+        }
+        if j > start {
+            let e = if eneg { -e } else { e };
+            exp2 = exp2.saturating_add(e.clamp(-100_000, 100_000) as i32);
+        }
+    }
+    // mant * 2^exp2 → f64（就近舍入、平局取偶）
+    let nbits = 128 - mant.leading_zeros();
+    if nbits > 53 {
+        let shift = nbits - 53;
+        let mut m = mant >> shift;
+        let rem = mant & ((1u128 << shift) - 1);
+        let half = 1u128 << (shift - 1);
+        if rem > half || (rem == half && ((m & 1) == 1 || sticky)) {
+            m += 1;
+            if m == (1u128 << 53) {
+                m >>= 1;
+                exp2 += 1;
+            }
+        }
+        exp2 = exp2.saturating_add(shift as i32);
+        mant = m;
+    }
+    Some(scale_pow2(mant as f64, exp2))
+}
+
+/// ↔ CRT `strtod`（十进制 + 十六进制浮点 + `inf`/`nan`）。
+/// `None` 表示一个字符都没消费（↔ `s == end`）→ 调用方报 "cannot convert the string"。
+fn parse_c_strtod(t: &str) -> Option<f64> {
+    let b = t.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() && is_c_space(b[i]) {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let rest = &b[i..];
+    // inf / infinity（大小写不敏感；"infi.e" 也走这条，strtod 匹配到 "inf" 就停）
+    if starts_ci(rest, b"inf") {
+        return Some(if neg { f64::NEG_INFINITY } else { f64::INFINITY });
+    }
+    // nan / nan(n-char-seq)：`"nan(.e"`、`"nan(a b).e"` 都接受（只取前缀）。
+    // **位模式也要一致**：MSVC 的 strtod 给的是全 1 尾数的 NaN（f64 0x7FFF_FFFF_FFFF_FFFF
+    // → f32 0x7FFFFFFF / 0xFFFFFFFF），打印成 `nan`/`-nan`；而 `0.0/0.0` 的
+    // x86「indefinite」是 0xFFC00000，打印成 `-nan(ind)`。实测见 probe_nanbits.nut。
+    if starts_ci(rest, b"nan") {
+        let n = f64::from_bits(0x7FFF_FFFF_FFFF_FFFF);
+        return Some(if neg { -n } else { n });
+    }
+    if rest.len() >= 2 && rest[0] == b'0' && (rest[1] == b'x' || rest[1] == b'X') {
+        return match parse_hex_float(&rest[2..]) {
+            Some(v) => Some(if neg { -v } else { v }),
+            None => Some(if neg { -0.0 } else { 0.0 }), // "0x." 退化成 '0'
+        };
+    }
+    parse_dec_float(rest).map(|v| if neg { -v } else { v })
+}
+
+/// 十进制浮点的字面形态：`[digits][.digits][e[+|-]digits]`，至少要有一个数字
+fn parse_dec_float(b: &[u8]) -> Option<f64> {
+    let mut normalized = String::new();
+    let mut i = 0;
     let mut any = false;
     while i < b.len() && b[i].is_ascii_digit() {
         normalized.push(b[i] as char);
