@@ -207,7 +207,30 @@ fn load_file(vm: &squirrel::api::Vm, path: &str) -> Result<Value, Option<String>
     }
 }
 
+/// 解释器线程的栈大小。
+///
+/// Rust 可执行文件的**主线程**栈在 Windows 上默认只有 1MB，而 MSVC 编译的
+/// `sq_static.exe` 在 4000 层嵌套正则时还能跑（8000 层才 `0xC00000FD`）。
+/// 为了不让"栈比 C++ 版小"变成行为差异，脚本执行放到这个 16MB 栈的线程上，
+/// 同时把正则的递归预算放大到 8MB（默认值仍是保守的 384KB，见 regex.rs）。
+const VM_THREAD_STACK: usize = 16 * 1024 * 1024;
+const REGEX_STACK_BUDGET: usize = 8 * 1024 * 1024;
+
 fn main() {
+    // 真正干活的部分跑在大栈线程里，行为和 C++ 版对齐
+    let child = std::thread::Builder::new()
+        .stack_size(VM_THREAD_STACK)
+        .spawn(real_main);
+    match child {
+        Ok(h) => {
+            let _ = h.join();
+        }
+        Err(_) => real_main(),
+    }
+}
+
+fn real_main() {
+    squirrel_stdlib::regex::set_stack_budget(REGEX_STACK_BUDGET);
     let args: Vec<String> = std::env::args().collect();
     let mut retval: SQInteger = 0;
 

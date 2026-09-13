@@ -51,10 +51,36 @@ const SYM_EOS: u8 = b'$';
 const SYM_BOS: u8 = b'^';
 const SYM_ESC: u8 = b'\\';
 
-/// 编译期/匹配期递归上限（参考实现没有上限，畸形模式会爆栈）
-const MAX_RE_DEPTH: u32 = 4000;
+/// 递归层数上限（**次要**保险；真正的限制是下面的栈预算）
+const MAX_RE_DEPTH: u32 = 100_000;
+/// 递归栈预算：用局部变量地址差估算已用栈深，**比固定层数可靠**——
+/// 同一段代码在不同线程上的栈大小并不一样（Rust 主线程默认 1MB；参考实现
+/// 实测 4000 层能编、8000 层 `0xC00000FD`）。超过预算就给可捕获错误，
+/// 而不是把宿主栈打穿。
+///
+/// 默认值按"最小的常见栈"取（1MB 主线程 ⇒ 384KB 预算）；CLI 自己会在大栈线程上
+/// 调 `set_stack_budget` 放大它（见 `crates/sq`），因此命令行下与参考实现同量级。
+static RE_STACK_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(384 * 1024);
+
+/// 设置正则递归栈预算（会在**大栈线程**里执行的宿主可以调大）
+pub fn set_stack_budget(bytes: usize) {
+    RE_STACK_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 匹配步数上限：参考实现在 `(a*)*` 这类空匹配量词上会**死循环**
 const MAX_RE_STEPS: u64 = 4_000_000;
+
+/// 当前栈指针的近似值（只用地址差，不做解引用）
+#[inline]
+fn stack_probe() -> usize {
+    let probe = 0u8;
+    &probe as *const u8 as usize
+}
+
+/// 编译期栈预算检查
+fn stack_left(base: usize) -> bool {
+    base.saturating_sub(stack_probe()) < RE_STACK_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------- ctype（C locale）
 fn scisprint(c: u8) -> bool {
@@ -112,6 +138,8 @@ struct Comp {
     nodes: Vec<Node>,
     nsubexpr: i32,
     depth: u32,
+    /// 编译开始时的栈指针（见 `RE_STACK_BUDGET`）
+    stack_base: usize,
 }
 
 impl Comp {
@@ -439,7 +467,7 @@ impl Comp {
     /// ↔ 原版 `element()` 的入口：带递归深度保护（真正的嵌套才增加深度）
     fn element(&mut self) -> Result<i32, String> {
         self.depth += 1;
-        if self.depth > MAX_RE_DEPTH {
+        if self.depth > MAX_RE_DEPTH || !stack_left(self.stack_base) {
             self.depth -= 1;
             return Err("regexp too deeply nested".to_string());
         }
@@ -485,6 +513,8 @@ struct M<'a> {
     depth: u32,
     steps: u64,
     aborted: bool,
+    /// 匹配开始时的栈指针（见 `RE_STACK_BUDGET`）
+    stack_base: usize,
 }
 
 impl<'a> M<'a> {
@@ -499,6 +529,7 @@ impl<'a> M<'a> {
             depth: 0,
             steps: 0,
             aborted: false,
+            stack_base: stack_probe(),
         }
     }
 
@@ -586,7 +617,7 @@ impl<'a> M<'a> {
             return None;
         }
         self.depth += 1;
-        if self.depth > MAX_RE_DEPTH {
+        if self.depth > MAX_RE_DEPTH || !stack_left(self.stack_base) {
             self.depth -= 1;
             self.aborted = true;
             return None;
@@ -843,6 +874,7 @@ impl Regex {
             nodes: Vec::new(),
             nsubexpr: 0,
             depth: 0,
+            stack_base: stack_probe(),
         };
         let first = c.newnode(OP_EXPR);
         let res = c.list()?;
