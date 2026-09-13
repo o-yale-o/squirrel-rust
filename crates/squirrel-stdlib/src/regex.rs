@@ -21,9 +21,8 @@ enum Node {
     NonCap(Box<Node>),      // (?:...)
     Concat(Vec<Node>),
     Alt(Vec<Node>),
-    Star(Box<Node>, bool),  // greedy
-    Plus(Box<Node>, bool),
-    Quest(Box<Node>, bool),
+    /// ↔ OP_GREEDY：right = (p0<<16)|p1，p1 = 0xFFFF 表示无上限；引擎无惰性量词
+    Greedy(Box<Node>, u16, u16),
     /// ↔ OP_MB：\m(cb)(ce) 嵌套平衡匹配
     MBalanced(u8, u8),
     /// ↔ OP_WB：\b / \B 词边界
@@ -32,6 +31,7 @@ enum Node {
 
 pub struct Regex {
     root: Node,
+    /// 捕获组数量（不含整体匹配）
     ngroups: usize,
 }
 
@@ -39,77 +39,155 @@ struct Parser<'a> {
     pat: &'a [u8],
     pos: usize,
     ngroups: usize,
+    err: Option<String>,
 }
 
 impl<'a> Parser<'a> {
+    /// ↔ sqstd_rex_list：可选的起始 `^`，一个 element，其后若为 `|` 则右递归成 OR
     fn parse_alt(&mut self) -> Node {
-        let mut branches = vec![self.parse_concat()];
-        while self.pos < self.pat.len() && self.pat[self.pos] == b'|' {
+        let bol = if self.pos < self.pat.len() && self.pat[self.pos] == b'^' {
             self.pos += 1;
-            branches.push(self.parse_concat());
-        }
-        if branches.len() == 1 {
-            branches.pop().unwrap()
+            Some(Node::Start)
         } else {
-            Node::Alt(branches)
+            None
+        };
+        let e = self.parse_element();
+        let mut ret = match bol {
+            Some(b) => Node::Concat(vec![b, e]),
+            None => e,
+        };
+        if self.err.is_none() && self.pos < self.pat.len() && self.pat[self.pos] == b'|' {
+            self.pos += 1;
+            let right = self.parse_alt();
+            ret = Node::Alt(vec![ret, right]);
+        }
+        ret
+    }
+
+    fn fail(&mut self, msg: &str) {
+        if self.err.is_none() {
+            self.err = Some(msg.to_string());
         }
     }
 
-    fn parse_concat(&mut self) -> Node {
-        let mut items = Vec::new();
-        while self.pos < self.pat.len() && self.pat[self.pos] != b'|' && self.pat[self.pos] != b')' {
-            let atom = self.parse_atom();
-            let atom = self.parse_quant(atom);
-            items.push(atom);
+    /// ↔ sqstd_rex_expect
+    fn expect(&mut self, c: u8) {
+        if self.pos >= self.pat.len() || self.pat[self.pos] != c {
+            self.fail("expected paren");
+            return;
         }
-        if items.len() == 1 {
-            items.pop().unwrap()
-        } else {
-            Node::Concat(items)
-        }
+        self.pos += 1;
     }
 
-    fn parse_quant(&mut self, atom: Node) -> Node {
-        if self.pos >= self.pat.len() {
-            return atom;
+    /// ↔ sqstd_rex_parsenumber
+    fn parse_number(&mut self) -> u16 {
+        let mut n: u32 = 0;
+        while self.pos < self.pat.len() && self.pat[self.pos].is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((self.pat[self.pos] - b'0') as u32);
+            self.pos += 1;
         }
-        let c = self.pat[self.pos];
-        let mut greedy = true;
-        match c {
-            b'*' | b'+' | b'?' => {
-                self.pos += 1;
-                if self.pos < self.pat.len() && self.pat[self.pos] == b'?' {
-                    greedy = false;
+        n as u16
+    }
+
+    /// ↔ sqstd_rex_element：一个原子 + **至多一个**量词，之后按条件递归串联。
+    /// 注意参考实现的量词 switch 只走一次，所以 `a*?` 中的 `?` 是**字面问号**。
+    fn parse_element(&mut self) -> Node {
+        let mut ret = self.parse_atom();
+        if self.err.is_some() {
+            return ret;
+        }
+        let mut p0: u16 = 0;
+        let mut p1: u16 = 0;
+        let mut isgreedy = false;
+        if self.pos < self.pat.len() {
+            match self.pat[self.pos] {
+                b'*' => {
+                    p0 = 0;
+                    p1 = 0xFFFF;
                     self.pos += 1;
+                    isgreedy = true;
                 }
-                match c {
-                    b'*' => Node::Star(Box::new(atom), greedy),
-                    b'+' => Node::Plus(Box::new(atom), greedy),
-                    _ => Node::Quest(Box::new(atom), greedy),
+                b'+' => {
+                    p0 = 1;
+                    p1 = 0xFFFF;
+                    self.pos += 1;
+                    isgreedy = true;
                 }
+                b'?' => {
+                    p0 = 0;
+                    p1 = 1;
+                    self.pos += 1;
+                    isgreedy = true;
+                }
+                b'{' => {
+                    self.pos += 1;
+                    if self.pos >= self.pat.len() || !self.pat[self.pos].is_ascii_digit() {
+                        self.fail("number expected");
+                        return ret;
+                    }
+                    p0 = self.parse_number();
+                    match self.pat.get(self.pos).copied() {
+                        Some(b'}') => {
+                            p1 = p0;
+                            self.pos += 1;
+                        }
+                        Some(b',') => {
+                            self.pos += 1;
+                            p1 = 0xFFFF;
+                            if self.pos < self.pat.len() && self.pat[self.pos].is_ascii_digit() {
+                                p1 = self.parse_number();
+                            }
+                            self.expect(b'}');
+                            if self.err.is_some() {
+                                return ret;
+                            }
+                        }
+                        _ => {
+                            self.fail(", or } expected");
+                            return ret;
+                        }
+                    }
+                    isgreedy = true;
+                }
+                _ => {}
             }
-            _ => atom,
         }
+        if isgreedy {
+            ret = Node::Greedy(Box::new(ret), p0, p1);
+        }
+        // ↔ if(*_p 不在 { '|', ')', '*', '+', '\0' }) 继续串联下一个 element
+        if self.err.is_none()
+            && self.pos < self.pat.len()
+            && !matches!(self.pat[self.pos], b'|' | b')' | b'*' | b'+')
+        {
+            let next = self.parse_element();
+            return Node::Concat(vec![ret, next]);
+        }
+        ret
     }
 
+    /// ↔ sqstd_rex_element 的原子 switch（`^` 不在此列：它只在 list 起始处有意义）
     fn parse_atom(&mut self) -> Node {
+        if self.pos >= self.pat.len() {
+            // ↔ charnode 在 '\0' 上：不可打印 → "letter expected"（空模式同样是错误）
+            self.fail("letter expected");
+            return Node::Char(0);
+        }
         let c = self.pat[self.pos];
         match c {
             b'(' => {
                 self.pos += 1;
-                let noncap = self.pos + 1 < self.pat.len()
-                    && self.pat[self.pos] == b'?'
-                    && self.pat[self.pos + 1] == b':';
+                let noncap = self.pos < self.pat.len() && self.pat[self.pos] == b'?';
                 if noncap {
-                    self.pos += 2;
+                    self.pos += 1;
+                    self.expect(b':');
                 } else {
                     self.ngroups += 1;
                 }
                 let gidx = self.ngroups;
                 let inner = self.parse_alt();
-                // 期待 ')'
-                if self.pos < self.pat.len() && self.pat[self.pos] == b')' {
-                    self.pos += 1;
+                if self.err.is_none() {
+                    self.expect(b')');
                 }
                 if noncap {
                     Node::NonCap(Box::new(inner))
@@ -124,12 +202,18 @@ impl<'a> Parser<'a> {
                     neg = true;
                     self.pos += 1;
                 }
+                // ↔ if(*_p == ']') sqstd_rex_error("empty class")
+                if self.pos < self.pat.len() && self.pat[self.pos] == b']' {
+                    self.fail("empty class");
+                    return Node::Class { neg, ranges: Vec::new(), classes: Vec::new() };
+                }
                 let mut ranges = Vec::new();
                 let mut classes = Vec::new();
-                let mut first = true;
-                while self.pos < self.pat.len() && (self.pat[self.pos] != b']' || first) {
-                    first = false;
+                while self.pos < self.pat.len() && self.pat[self.pos] != b']' {
                     let lo = self.parse_class_char();
+                    if self.err.is_some() {
+                        break;
+                    }
                     if lo == b'\\' {
                         // 类简写
                         let cls = self.pat.get(self.pos - 1).copied().unwrap_or(b'd');
@@ -139,13 +223,19 @@ impl<'a> Parser<'a> {
                     if self.pos + 1 < self.pat.len() && self.pat[self.pos] == b'-' && self.pat[self.pos + 1] != b']' {
                         self.pos += 1;
                         let hi = self.parse_class_char();
+                        if self.err.is_some() {
+                            break;
+                        }
                         ranges.push((lo, hi));
                     } else {
                         ranges.push((lo, lo));
                     }
                 }
-                if self.pos < self.pat.len() {
-                    self.pos += 1; // ']'
+                if self.pos >= self.pat.len() {
+                    // ↔ class 循环靠指针比较，实际会撞上结尾 '\0' 的 charnode
+                    self.fail("letter expected");
+                } else {
+                    self.expect(b']');
                 }
                 Node::Class { neg, ranges, classes }
             }
@@ -153,17 +243,18 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Node::Any
             }
-            b'^' => {
-                self.pos += 1;
-                Node::Start
-            }
             b'$' => {
                 self.pos += 1;
                 Node::End
             }
             b'\\' => {
                 self.pos += 1;
-                let e = *self.pat.get(self.pos).unwrap_or(&b'\\');
+                if self.pos >= self.pat.len() {
+                    // ↔ charnode 的转义 switch：case 0
+                    self.fail("letter expected for argument of escape sequence");
+                    return Node::Char(0);
+                }
+                let e = self.pat[self.pos];
                 self.pos += 1;
                 match e {
                     // ↔ sqstd_rex_charclass 的完整集合
@@ -193,6 +284,11 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
+                // ↔ sqstd_rex_charnode：不可打印字符（含行尾 '\0'）报 "letter expected"
+                if !(0x20..0x7f).contains(&c) {
+                    self.fail("letter expected");
+                    return Node::Char(0);
+                }
                 self.pos += 1;
                 Node::Char(c)
             }
@@ -316,9 +412,14 @@ impl<'a> Matcher<'a> {
                 }
                 false
             }
-            Node::Star(inner, greedy) => self.m_repeat(inner, pos, 0, usize::MAX, *greedy, k),
-            Node::Plus(inner, greedy) => self.m_repeat(inner, pos, 1, usize::MAX, *greedy, k),
-            Node::Quest(inner, greedy) => self.m_repeat(inner, pos, 0, 1, *greedy, k),
+            Node::Greedy(inner, p0, p1) => self.m_repeat(
+                inner,
+                pos,
+                *p0 as usize,
+                if *p1 == 0xFFFF { usize::MAX } else { *p1 as usize },
+                true,
+                k,
+            ),
             Node::MBalanced(cb, ce) => {
                 // ↔ sqstd_rex_matchbalance：嵌套平衡
                 if pos >= self.text.len() || self.text[pos] != *cb {
@@ -398,14 +499,18 @@ impl<'a> Matcher<'a> {
         greedy: bool,
         k: &mut dyn FnMut(&mut Matcher<'a>, usize) -> bool,
     ) -> bool {
-        // 先收集能匹配的所有延续长度（贪心：多优先；惰性：少优先）
+        // 次数已用尽（↔ while(nmaches < p1)）：只能走延续，且必须已满足下限
+        if max == 0 {
+            return min == 0 && k(self, pos);
+        }
+        // 贪心：多优先；惰性：少优先
         if greedy {
             let _me: &mut Matcher<'a> = self;
             let mut kont = |m: &mut Matcher<'a>, p: usize| {
                 if p == pos {
                     return false; // 空匹配防死循环
                 }
-                m.m_repeat(inner, p, min.saturating_sub(1), max.saturating_sub(1), greedy, k)
+                m.m_repeat(inner, p, min.saturating_sub(1), max - 1, greedy, k)
             };
             if self.m(inner, pos, &mut kont) {
                 return true;
@@ -423,7 +528,7 @@ impl<'a> Matcher<'a> {
                 if p == pos {
                     return false;
                 }
-                m.m_repeat(inner, p, min.saturating_sub(1), max.saturating_sub(1), greedy, k)
+                m.m_repeat(inner, p, min.saturating_sub(1), max - 1, greedy, k)
             };
             self.m(inner, pos, &mut kont)
         }
@@ -441,17 +546,22 @@ impl<'a> Matcher<'a> {
 }
 
 impl Regex {
-    pub fn compile(pattern: &[u8]) -> Option<Regex> {
+    /// ↔ sqstd_rex_compile：失败时带出参考实现的错误文本
+    pub fn compile(pattern: &[u8]) -> Result<Regex, String> {
         let mut p = Parser {
             pat: pattern,
             pos: 0,
             ngroups: 0,
+            err: None,
         };
         let root = p.parse_alt();
-        if p.pos != pattern.len() {
-            return None;
+        if let Some(e) = p.err {
+            return Err(e);
         }
-        Some(Regex {
+        if p.pos != pattern.len() {
+            return Err("unexpected character".to_string());
+        }
+        Ok(Regex {
             root,
             ngroups: p.ngroups,
         })
@@ -508,6 +618,11 @@ impl Regex {
     pub fn ngroups(&self) -> usize {
         self.ngroups
     }
+
+    /// ↔ sqstd_rex_getsubexpcount：含整体匹配（C++ 的根 OP_EXPR 也占一个编号）
+    pub fn subexpcount(&self) -> usize {
+        self.ngroups + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,20 +651,27 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
     cls.borrow_mut().new_slot(ss, &rxid_key, &Value::Integer(0), false);
 
     macro_rules! method {
-        ($name:expr, $npc:expr, $f:expr) => {
+        ($name:expr, $npc:expr, $tm:expr, $f:expr) => {
             let nc = squirrel::closure::SQNativeClosure::create(ss, Rc::new($f), 0);
-            nc.borrow_mut().nparamscheck = $npc;
-            nc.borrow_mut().name = ss.intern($name.as_bytes());
+            {
+                let mut n = nc.borrow_mut();
+                n.nparamscheck = $npc;
+                n.name = ss.intern($name.as_bytes());
+                if let Some(tm) = $tm {
+                    squirrel::state::compile_typemask(&mut n.typecheck, tm.as_bytes());
+                }
+            }
             let key = ss.intern($name.as_bytes());
             cls.borrow_mut().new_slot(ss, &key, &Value::NativeClosure(nc), true);
         };
     }
 
-    // constructor(pattern)
-    method!("constructor", -1, move |v: &mut VmData| {
+    // ↔ rexobj_funcs：constructor,2,.s / search,-2,.xsn / match,2,.xs / capture,-2,.xsn /
+    //                subexpcount,1,.x / _typeof,1,.x
+    method!("constructor", 2, Some(".s"), move |v: &mut VmData| {
         let pat = v.stack_get(2);
         match Regex::compile(pat.as_bytes()) {
-            Some(rx) => {
+            Ok(rx) => {
                 let id = REGEXPS.with(|r| {
                     let mut b = r.borrow_mut();
                     b.push(Rc::new(rx));
@@ -562,14 +684,14 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
                 }
                 0
             }
-            None => {
-                v.raise_error_str("error compiling the regular expression");
+            Err(msg) => {
+                v.raise_error_str(&msg);
                 SQ_ERROR
             }
         }
     });
 
-    method!("search", -1, |v: &mut VmData| {
+    method!("search", -2, Some("xsn"), |v: &mut VmData| {
         let rx = match get_rx(v, 1) {
             Some(r) => r,
             None => return SQ_ERROR,
@@ -591,7 +713,7 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
         }
     });
 
-    method!("capture", -1, |v: &mut VmData| {
+    method!("capture", -2, Some("xsn"), |v: &mut VmData| {
         let rx = match get_rx(v, 1) {
             Some(r) => r,
             None => return SQ_ERROR,
@@ -605,17 +727,12 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
             Some((_b, _e, caps)) => {
                 let arr = squirrel::array::SQArray::create(&v.ss, caps.len() as SQInteger);
                 for (i, c) in caps.iter().enumerate() {
-                    match c {
-                        Some((s, e)) => {
-                            let t = squirrel::table::SQTable::create(&v.ss, 2);
-                            t.borrow_mut().new_slot(&v.ss.intern(b"begin"), &Value::Integer(*s as SQInteger));
-                            t.borrow_mut().new_slot(&v.ss.intern(b"end"), &Value::Integer(*e as SQInteger));
-                            let _ = arr.borrow_mut().set(i as SQInteger, &Value::Table(t));
-                        }
-                        None => {
-                            let _ = arr.borrow_mut().set(i as SQInteger, &Value::Null);
-                        }
-                    }
+                    // ↔ match.len > 0 ? 实际区间 : 空匹配（{begin:0,end:0}），不是 null
+                    let (s, e) = c.unwrap_or((0, 0));
+                    let t = squirrel::table::SQTable::create(&v.ss, 2);
+                    t.borrow_mut().new_slot(&v.ss.intern(b"begin"), &Value::Integer(s as SQInteger));
+                    t.borrow_mut().new_slot(&v.ss.intern(b"end"), &Value::Integer(e as SQInteger));
+                    let _ = arr.borrow_mut().set(i as SQInteger, &Value::Table(t));
                 }
                 v.push(Value::Array(arr));
                 1
@@ -624,7 +741,7 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
         }
     });
 
-    method!("match", 2, |v: &mut VmData| {
+    method!("match", 2, Some("xs"), |v: &mut VmData| {
         let rx = match get_rx(v, 1) {
             Some(r) => r,
             None => return SQ_ERROR,
@@ -634,12 +751,19 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
         1
     });
 
-    method!("subexpcount", 1, |v: &mut VmData| {
+    method!("subexpcount", 1, Some("x"), |v: &mut VmData| {
         let rx = match get_rx(v, 1) {
             Some(r) => r,
             None => return SQ_ERROR,
         };
-        v.push(Value::Integer(rx.ngroups() as SQInteger));
+        v.push(Value::Integer(rx.subexpcount() as SQInteger));
+        1
+    });
+
+    // ↔ rexobj_funcs 的 _typeof：typeof regexp 实例得到 "regexp"
+    method!("_typeof", 1, Some("x"), |v: &mut VmData| {
+        let s = v.ss.intern(b"regexp");
+        v.push(s);
         1
     });
 

@@ -1,11 +1,11 @@
 local w = file("diff_test_rw.txt", "wb+");
-local blob = blob(0);
-blob.writen(72, 'b');
-blob.writen(101, 'b');
-blob.writen(108, 'b');
-blob.writen(108, 'b');
-blob.writen(111, 'b');
-w.writeblob(blob);
+local b1 = blob(0);
+b1.writen(72, 'b');
+b1.writen(101, 'b');
+b1.writen(108, 'b');
+b1.writen(108, 'b');
+b1.writen(111, 'b');
+w.writeblob(b1);
 w.flush();
 w.seek(0, 'b');
 local r = w.readblob(5);
@@ -30,3 +30,13 @@ print(b3.readn('f') + "\n");
 print(casti2f(swap4(castf2i(2.5))) + "\n");
 print(swap2(0x1234) + "\n");
 print(swap4(0x12345678) + "\n");
+// blob 全局函数（↔ sqstdblob.cpp 的 _g_blob_*，掩码 .n）
+print(swap4(1) + "\n");
+print(swap2(0xFF) + "\n");
+print(castf2i(1.5) & 0xFFFFFFFF) + "\n";
+print(casti2f(1069547520) + "\n");
+print(swapfloat(1.0) + "\n");
+print(casti2f(0x40200000) + "\n");
+function tt(tag, f) { try { print(tag + "=" + f() + "\n"); } catch (e) { print(tag + "!" + e + "\n"); } }
+tt("bad_casti2f", function() { return casti2f("x"); });
+tt("bad_swap2", function() { return swap2(); });

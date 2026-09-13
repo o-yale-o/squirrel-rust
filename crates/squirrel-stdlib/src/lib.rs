@@ -893,33 +893,37 @@ pub fn register_bloblib(vm: &mut VmData) {
         _ => return,
     };
 
+    // ↔ _DECL_GLOBALBLOB_FUNC(name,2,".n")：掩码首位 '.' 是 this 占位
     macro_rules! bfn {
         ($name:expr, $tm:expr, $f:expr) => {
-            reg_global(&ss, &root, $name, Rc::new($f), 2, Some($tm));
+            reg_global(&ss, &root, $name, Rc::new($f), 2, Some(concat!(".", $tm)));
         };
     }
 
-    bfn!("castf2i", "f", |v: &mut VmData| {
+    bfn!("castf2i", "n", |v: &mut VmData| {
+        // ↔ *(const SQInteger *)&f：参考实现按位重解释 f32 的 4 字节（高位读的是相邻栈内容，
+        // 属 UB）；这里取确定性的低 32 位（即 f32 的位模式）
         let f = v.stack_get(2).as_float();
-        v.push(Value::Integer(squirrel::config::c_f32_to_i64(f)));
+        v.push(Value::Integer(f.to_bits() as SQInteger));
         1
     });
-    bfn!("casti2f", "i", |v: &mut VmData| {
+    bfn!("casti2f", "n", |v: &mut VmData| {
         let i = v.stack_get(2).as_integer();
         v.push(Value::Float(f32::from_bits(i as u32)));
         1
     });
-    bfn!("swap2", "i", |v: &mut VmData| {
+    bfn!("swap2", "n", |v: &mut VmData| {
         let i = v.stack_get(2).as_integer();
         v.push(Value::Integer(((i & 0xFF) << 8) | ((i >> 8) & 0xFF)));
         1
     });
-    bfn!("swap4", "i", |v: &mut VmData| {
+    bfn!("swap4", "n", |v: &mut VmData| {
+        // ↔ unsigned int t4 = (unsigned int)i; __swap_dword(&t4)：只交换低 32 位
         let i = v.stack_get(2).as_integer();
-        v.push(Value::Integer(i.swap_bytes()));
+        v.push(Value::Integer((i as u32).swap_bytes() as SQInteger));
         1
     });
-    bfn!("swapfloat", "f", |v: &mut VmData| {
+    bfn!("swapfloat", "n", |v: &mut VmData| {
         let f = v.stack_get(2).as_float();
         v.push(Value::Float(f32::from_bits(f.to_bits().swap_bytes())));
         1
