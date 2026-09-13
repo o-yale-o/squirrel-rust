@@ -11,8 +11,8 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 | 验证项 | 结果 |
 |---|---|
 | 官方 samples/ 全部 17 个脚本差分 | **17/17 一致** |
-| 自建边界语料 **51** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **51/51 一致** |
-| 自动生成的组合矩阵：运算符 × 类型（3181 条）、metamethod（343 条）、格式串（1305 条） | **逐行一致** |
+| 自建边界语料 **53** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **53/53 一致** |
+| 自动生成的组合矩阵：运算符 × 类型（3181 条）、metamethod（343 条）、格式串（1305 条）、委托方法（2870 条）、根表顺序 | **逐行一致** |
 | REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
 | `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **51/51 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
 | `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **51/51 通过** |
@@ -43,11 +43,12 @@ python tools/minimal_diff.py                    # 编出官方 etc/minimal.c 与
 python tools/stdin_eof.py                       # stdin 在管道/文件重定向下的原语行为
 python tools/audit_globals.py                   # 全局注册（名字/参数个数/类型掩码）
 python tools/audit_delegates.py                 # 11 张默认委托表成员
+python tools/audit_regorder.py                  # 根表**插入顺序**（迭代顺序由它决定）
 python tools/lint_corpus.py                     # 语料语法陷阱 + 逐个试编译
 ```
 
 三张矩阵语料由脚本生成，改语料请改生成器（`tools/gen_opmatrix.py`、
-`tools/gen_metaprobe.py`、`tools/gen_formatmx.py`）后重新生成。
+`tools/gen_metaprobe.py`、`tools/gen_formatmx.py`、`tools/gen_delmatrix.py`）后重新生成。
 
 参考 C++ 二进制的构建（一次性）：
 
@@ -141,9 +142,10 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
   文件重定向与参考实现逐字节一致（实测脚本：`python tools/stdin_eof.py`、
   `tools/stdin_diff.py`、`tools/probes/stream_semantics.nut`）；
 - 少数**参考实现自身越界/UB** 的场景取确定性行为（详见 `STATUS.md` 第四节）：
-  `escape` 短字符串中的高位字节、`getstackinfos(-1)`、UCRT `date` 上界、
-  在已挂起的线程上再次 `call()`、REPL 读到 EOF、空正则模式（参考实现会写 NULL 崩溃）、
-  `.cnut` 里 outer 类型字段的高 4 字节（参考实现写的是未初始化内存）、
+  `escape` 短字符串中的高位字节、`getstackinfos(-1)` / `thread.getstackinfos(<负 level>)`、
+  UCRT `date` 上界、在已挂起的线程上再次 `call()`、REPL 读到 EOF、
+  空正则模式（参考实现会写 NULL 崩溃）、`blob.resize(<负>)` 与 `blob.readblob(<负>)`
+  （参考实现直接访问违例）、`.cnut` 里 outer 类型字段的高 4 字节（未初始化内存）、
   坏字节码里的越界 outer 索引（参考实现访问违例崩溃）、
   `format` 规格串恰好 20 字符（参考实现栈溢出崩溃）。
 

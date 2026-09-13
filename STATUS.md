@@ -9,7 +9,9 @@
 | 验证项 | 复现命令 | 实测结果 |
 |---|---|---|
 | 官方 samples 差分（stdout + stderr + 退出码） | `python tools/diff_test.py` | **17/17 一致** |
-| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **51/51 一致** |
+| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **53/53 一致** |
+| 委托方法 × 参数形态矩阵（2723 条自动 + 147 条语义） | 同上 | **逐行一致** |
+| 根表插入/迭代顺序 | `python tools/diff_test.py tests-corpus`（`t_roottable.nut`） | **逐行一致**（注册顺序已逐库对齐） |
 | 运算符 × 类型矩阵（3181 条断言） | `python tools/diff_test.py tests-corpus` | **逐行一致** |
 | metamethod 全矩阵（343 个用例 × 18 个 metamethod） | 同上 | **逐行一致** |
 | `format`/`printf` 格式串矩阵（1305 行） | 同上 | **逐行一致** |
@@ -291,10 +293,74 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 - `flush()` 失败返回 `1`、成功返回 `null`；
 - `writen` 的参数顺序是 **`(值, 格式)`**，与 `readn(格式)` 相反（`sqstdstream.cpp` 读的是 arg3）。
 
+## 三·补5、第五轮：委托方法矩阵（含 ASan 定位参考实现越界）
+
+这一轮把「委托方法 × 参数形态」也做成生成矩阵（`tools/gen_delmatrix.py` → `tests-corpus/t_delmatrix.nut`，
+2723 条自动 + 147 条语义），成员名同样取自 C++ 的 `*_default_delegate_funcz` 表，参数形态覆盖
+空参/整数/负数/浮点/null/布尔/字符串/空串/数组/表/闭包/比较器/多参数。
+
+**过程中参考实现开始不稳定崩**（同一文件 5 次跑 3 次崩、2 次正常，就是那个崩溃框）。
+没有猜，而是用 **AddressSanitizer 重编参考实现**（`tmp-c2/build_asan.bat`）直接拿到报告：
+
+```text
+ERROR: AddressSanitizer: heap-buffer-overflow READ of size 4
+    #0 sq_stackinfos      squirrel/sqdebug.cpp:35
+    #1 __getcallstackinfos squirrel/sqbaselib.cpp:117
+    #2 thread_getstackinfos squirrel/sqbaselib.cpp:1271
+```
+
+`thread.getstackinfos(<负数>)`：`sq_stackinfos` 的边界判断是 `cssize > level`，对负 level 恒真，
+于是去读一个空的调用栈（越界读 + 偶发访问违例）。同类还有两条，都由矩阵二分 + 逐条单跑定位：
+
+| 参考实现 UB 输入 | 现象 |
+|---|---|
+| `blob.resize(<负数>)` | `SQBlob::Resize` 直接 `realloc(负长度)` → 访问违例 0xC0000005 |
+| `blob.readblob(<负数>)` | `sq_getscratchpad(v,-1)` + `fread(buf,1,(size_t)-1)` → 访问违例 |
+| `thread.getstackinfos(<负数>)` | 越界读调用栈（ASan 报告如上），偶发崩溃 |
+
+这三类已从语料里按形态排除（`gen_delmatrix.py` 的 `BLOCK` 表），并在 ASan 构建下复跑到
+**零报告**，参考实现 5/5 稳定跑完。
+
+**矩阵接着抓出的真差异（全部已修）**：
+
+1. **`array.apply` 返回值错 + 栈泄漏**：参考实现返回**数组本身**（`__map_array` 之后 `sq_pop(v,1)`
+   让 this 成为返回值）；本实现返回了最后一个映射结果。根因是 `map_array` 没有消费压入的实参
+   （我们的 `call_value` 等价于 `SQVM::Call`，不会像 `sq_call` 那样 `Pop(params)+Push(res)`），
+   于是每处理一个元素栈就长 2 格——大数组会顶爆栈，返回值也取错槽。已按 `__map_array` 逐句对齐。
+2. **根表插入顺序 4 处不同**（脚本可观察：`foreach (k,v in getroottable())`）：
+   bloblib 的 `stream` 类位置与 `casti2f`/`castf2i` 顺序、`blob` 类应在 swap* 之后；
+   iolib 的 `stdout/stdin/stderr` 顺序（本实现写成了 stdout/stderr/stdin）；systemlib 的 `date`
+   位置（应在 `remove` 之前）；stringlib 的 `regexp`（应在 `format` 之前）。
+   定位方法：给参考实现副本的 `sq_newslot` 加一行追踪 + 我们这边临时同样追踪，逐条对比插入序列
+   （现在固化成了 `tools/audit_regorder.py` 静态审计 + `tests-corpus/t_roottable.nut` 语料）。
+3. **`closure.call` 的尾调用怪癖**：参考实现判断的是**最后一个实参**是否为非生成器闭包，
+   被调用者则是 `this`；命中就走 `sq_tailcall`（原生闭包 → `only closure can be tail called`）。
+   本实现按接收者判断，错误文本因此不同。
+4. **`closure.getinfos`**：`varargs` 是整数 0/1（不是布尔）；原生闭包的 `typecheck` 为空时是
+   **null**（不是空数组）。
+5. **`closure.getroot`/`setroot`**：对原生闭包报 `closure expected`；`setroot` 的非表参数报
+   `invalid type`。原实现返回 `SQ_ERROR` 却没设消息，脚本 catch 到的是上一次的陈旧错误文本。
+6. **`class.getattributes(null)`**：参考实现返回**类自身**的 attributes（没有就是 null），
+   本实现报 `wrong index`。
+7. **`weakref.weakref()`**：weakref 自身也是引用计数对象，`w.weakref()` 给的是「指向 w 的 weakref」
+   （`SQRefCounted::GetWeakRef`），因此 `w.weakref() == w` 恒为 false、`typeof` 仍是 weakref。
+   本实现原来返回 `w` 自己（后来又错改成返回目标对象）。
+8. **`regexp.constructor`**：已构造过的实例再调必须报 `invalid regexp object`（参考实现看实例
+   userpointer 是否为空）；顺带把 `get_rx` 的 `__rxid` 读取改成严格校验（null/非整数/越界一律
+   视为无效，不允许 `as_integer()` 把 null 当 0 去取别人的正则）。
+9. `stream/blob/file` 三个类被构造了两次（bloblib 与 iolib 各一次）→ 现在幂等缓存，
+   root 里的类与内部引用指向同一对象。
+
+**测试方法学**：`diff_test.py` 的「未捕获错误 → SUSPECT」守卫加了完成标记豁免——生成的矩阵语料
+以 `<NAME>-DONE` 结尾，若 stdout 里有这个标记就说明脚本跑完了；此时 stderr 可能是「错误被脚本
+catch 住、错误处理器仍打印」的那类情况（两边逐字一致才算过），不该误判为提前结束。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
 |---|---|
+| `blob.resize(<负数>)` / `blob.readblob(<负数>)` | 参考实现不检查负数：前者 `realloc(负长度)`，后者 `sq_getscratchpad(-1)` + `fread(buf,1,(size_t)-1)`，实测都访问违例（0xC0000005）。本实现报可捕获错误，语料按形态排除 |
+| `thread.getstackinfos(<负数 level>)` | `sq_stackinfos` 用 `cssize > level` 判界，负 level 恒真 → 越界读空调用栈（ASan 实测 `sqdebug.cpp:35` heap-buffer-overflow），偶发整进程崩溃。本实现返回 null，语料按形态排除 |
 | 不可 seek 流上 `len()`/`eos()`/`readblob` | 参考实现的 `EOS()` 是 `Tell()==Len()`，而 `Len()` 靠 `fseek(SEEK_END)`：管道上这次调用**失败**，之后 `ftell` 给出的是 CRT 内部状态（实测同一进程里 `readblob(4)` 之前 Len()≥4、之后 Len()=0；5000 字节管道上又变成 904=5000−4096）。更糟的是失败的 `fseek` 会**丢弃已缓冲的输入**：8 字节管道上读完 2 字节后剩下的 6 字节直接消失，于是 `readn` 报 io error。本实现给出确定性行为（`tell()`=已消费字节数、不可 seek 时 `len()`=0），不复刻这个数据丢失 |
 | `.cnut` 的 outer 类型字段 | 参考实现用 `sizeof(SQUnsignedInteger)`（8 字节）写一个 4 字节枚举，高 4 字节是**未初始化内存**：同一脚本连编两次字节都不同（实测 `ff245324…` vs `e4e3c42e…`），而 `e4e3c42e…` 恰好等于本实现的输出。因此含闭包的语料会有几个文件字节不同，`tools/cnut_matrix.py` 把这种只差高 4 字节的情况单独标成 `PAD-ONLY`（低 32 位类型仍逐位相同，其余字段全部一致）；本实现写确定的 0。加载侧已按低 32 位掩码，参考实现产出的字节码能正常执行（51/51 交叉执行一致） |
 | 坏字节码里的越界 outer 索引 | 参考实现不检查该索引，夹具 `ref_closures_badouter.cnut` 让 C++ 侧访问违例崩溃（0xC0000005）；本实现报可捕获的 `invalid outer value index`（`crates/squirrel-stdlib/tests/bytecode_interop.rs` 守门） |

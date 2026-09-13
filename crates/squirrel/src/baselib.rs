@@ -145,6 +145,7 @@ fn parse_c_strtod(t: &str) -> Option<f64> {
 }
 
 /// 注册一个原生函数到表（↔ CreateDefaultDelegate 的一步）
+
 fn reg(
     ss: &Rc<SharedState>,
     t: &TableRef,
@@ -566,7 +567,9 @@ pub fn get_local_at(v: &mut VmData, level: SQInteger, nseq: SQInteger) -> Option
             (o.open_idx, o.value.clone())
         };
         let val = match open_idx {
-            Some(i) => v.stack[i].clone(),
+            // 栈槽索引来自 outer 记录，可能因为栈被重建/关闭而失效：越界一律退化为 null，
+            // 不允许直接索引（否则宿主机直接 panic）
+            Some(i) => v.stack.get(i).cloned().unwrap_or(Value::Null),
             None => closed,
         };
         v.push(val);
@@ -684,6 +687,8 @@ fn default_delegate_tostring(v: &mut VmData) -> NativeResult {
 }
 
 fn obj_delegate_weakref(v: &mut VmData) -> NativeResult {
+    // ↔ sq_weakref：引用计数类型返回「该对象自己的 weakref」（按对象缓存，
+    // weakref 自身的 weakref 指向它自己）；非引用计数类型原样返回。
     let o = v.stack_get(1);
     let w = o.get_weakref();
     v.push(w);
@@ -1215,18 +1220,25 @@ fn array_apply(v: &mut VmData) -> NativeResult {
             return SQ_ERROR;
         }
     }
-    v.pop();
+    // ↔ array_apply：__map_array 之后再 sq_pop(v,1)，使 this（数组本身）成为返回值；
+    // 这里显式把栈收回到 this 并压回数组，语义相同且不依赖栈上残留
+    v.top = v.stackbase + 1;
+    v.push(o);
     1
 }
 
 /// ↔ __map_array
 fn map_array(v: &mut VmData, dest: &ArrayRef, src: &Value) -> Result<(), ()> {
+    // ↔ __map_array：每轮压 nArgs 个实参 → sq_call（**消费实参**并压回返回值）
+    //                  → 取结果 → 弹掉结果。净栈变化为 0。
+    // 我们的 call_value 相当于 SQVM::Call（返回结果但**不**动实参），
+    // 所以必须自己 pop_n(nArgs)；否则实参留在栈上：既会让调用方（array_apply）
+    // 的返回值取错栈槽，又会让大数组的 apply 把栈顶爆掉。
     let closure = v.stack_get(2);
     let size = match src {
         Value::Array(a) => a.borrow().size(),
         _ => 0,
     };
-    v.push(closure.clone());
     let nargs = match &closure {
         Value::Closure(c) => c.borrow().function.parameters.len() as SQInteger,
         Value::NativeClosure(nc) => {
@@ -1252,17 +1264,16 @@ fn map_array(v: &mut VmData, dest: &ArrayRef, src: &Value) -> Result<(), ()> {
         if nargs >= 4 {
             v.push(src.clone());
         }
-        match v.call_value(&closure, nargs, v.top - nargs, false) {
-            Ok(r) => {
-                dest.borrow_mut().set(n, &r);
-                v.pop();
-            }
+        let r = match v.call_value(&closure, nargs, v.top - nargs, false) {
+            Ok(r) => r,
             Err(_) => {
+                v.pop_n(nargs);
                 return Err(());
             }
-        }
+        };
+        v.pop_n(nargs); // ↔ sq_call 里的 v->Pop(params)
+        dest.borrow_mut().set(n, &r);
     }
-    v.pop();
     Ok(())
 }
 
@@ -1718,17 +1729,21 @@ fn closure_pcall(v: &mut VmData) -> NativeResult {
 }
 
 fn closure_call(v: &mut VmData) -> NativeResult {
-    let c = v.stack_get(1);
-    let is_plain = match &c {
-        Value::Closure(cl) => !cl.borrow().function.bgenerator,
-        _ => false,
-    };
-    let n = v.top - v.stackbase - 1;
-    if is_plain {
-        // ↔ sq_tailcall
-        let cl = match &c {
-            Value::Closure(cl) => cl.clone(),
-            _ => unreachable!(),
+    // ↔ closure_call：判断的是**最后一个实参**是否为非生成器脚本闭包（参考实现就是这样写的），
+    // 被调用者则是 GetUp(-(nparams+1))（= this）。命中走尾调用；否则走普通调用。
+    let n = v.top - v.stackbase - 1; // ↔ sq_gettop(v)-1（不含 this）
+    let last_is_plain = matches!(v.get_up(-1), Value::Closure(ref cl) if !cl.borrow().function.bgenerator);
+    if last_is_plain {
+        // ↔ sq_tailcall(v, n)：被调用者是 GetUp(-(n+1))
+        let callee = v.get_up(-(n + 1));
+        let cl = match &callee {
+            Value::Closure(cl) => {
+                if cl.borrow().function.bgenerator {
+                    return throw_error(v, "generators cannot be tail called");
+                }
+                cl.clone()
+            }
+            _ => return throw_error(v, "only closure can be tail called"),
         };
         let last_top = v.top;
         if !v.openouters.is_empty() {
@@ -1745,15 +1760,16 @@ fn closure_call(v: &mut VmData) -> NativeResult {
         if last_top >= v.top {
             v.top = last_top;
         }
-        SQ_TAILCALL_FLAG
-    } else {
-        match v.call_value(&c, n, v.stackbase + 1, true) {
-            Ok(r) => {
-                v.push(r);
-                1
-            }
-            Err(_) => SQ_ERROR,
+        return SQ_TAILCALL_FLAG;
+    }
+    // 普通调用：↔ sq_call(v, sq_gettop(v)-1, SQTrue, SQTrue)
+    let c = v.stack_get(1);
+    match v.call_value(&c, n, v.stackbase + 1, true) {
+        Ok(r) => {
+            v.push(r);
+            1
         }
+        Err(_) => SQ_ERROR,
     }
 }
 
@@ -1819,6 +1835,7 @@ fn closure_bindenv(v: &mut VmData) -> NativeResult {
 }
 
 fn closure_getroot(v: &mut VmData) -> NativeResult {
+    // ↔ sq_getclosureroot：sq_isclosure 只认脚本闭包，原生闭包报 "closure expected"
     let closure = v.stack_get(1);
     match &closure {
         Value::Closure(c) => {
@@ -1827,23 +1844,25 @@ fn closure_getroot(v: &mut VmData) -> NativeResult {
             v.push(obj);
             1
         }
-        _ => SQ_ERROR,
+        _ => throw_error(v, "closure expected"),
     }
 }
 
 fn closure_setroot(v: &mut VmData) -> NativeResult {
+    // ↔ sq_setclosureroot：先查闭包（脚本闭包），再查参数是不是表；错误文本与之一致
     let closure = v.get_up(-2);
     let root = v.get_up(-1);
-    if let Value::Closure(c) = &closure {
-        let w = match &root {
-            Value::Table(t) => Some(Value::Table(t.clone()).get_weakref_as_weakref()),
-            _ => None,
-        };
-        c.borrow_mut().set_root(w);
-        v.push(closure);
-        1
-    } else {
-        SQ_ERROR
+    match &closure {
+        Value::Closure(c) => match &root {
+            Value::Table(t) => {
+                let w = Value::Table(t.clone()).get_weakref_as_weakref();
+                c.borrow_mut().set_root(Some(w));
+                v.push(closure);
+                1
+            }
+            _ => throw_error(v, "invalid type"),
+        },
+        _ => throw_error(v, "closure expected"),
     }
 }
 
@@ -1878,7 +1897,11 @@ fn closure_getinfos(v: &mut VmData) -> NativeResult {
             rt.new_slot(&v.ss.intern(b"name"), &f.name);
             rt.new_slot(&v.ss.intern(b"src"), &f.sourcename);
             rt.new_slot(&v.ss.intern(b"parameters"), &Value::Array(params));
-            rt.new_slot(&v.ss.intern(b"varargs"), &Value::Bool(f.varparams != 0));
+            // ↔ f->_varparams：SQInteger 0/1（不是布尔）
+            rt.new_slot(
+                &v.ss.intern(b"varargs"),
+                &Value::Integer(if f.varparams != 0 { 1 } else { 0 }),
+            );
             rt.new_slot(&v.ss.intern(b"defparams"), &Value::Array(defparams));
         }
         Value::NativeClosure(nc) => {
@@ -1890,15 +1913,21 @@ fn closure_getinfos(v: &mut VmData) -> NativeResult {
             rt.new_slot(&v.ss.intern(b"native"), &Value::Bool(true));
             rt.new_slot(&v.ss.intern(b"name"), &name);
             rt.new_slot(&v.ss.intern(b"paramscheck"), &Value::Integer(nparamscheck));
-            let tcarr = SQArray::create(&v.ss, typecheck.len() as SQInteger);
-            {
-                let mut tb = tcarr.borrow_mut();
-                tb.resize(typecheck.len() as SQInteger, &Value::Null);
-                for n in 0..typecheck.len() {
-                    tb.set(n as SQInteger, &Value::Integer(typecheck[n] as SQInteger));
+            // ↔ 参考实现：typecheck 为空时该槽是 **null**（不是空数组）
+            let tcval = if typecheck.is_empty() {
+                Value::Null
+            } else {
+                let tcarr = SQArray::create(&v.ss, typecheck.len() as SQInteger);
+                {
+                    let mut tb = tcarr.borrow_mut();
+                    tb.resize(typecheck.len() as SQInteger, &Value::Null);
+                    for n in 0..typecheck.len() {
+                        tb.set(n as SQInteger, &Value::Integer(typecheck[n] as SQInteger));
+                    }
                 }
-            }
-            rt.new_slot(&v.ss.intern(b"typecheck"), &Value::Array(tcarr));
+                Value::Array(tcarr)
+            };
+            rt.new_slot(&v.ss.intern(b"typecheck"), &tcval);
         }
         _ => return SQ_ERROR,
     }
@@ -2157,6 +2186,13 @@ fn class_getattributes(v: &mut VmData) -> NativeResult {
     let self_ = v.get_up(-2);
     let key = v.get_up(-1);
     if let Value::Class(c) = &self_ {
+        // ↔ sq_getattributes：key 为 null 时返回**类**的 attributes（没有 attr 就是 null）
+        if key.is_null() {
+            let attrs = c.borrow().attributes.clone();
+            v.pop();
+            v.push(attrs);
+            return 1;
+        }
         let r = c.borrow().get_attributes(&key);
         match r {
             Some(a) => {

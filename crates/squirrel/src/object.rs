@@ -213,6 +213,7 @@ impl Value {
                 }
                 let w = Value::WeakRef(Rc::new(RefCell::new(SQWeakRef {
                     obj: WeakValue::$variant(Rc::downgrade(rc)),
+                    weakref_slot: RefCell::new(None),
                 })));
                 *rc.borrow_mut().weakref_slot.borrow_mut() = Some(w.clone());
                 w
@@ -227,6 +228,7 @@ impl Value {
                 }
                 let w = Value::WeakRef(Rc::new(RefCell::new(SQWeakRef {
                     obj: WeakValue::$variant(Rc::downgrade(rc)),
+                    weakref_slot: RefCell::new(None),
                 })));
                 *rc.weakref_slot.borrow_mut() = Some(w.clone());
                 w
@@ -245,6 +247,20 @@ impl Value {
             Value::Class(r) => singleton_cell!(r, Class),
             Value::Instance(r) => singleton_cell!(r, Instance),
             Value::Outer(r) => singleton_cell!(r, Outer),
+            // ↔ SQRefCounted::GetWeakRef：weakref 也有自己的 weakref（指向它本身），
+            // 因此 `w.weakref()` 是 weakref（不是目标对象），且 `w.weakref() == w` 为 false
+            Value::WeakRef(r) => {
+                if let Some(w) = r.borrow().weakref_slot.borrow().clone() {
+                    return w;
+                }
+                let w = Value::WeakRef(Rc::new(RefCell::new(SQWeakRef {
+                    obj: WeakValue::WeakRef(Rc::downgrade(r)),
+                    weakref_slot: RefCell::new(None),
+                })));
+                *r.borrow().weakref_slot.borrow_mut() = Some(w.clone());
+                w
+            }
+            // 非引用计数类型（int/float/bool/null…）：↔ sq_weakref 的 v->Push(o)
             _ => self.clone(),
         }
     }
@@ -346,6 +362,8 @@ pub enum WeakValue {
     Class(Weak<RefCell<SQClass>>),
     Instance(Weak<RefCell<SQInstance>>),
     Outer(Weak<RefCell<SQOuter>>),
+    /// weakref 本身也是引用计数对象：`w.weakref()` 给的是「指向 w 的 weakref」
+    WeakRef(Weak<RefCell<SQWeakRef>>),
 }
 
 impl WeakValue {
@@ -367,13 +385,15 @@ impl WeakValue {
             WeakValue::Class(w) => w.upgrade().map(Value::Class).unwrap_or(Value::Null),
             WeakValue::Instance(w) => w.upgrade().map(Value::Instance).unwrap_or(Value::Null),
             WeakValue::Outer(w) => w.upgrade().map(Value::Outer).unwrap_or(Value::Null),
+        WeakValue::WeakRef(w) => w.upgrade().map(Value::WeakRef).unwrap_or(Value::Null),
         }
     }
 }
 
-/// ↔ SQWeakRef
+/// ↔ SQWeakRef（含 ↔ SQRefCounted::_weakref：weakref 自己的 weakref 也懒建并缓存）
 pub struct SQWeakRef {
     pub obj: WeakValue,
+    pub weakref_slot: RefCell<Option<Value>>,
 }
 
 /// ↔ TranslateIndex（sqobject.cpp:73-83）

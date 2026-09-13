@@ -636,8 +636,13 @@ thread_local! {
 fn get_rx(v: &VmData, idx: SQInteger) -> Option<Rc<Regex>> {
     let o = v.stack_get(idx);
     if let Value::Instance(inst) = &o {
+        // __rxid 必须是**整数**且在注册表范围内：null/其它类型/越界一律当作无效对象，
+        // 不允许 as_integer() 把 null 当成 0 去取表（那会取到别人的正则）
         let idv = inst.borrow().get(&v.ss.intern(b"__rxid"))?;
-        let id = idv.as_integer() as usize;
+        let id = match idv {
+            Value::Integer(i) if i >= 0 => i as usize,
+            _ => return None,
+        };
         return REGEXPS.with(|r| r.borrow().get(id).cloned());
     }
     None
@@ -647,8 +652,9 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
     let cls = squirrel::class::SQClass::create(ss, None);
     let rxid_key = ss.intern(b"__rxid");
 
-    // 字段：__rxid（REGEXPS 注册表索引）
-    cls.borrow_mut().new_slot(ss, &rxid_key, &Value::Integer(0), false);
+    // 字段：__rxid（REGEXPS 注册表索引）。默认 **null** = 还没构造过
+    // （↔ 参考实现用实例 userpointer 判 self != NULL；本实现用这个隐藏字段代替）
+    cls.borrow_mut().new_slot(ss, &rxid_key, &Value::Null, false);
 
     macro_rules! method {
         ($name:expr, $npc:expr, $tm:expr, $f:expr) => {
@@ -669,6 +675,19 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
     // ↔ rexobj_funcs：constructor,2,.s / search,-2,.xsn / match,2,.xs / capture,-2,.xsn /
     //                subexpcount,1,.x / _typeof,1,.x
     method!("constructor", 2, Some(".s"), move |v: &mut VmData| {
+        // ↔ _regexp_constructor：实例已经构造过（self != NULL）时直接报错，
+        // 而不是重新编译——`regexp("a").constructor("s")` 在参考实现里是
+        // "invalid regexp object"，不是语法错误
+        {
+            let self_ = v.stack_get(1);
+            if let Value::Instance(inst) = &self_ {
+                let cur = inst.borrow().get(&rxid_key).unwrap_or(Value::Null);
+                if !cur.is_null() {
+                    v.raise_error_str("invalid regexp object");
+                    return SQ_ERROR;
+                }
+            }
+        }
         let pat = v.stack_get(2);
         match Regex::compile(pat.as_bytes()) {
             Ok(rx) => {

@@ -68,7 +68,14 @@ def main(paths, check_stderr=True):
             print("  output: %r" % norm(out_r)[:200])
         if same and norm(err_r).strip() and name not in EXPECT_UNCAUGHT:
             # 未捕获错误会让脚本**中途停止**，后面的断言根本没跑 —— 这种「两边一样地早停」
-            # 曾经骗过差分测试（新语料 429 行只跑到 25 行仍报 PASS）
+            # 曾经骗过差分测试（新语料 429 行只跑到 25 行仍报 PASS）。
+            # 例外：脚本自己打印了完成标记（生成的矩阵语料都以 `<NAME>-DONE` 结尾），
+            # 说明它跑完了；此时 stderr 只可能是「错误被脚本 catch 住、但错误处理器仍打印」
+            # 的那类情况（两边逐字一致才算通过，前面已经比过 stderr 了）。
+            if b"-DONE" in norm(out_r):
+                npass += 1
+                print("PASS %s（stderr 非空但已跑到 -DONE）" % name)
+                continue
             same = False
             print("SUSPECT %s：脚本以未捕获错误提前结束（后面的用例没跑到）" % name)
             print("  stderr: %r" % norm(err_r)[:200])

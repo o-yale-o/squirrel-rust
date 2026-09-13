@@ -921,6 +921,9 @@ fn file_close(v: &mut VmData) -> SQInteger {
 
 thread_local! {
     static BLOB_CLASS: RefCell<Option<ClassRef>> = const { RefCell::new(None) };
+    /// 三个流类只建一次：bloblib 与 iolib 都要用，
+    /// 重复构造会让 root 里的类与 BLOB_CLASS 指向不同对象（readblob 立刻报错）
+    static STREAM_CLASSES: RefCell<Option<(ClassRef, ClassRef, ClassRef)>> = const { RefCell::new(None) };
 }
 
 /// ↔ sqstd_createblob：构造 blob 实例并压栈
@@ -970,22 +973,35 @@ pub fn push_file_instance(v: &mut VmData, file_cls: &ClassRef, fd: u8) {
 // 注册入口
 // ---------------------------------------------------------------------------
 
-/// ↔ sqstd_register_iolib 的类声明部分（declare_stream）
-/// 返回 (stream_cls, file_cls, blob_cls)
-pub fn declare_stream_classes(vm: &mut VmData) -> (ClassRef, ClassRef, ClassRef) {
+/// ↔ declare_stream / init_streamclass 的类构造部分（**不**注册进 root）
+///
+/// 注册顺序必须与参考实现一致（根表迭代顺序可被 `foreach getroottable()` 观察到）：
+///     bloblib : stream → casti2f/castf2i/swap2/swap4/swapfloat → blob
+///     iolib   : loadfile/dofile/writeclosuretofile → file → stdout → stdin → stderr
+/// 所以这里只负责建类，插入 root 的时机交给各 lib 的注册函数。
+pub fn make_stream_classes(vm: &mut VmData) -> (ClassRef, ClassRef, ClassRef) {
     let ss = vm.ss.clone();
+    // 幂等：第二次调用必须返回同一批类对象（↔ declare_stream 复用 registry 里的 std_stream）
+    let cached = STREAM_CLASSES.with(|c| c.borrow().clone());
+    if let Some(triple) = cached {
+        return triple;
+    }
     let stream_cls = make_stream_class(&ss);
     let file_cls = make_file_class(&ss, &stream_cls);
     let blob_cls = make_blob_class(&ss, &stream_cls);
     BLOB_CLASS.with(|c| *c.borrow_mut() = Some(blob_cls.clone()));
+    STREAM_CLASSES.with(|c| *c.borrow_mut() = Some((stream_cls.clone(), file_cls.clone(), blob_cls.clone())));
+    let _ = vm;
+    (stream_cls, file_cls, blob_cls)
+}
 
+/// 把一个类注册进 root（↔ declare_stream 末尾的 sq_newslot）
+pub fn register_class(vm: &mut VmData, name: &str, cls: &ClassRef) {
+    let ss = vm.ss.clone();
     let root = match &vm.roottable {
         Value::Table(t) => t.clone(),
-        _ => return (stream_cls, file_cls, blob_cls),
+        _ => return,
     };
-    // root: stream / file / blob
-    root.borrow_mut().new_slot(&ss.intern(b"stream"), &Value::Class(stream_cls.clone()));
-    root.borrow_mut().new_slot(&ss.intern(b"file"), &Value::Class(file_cls.clone()));
-    root.borrow_mut().new_slot(&ss.intern(b"blob"), &Value::Class(blob_cls.clone()));
-    (stream_cls, file_cls, blob_cls)
+    root.borrow_mut()
+        .new_slot(&ss.intern(name.as_bytes()), &Value::Class(cls.clone()));
 }

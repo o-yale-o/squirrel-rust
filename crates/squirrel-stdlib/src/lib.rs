@@ -239,6 +239,10 @@ pub fn register_systemlib(vm: &mut VmData) {
         1
     }), 1, None);
 
+    // ↔ systemlib_funcs 的顺序：getenv, system, clock, time, **date**, remove, rename
+    // （根表迭代顺序可被 `foreach getroottable()` 观察到，必须逐位对齐）
+    reg_global(&ss, &root, "date", Rc::new(date_fn), -1, Some(".nn"));
+
     reg_global(&ss, &root, "remove", Rc::new(|v: &mut VmData| {
         let p = v.stack_get(2);
         let r = std::fs::remove_file(String::from_utf8_lossy(p.as_bytes()).as_ref())
@@ -260,8 +264,6 @@ pub fn register_systemlib(vm: &mut VmData) {
         v.push(Value::Integer(r));
         1
     }), 3, Some(".ss"));
-
-    reg_global(&ss, &root, "date", Rc::new(date_fn), -1, Some(".nn"));
 }
 
 /// ↔ sqstd_system_date：返回 {sec,min,hour,day,month,year,wday,yday}
@@ -432,15 +434,17 @@ pub fn register_iolib(vm: &mut VmData) {
     reg_global(&ss, &root, "dofile", Rc::new(io_dofile), -2, Some(".sb"));
     reg_global(&ss, &root, "writeclosuretofile", Rc::new(io_writeclosuretofile), 3, Some(".sc"));
 
-    // ↔ declare_stream：stream 基类 + file/blob 派生类（含全部方法）
-    let (_stream_cls, file_cls, _blob_cls) = crate::stream::declare_stream_classes(vm);
+    // ↔ declare_stream("file", ...)：先注册 iolib 的全局函数，再插入 file 类
+    // （stream/blob 已在 bloblib 里建好并注册，iolib 复用同一个 stream 基类）
+    let (_stream2, file_cls, _blob2) = crate::stream::make_stream_classes(vm);
+    crate::stream::register_class(vm, "file", &file_cls);
 
-    // ↔ sqstd_createfile(stdout/stdin/stderr)
-    for (name, fd) in [("stdout", 1u8), ("stderr", 2u8), ("stdin", 0u8)] {
+    // ↔ sqstd_createfile：顺序是 stdout, stdin, stderr
+    for (name, fd) in [("stdout", 1u8), ("stdin", 0u8), ("stderr", 2u8)] {
         crate::stream::push_file_instance(vm, &file_cls, fd);
         let inst = v_take(vm);
         let key = ss.intern(name.as_bytes());
-        root.borrow_mut().new_slot(&key, &inst);
+            root.borrow_mut().new_slot(&key, &inst);
     }
 }
 
@@ -604,6 +608,11 @@ pub fn register_stringlib(vm: &mut VmData) {
         _ => return,
     };
 
+    // ↔ sqstd_register_stringlib：regexp 类先建，其后才是 format/printf/...
+    let rx_class = crate::regex::make_regexp_class(&ss);
+    root.borrow_mut()
+        .new_slot(&ss.intern(b"regexp"), &rx_class);
+
     reg_global(&ss, &root, "format", Rc::new(string_format), -2, Some(".s"));
     reg_global(&ss, &root, "printf", Rc::new(|v: &mut VmData| {
         // ↔ printf：format 到 scratchpad 后经 printfunc 输出
@@ -620,10 +629,6 @@ pub fn register_stringlib(vm: &mut VmData) {
     reg_global(&ss, &root, "startswith", Rc::new(string_startswith), 3, Some(".ss"));
     reg_global(&ss, &root, "endswith", Rc::new(string_endswith), 3, Some(".ss"));
 
-    // regexp 类
-    let rx_class = crate::regex::make_regexp_class(&ss);
-    let key = ss.intern(b"regexp");
-    root.borrow_mut().new_slot(&key, &rx_class);
 }
 
 /// ↔ sqstd_format：printf 风格（%s %i %d %c %u %o %x %X %f %g %G %e %E）
@@ -1060,16 +1065,20 @@ pub fn register_bloblib(vm: &mut VmData) {
         };
     }
 
+    // ↔ init_streamclass：`stream` 基类先于 blob 的全局函数进 root
+    let (stream_cls, file_cls, blob_cls) = crate::stream::make_stream_classes(vm);
+    crate::stream::register_class(vm, "stream", &stream_cls);
+
+    bfn!("casti2f", "n", |v: &mut VmData| {
+        let i = v.stack_get(2).as_integer();
+        v.push(Value::Float(f32::from_bits(i as u32)));
+        1
+    });
     bfn!("castf2i", "n", |v: &mut VmData| {
         // ↔ *(const SQInteger *)&f：参考实现按位重解释 f32 的 4 字节（高位读的是相邻栈内容，
         // 属 UB）；这里取确定性的低 32 位（即 f32 的位模式）
         let f = v.stack_get(2).as_float();
         v.push(Value::Integer(f.to_bits() as SQInteger));
-        1
-    });
-    bfn!("casti2f", "n", |v: &mut VmData| {
-        let i = v.stack_get(2).as_integer();
-        v.push(Value::Float(f32::from_bits(i as u32)));
         1
     });
     bfn!("swap2", "n", |v: &mut VmData| {
@@ -1088,6 +1097,9 @@ pub fn register_bloblib(vm: &mut VmData) {
         v.push(Value::Float(f32::from_bits(f.to_bits().swap_bytes())));
         1
     });
+
+    // ↔ declare_stream 末尾：类名插到 root（在 globals 之后）
+    crate::stream::register_class(vm, "blob", &blob_cls);
 }
 
 // ===========================================================================
