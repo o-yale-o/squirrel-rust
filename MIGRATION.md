@@ -14,7 +14,7 @@
 | 参考实现自身的 UB / 崩溃（约 20 种形态） | `0xC0000005` / `0xC0000095` / `0xC0000409` / `0xC00000FD` 崩溃，或静默内存损坏 | **可捕获的脚本错误** | 如果你的脚本靠"崩了重启"兜底，改成 `try/catch` |
 | 资源无上限（递归、指令数、内存） | 一直涨到系统杀进程 | 有上限，报可捕获错误；CLI 另有 `--max-ops` / `--mem-limit` | 正常脚本无感；死循环脚本会从"挂死"变成"报错" |
 | 不可复现的取值（裸指针序等） | 同一脚本换次运行就不同 | 确定性值（只保证"同一次运行内一致"） | 不要依赖跨进程稳定的比较结果 |
-| **不可达的 file/blob/stream 何时释放** | 引用计数归零 / 帧弹出 / GC 时释放，于是**别人删得掉**那些文件（`remove()` 成功） | 后端注册表目前**只增不减**：没显式 `close()` 的实例会一直活到进程结束，句柄一直开着 → 同一场景下 `remove()` 会失败 | 脚本里**显式 `close()`**（两边都推荐）；这条已记为后续项（见 `TODO.md` P12-9） |
+| **不可达的 file/blob/stream 何时释放** | 引用计数归零 / 帧弹出 / GC 时释放 | **已对齐**（P14）：后端注册表原来只增不减、导致未显式 `close()` 的实例活到进程结束；现在实例上挂一个 userdata（`__be`），其 release hook 在实例死亡时释放注册表槽位。仍建议脚本显式 `close()` |
 | 平台副作用（CRT 在管道上的 `fseek`） | 会丢弃已缓冲输入 | 确定性行为 | 用管道喂 stdin 的脚本行为会更"正常" |
 
 ## 1. 参考实现会崩溃、我们给可捕获错误
@@ -102,7 +102,7 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `dofile`/`loadfile` 第 2 参 | 是 `printerror` **布尔**，不是脚本实参 |
 | 序列化默认参数 | 往返**会丢**默认值，但**只丢"被直接序列化的那个闭包自己"的**：`writeclosuretofile(P, function(a, b = 100) {...})` 读回后 `g(1)` 里 `b` 是 `null`；而闭包**内部**嵌套函数的默认值（`f(1)` → `b=100`）、它**返回出去**的内部闭包（`inner=77`）、以及 varargs（`vargv.len()`）都完好 |
 | `writeclosuretofile` 的**检查顺序**与残留文件 | 顺序是"掩码 → 开文件 → 序列化"：① 第 3 参过不了 `.sc` 掩码（传整数）→ 参数类型错，**不会建文件**；② 过了掩码**先 `fopen(...,"wb+")`**：路径不可写 → `cannot open the file`（**哪怕第 3 参是 native closure、后面还会类型不符**）；③ 路径可写则文件**立刻建出来**，之后无论序列化失败（自由变量）还是 native closure 不匹配，那个 **0 字节文件都会留在磁盘上**。写脚本时别用 `writeclosuretofile` 的返回值判断"文件有没有生成"，要自己检查 |
-| 文件句柄的**共享模式**（Windows） | 参考实现的 `fopen` 用 `_SH_DENYNO`（`FILE_SHARE_READ/WRITE`，**不含** `FILE_SHARE_DELETE`）：**句柄还开着时 `remove()` 会失败**（`remove() failed`，文件留在磁盘上） | 我们用 Rust 的 `std::fs::File`，默认三种共享齐全 → **开着也能删**。**暂未对齐**：见下面那条"不可达的 file/blob/stream 何时释放" —— 只有先让不可达实例释放句柄，去掉 share-delete 才不会让"建很多实例但从不 GC"的脚本连收尾清理都做不了（`TODO.md` P14 有改造方案） |
+| 文件句柄的**共享模式**（Windows） | 参考实现的 `fopen` 用 `_SH_DENYNO`（`FILE_SHARE_READ/WRITE`，**不含** `FILE_SHARE_DELETE`）：**句柄还开着时 `remove()` 会失败**（`remove() failed`，文件留在磁盘上） | 我们用 Rust 的 `std::fs::File`，默认三种共享齐全 → **开着也能删**。**暂未对齐**（`TODO.md` P14 子问题 2）：去掉 share-delete 会牵出"我们的实例可能在作用域结束前就被释放"，反而偏离参考实现，查清后再打开 |
 | 未捕获错误的退出码 | 是 0（`retval` 不被错误覆盖）；CLI 加载失败才是 −2 |
 | tail call | `return inner()` 会**复用当前帧**，出错时调用栈里看不到这一层 |
 | string 库是**全局函数**，不是字符串方法 | `strip/lstrip/rstrip/split/escape/startswith/endswith/format/printf` 都要写成 `startswith("abc","a")`；`"abc".startswith("a")` 报 `the index 'startswith' does not exist` |

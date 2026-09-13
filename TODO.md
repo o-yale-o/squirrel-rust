@@ -30,35 +30,37 @@
 >
 > **一条命令跑完**：`python tools/check_all.py`（11 项，任一项失败退出码非 0；`--quick` 跳过 cargo test）。
 
-### P14（部分完成）：文件句柄共享模式 + 后端注册表只增不减
+### P14：后端注册表只增不减（**已修**）+ 两个后续子问题
 
-**已修**（`tools/cli_matrix.py` 之外的模糊测试线发现）：参考实现的 `fopen` 用 `_SH_DENYNO`
-（`FILE_SHARE_READ|WRITE`，**不含** `FILE_SHARE_DELETE`）→ 句柄开着时 `remove()` **失败**；
-Rust 的 `std::fs::File` 默认三种共享齐全（开着也能删）→ 我们曾在同一场景删成功。
-已在 `stream.rs` 显式 `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` 对齐，
-探针 a/b/c/d 四种组合全部一致，并进语料（`t_file.nut` 的 `share_remove_*`）。
+**已修（本轮）**：`stream.rs` 的 `BACKENDS`（thread-local `Vec<Option<BackendRef>>`）原来
+**只增不减** —— `register_backend` 只 push，没有任何地方置 `None`，于是**每个创建过的
+file/blob/stream 后端都被永久持有**：没显式 `close()` 的实例活到进程结束、文件句柄一直开着
+（无界增长，属健壮性项）。
 
-**发现但未修（后续项）**：`stream.rs` 的 `BACKENDS`（thread-local
-`Vec<Option<BackendRef>>`）**只增不减** —— `register_backend` 只 push，没有任何地方把槽位置
-`None`。于是**每个创建过的 file/blob/stream 后端都被永久持有**：没显式 `close()` 的实例
-会活到进程结束，文件句柄一直开着 → 与参考实现（引用计数归零/帧弹出/GC 时释放）不同，
-表现为"参考实现 `remove()` 成功、我们失败"（同名 local 重复声明、`m = null` 之后都会这样）。
-这是**无界增长**，属健壮性项。
+修法：实例上挂一个 userdata 成员 `__be`，其 release hook 在**实例死亡时**清掉注册表槽位
+（`bind_backend_inst`；并做**指针身份校验**，避免跨线程 sid 碰撞误清别人的槽）。
+验证：2000 个 blob 的循环里释放钩子触发 **2004 次**（全部释放 ✓）；`t_streammap.nut`
+（上千个 file 实例、从不 GC）在打开 share-delete 限制的前提下依然全绿 —— 说明不是把泄漏藏起来。
 
-**这条还挡住了一个已验证的对齐**：参考实现的 `fopen` 用 `_SH_DENYNO`（不含
-`FILE_SHARE_DELETE`），"句柄开着时 `remove()` 失败"；Rust 的 `std::fs::File` 默认三种共享
-齐全（开着也能删）。本轮试过显式 `share_mode(FILE_SHARE_READ|WRITE)` —— 探针对齐了（a/b/c/d
-四种组合全一致），但**语料立刻红**：`t_streammap.nut` 建了上千个 file 实例从不 GC，
-一旦去掉 share-delete，它收尾的 `remove` 就失败（`remove() failed`）。所以已回退，
-等注册表改造一起做。
+**踩到的坑（值得记）**：`SQInstance::set` 对**类里没声明的键**直接返回 `false`
+（Squirrel 语义），所以 `__be` 必须像 `__sid` 一样先 `new_slot` 声明成类字段；
+不声明时 userdata 只被临时引用持有、立刻析构 → 钩子提前清槽 → 刚建出来的 blob/file
+全变成 `the stream is invalid`。
 
-修法思路（任选）：
-1. **推荐**：注册表存 `Weak`，实例侧再持一个强引用 —— 例如把 `BackendRef` 放进实例的一个
-   userdata 成员（release hook 里 drop 掉，注册表槽位自然变死；现在实例已经有一个
-   `__sid` 可见成员，多一个同类成员不改变"参考实现本来就没有它"这个事实）；
-   这样"不可达即释放"与参考实现一致，share-delete 也可以随后对齐；
-2. GC 时做一次"注册表压实"：遍历存活实例收集 `__sid` 集合，把其它槽位置 `None`
-   （实现小，但"到下次 GC 才释放"仍与参考实现不同，上面那个语料用例依然会红）。
+**子问题 1（已修）**：不可达实例的句柄何时释放 —— 见上，现在与参考实现一致。
+
+**子问题 2（待查）**：文件句柄共享模式仍**未对齐**。参考实现的 `fopen` 用 `_SH_DENYNO`
+（不含 `FILE_SHARE_DELETE`）→ 句柄开着时 `remove()` 失败；Rust 的 `std::fs::File` 默认三种
+共享齐全（开着也能删）。本轮试过显式 `share_mode(FILE_SHARE_READ|WRITE)`：探针 a/b/c/d/e
+四种组合全部对齐 ✓、语料也全绿 ✓，但随后发现**我们的实例可能"在作用域结束前"就被释放**：
+
+    函数里 `local a = file(p,"wb+"); return try_remove(p);`
+      我们 → remove=ok（句柄已关），参考 → remove() failed（句柄还开着）
+    中间加一次 `a.len()` 或 `a.tell()` → 两边一致（都 failed）
+
+也就是说打开 share-delete 限制会让这类脚本**反而**偏离参考实现，所以又回退了。下一步要查：
+为什么"创建后没有别的操作"的实例会被提前释放（GC 标记是遍历实例成员的 ✓、注册表滞留也修了 ✓，
+所以更像编译期/运行期的**槽位生命周期**问题：最后一次使用之后到帧弹出之间，谁把它释放了）。
 
 
 >

@@ -266,28 +266,38 @@ fn file_seek_negative_absolute_offset_fails() {
     let _ = std::fs::remove_file(&dir);
 }
 
-/// 文件句柄开着时 `remove()` 的行为：**暂时不对齐参考实现**（见 TODO.md P14）。
+/// 后端随实例死亡而释放（↔ 参考实现"引用计数归零即释放"）。
 ///
-/// 参考实现的 `fopen` 用 `_SH_DENYNO`（`FILE_SHARE_READ|WRITE`，不含 `FILE_SHARE_DELETE`），
-/// 句柄开着时 `remove()` 会报 `remove() failed`；Rust 的 `std::fs::File` 默认三种共享齐全，
-/// 开着也能删。要忠实对齐得先修后端注册表"只增不减"（未显式 close 的后端活到进程结束）——
-/// 否则语料里"建很多实例但从不 GC"的用例连收尾清理都做不了。
-/// 这个测试固定**当前**行为，等注册表改造完成后应改成断言 `remove()` 失败。
+/// 背景（TODO.md P14）：`BACKENDS` 注册表原来只增不减 —— 每个创建过的 file/blob/stream
+/// 后端都被永久持有，没显式 `close()` 的文件句柄会一直开到进程结束（无界增长）。
+/// 现在实例上挂了一个 userdata 成员 `__be`，它的 release hook 在实例死亡时清掉注册表槽位
+/// （并做指针身份校验，避免跨线程 sid 碰撞误清）。
+/// 这里断言行为：大量 blob 反复创建/丢弃后一切照常（后端真被释放时不会有"the stream is
+/// invalid"；没释放则是无界增长，靠 tools 侧的内存探测另测）。
 #[test]
-fn open_handle_allows_remove_for_now() {
-    let dir = std::env::temp_dir().join("sqrust_share_test.bin");
-    let _ = std::fs::remove_file(&dir);
-    let p = dir.to_string_lossy().replace('\\', "\\\\");
+fn backend_released_when_instance_dies() {
+    let dir = std::env::temp_dir().join("sqrust_be_churn");
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join("churn.bin").to_string_lossy().replace('\\', "\\\\");
     let src = format!(
         r#"
-        function try_remove(p) {{ try {{ remove(p); return "ok"; }} catch (e) {{ return "E:" + e; }} }}
-        local h1 = file("{p}", "wb+");
-        local h2 = file("{p}", "wb+");
-        print("while_open=" + try_remove("{p}") + "\n");
-        h1.close(); h2.close();
+        function churn() {{
+            local n = 0;
+            for (local i = 0; i < 500; i++) {{
+                local b = blob(64);
+                n += b.len();
+                local f = file("{p}", "wb+");
+                n += f.tell();
+                f.close();
+            }}
+            return n;
+        }}
+        print("churn=" + churn() + "\n");
+        print("after=" + blob(8).len() + "\n");
     "#
     );
     let (out, _err) = run_capture(&src);
-    assert_eq!(out, "while_open=ok\n", "见 TODO.md P14：对齐参考实现要等注册表改造");
+    // 500 次 × blob(64).len() = 32000（f.tell() 建完就是 0）
+    assert_eq!(out, "churn=32000\nafter=8\n");
     let _ = std::fs::remove_file(&dir);
 }

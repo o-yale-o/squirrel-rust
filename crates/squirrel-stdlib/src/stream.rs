@@ -289,12 +289,12 @@ impl FileBackend {
             opts.append(true).read(plus).create(true);
         }
         // 注：参考实现的 fopen 用 _SH_DENYNO（FILE_SHARE_READ|WRITE，**不含**
-        // FILE_SHARE_DELETE），所以"句柄还开着时 remove() 会失败"；Rust 的
-        // std::fs::File 默认三种共享齐全，开着也能删。对齐它需要先解决下面这个问题：
-        // 本文件的 BACKENDS 注册表**只增不减**（见 TODO.md P14），未显式 close 的后端
-        // 会一直活到进程结束、句柄一直开着 —— 一旦去掉 share-delete，语料里那些
-        // "建很多 file 实例但从不 GC"的用例连收尾清理都做不了。等注册表改造
-        // （实例持有后端 + 注册表存 Weak）落地后再打开 share_mode。
+        // FILE_SHARE_DELETE）→ 句柄开着时 `remove()` 失败；Rust 的 std::fs::File
+        // 默认三种共享齐全（开着也能删）。**暂不打开** share_mode：虽然 P14 的注册表
+        // 滞留已修（后端随实例死亡释放），但还发现"实例可能在**作用域结束前**就被释放"
+        // （证据：函数里 `local a = file(p,"wb+"); return try_remove(p);` 我们给 ok、
+        // 参考给 failed；中间加一次 `a.len()` 就两边一致）—— 那是下一个要查的点，
+        // 在此之前去掉 share-delete 会让这类脚本行为反而偏离参考实现。
         match opts.open(filename) {
             Ok(f) => Some(FileBackend {
                 handle: Some(Rc::new(RefCell::new(f))),
@@ -482,6 +482,62 @@ fn set_instance_sid(v: &VmData, sid: SQInteger) {
     }
 }
 
+/// 释放注册表的某个槽位（只在确实还是同一个后端时才清，避免跨线程 sid 碰撞误清）。
+fn release_backend_slot(sid: SQInteger, expect: usize) {
+    BACKENDS.with(|reg| {
+        let mut r = reg.borrow_mut();
+        if let Some(slot) = r.get_mut(sid as usize) {
+            let same = slot
+                .as_ref()
+                .map(|b| Rc::as_ptr(b) as *const () as usize == expect)
+                .unwrap_or(false);
+            if same {
+                *slot = None;
+            }
+        }
+    });
+}
+
+/// 把后端绑到实例上：注册表存**强引用**，实例侧再挂一个 userdata 成员 `__be`，
+/// 它的 release hook 在**实例死亡时**清掉注册表槽位 → 强引用释放 → 后端（连同它持有的
+/// 文件句柄）立即析构。
+///
+/// 为什么要这样：注册表原来只 push、从不清理，于是**每个创建过的 file/blob/stream 后端
+/// 都被永久持有**（无界增长；没显式 `close()` 的文件句柄会一直开到进程结束）。参考实现是
+/// 引用计数归零就释放，所以同一段脚本里"别人删得掉的文件"我们必须也删得掉
+/// （见 TODO.md P14）。
+fn bind_backend_inst(
+    v: &mut VmData,
+    inst: &squirrel::object::InstanceRef,
+    backend: BackendRef,
+) -> SQInteger {
+    let sid = register_backend(backend.clone());
+    // 注意：`Rc<RefCell<dyn Trait>>` 的 as_ptr 是胖指针，先转成薄指针再取整数
+    let expect = Rc::as_ptr(&backend) as *const () as usize;
+    let ud = squirrel::userdata::SQUserData::create(&v.ss, 0);
+    {
+        let mut u = ud.borrow_mut();
+        u.hook = Some(Box::new(move |_p, _s| {
+            release_backend_slot(sid, expect);
+            0
+        }));
+    }
+    inst.borrow_mut()
+        .set(&v.ss.intern(b"__be"), &Value::Userdata(ud));
+    inst.borrow_mut()
+        .set(&v.ss.intern(b"__sid"), &Value::Integer(sid));
+    sid
+}
+
+/// 同 `bind_backend_inst`，但作用于栈槽 1 的 `this`（blob/file 构造器与 `_cloned` 用）
+fn bind_backend_this(v: &mut VmData, backend: BackendRef) -> SQInteger {
+    let inst = match v.stack_get(1) {
+        Value::Instance(i) => i,
+        _ => return 0,
+    };
+    bind_backend_inst(v, &inst, backend)
+}
+
 fn stream_err(v: &mut VmData, msg: &str) -> SQInteger {
     v.raise_error_str(msg);
     SQ_ERROR
@@ -535,8 +591,12 @@ fn make_stream_class(ss: &Rc<SharedState>) -> ClassRef {
 /// ↔ _file_methods
 pub fn make_file_class(ss: &Rc<SharedState>, stream_cls: &ClassRef) -> ClassRef {
     let cls = SQClass::create(ss, Some(stream_cls.clone()));
-    // 实例字段 __sid（后端注册表索引）
+    // 实例字段 __sid（后端注册表索引）与 __be（持有后端强引用的 userdata，见 bind_backend_inst）。
+    // 必须**声明成类字段**：SQInstance::set 对未声明的键直接返回 false（Squirrel 语义），
+    // 不声明的话 userdata 只会被临时引用持有、立刻析构 —— 钩子会提前清掉注册表槽位，
+    // 于是刚建出来的 blob/file 都变成 "the stream is invalid"（踩过）。
     cls.borrow_mut().new_slot(ss, &ss.intern(b"__sid"), &Value::Integer(0), false);
+    cls.borrow_mut().new_slot(ss, &ss.intern(b"__be"), &Value::Null, false);
     method(ss, &cls, "constructor", Rc::new(file_constructor), 3, Some("x"));
     method(ss, &cls, "_typeof", Rc::new(|v: &mut VmData| {
         v.push(v.ss.intern(b"file"));
@@ -549,8 +609,9 @@ pub fn make_file_class(ss: &Rc<SharedState>, stream_cls: &ClassRef) -> ClassRef 
 /// ↔ _blob_methods
 pub fn make_blob_class(ss: &Rc<SharedState>, stream_cls: &ClassRef) -> ClassRef {
     let cls = SQClass::create(ss, Some(stream_cls.clone()));
-    // 实例字段 __sid（后端注册表索引）
+    // 实例字段 __sid 与 __be（见 make_file_class 里的说明：必须声明成类字段）
     cls.borrow_mut().new_slot(ss, &ss.intern(b"__sid"), &Value::Integer(0), false);
+    cls.borrow_mut().new_slot(ss, &ss.intern(b"__be"), &Value::Null, false);
     method(ss, &cls, "constructor", Rc::new(blob_constructor), -1, Some("xn"));
     method(ss, &cls, "resize", Rc::new(blob_resize), 2, Some("xn"));
     method(ss, &cls, "swap2", Rc::new(blob_swap2), 1, Some("x"));
@@ -781,8 +842,7 @@ fn blob_constructor(v: &mut VmData) -> SQInteger {
         return stream_err(v, "cannot create blob with negative size");
     }
     let backend: BackendRef = Rc::new(RefCell::new(BlobBackend::new(size)));
-    let sid = register_backend(backend);
-    set_instance_sid(v, sid);
+    bind_backend_this(v, backend);
     0
 }
 
@@ -930,8 +990,7 @@ fn blob_cloned(v: &mut VmData) -> SQInteger {
         nb.write(&content);
         nb.seek(0, SQ_SEEK_SET);
     }
-    let sid = register_backend(backend);
-    set_instance_sid(v, sid);
+    bind_backend_this(v, backend);
     0
 }
 
@@ -956,8 +1015,7 @@ fn file_constructor(v: &mut VmData) -> SQInteger {
         _ => return stream_err(v, "wrong parameter"),
     };
     let backend: BackendRef = Rc::new(RefCell::new(backend));
-    let sid = register_backend(backend);
-    set_instance_sid(v, sid);
+    bind_backend_this(v, backend);
     0
 }
 
@@ -988,11 +1046,10 @@ pub fn push_blob_instance(v: &mut VmData, data: Vec<u8>) -> SQInteger {
         b.write(&data);
         b.seek(0, SQ_SEEK_SET);
     }
-    let sid = register_backend(backend);
     let blob_cls = BLOB_CLASS.with(|c| c.borrow().clone());
     if let Some(cls) = blob_cls {
         let inst = SQClass::create_instance(&cls, &v.ss);
-        inst.borrow_mut().set(&v.ss.intern(b"__sid"), &Value::Integer(sid));
+        bind_backend_inst(v, &inst, backend);
         v.push(Value::Instance(inst));
         1
     } else {
@@ -1017,9 +1074,8 @@ pub fn get_blob_bytes(v: &VmData, o: &Value) -> Option<Vec<u8>> {
 /// ↔ sqstd_createfile：为 stdout/stderr/stdin 创建实例并压栈
 pub fn push_file_instance(v: &mut VmData, file_cls: &ClassRef, fd: u8) {
     let backend: BackendRef = Rc::new(RefCell::new(FileBackend::from_std(fd)));
-    let sid = register_backend(backend);
     let inst = SQClass::create_instance(file_cls, &v.ss);
-    inst.borrow_mut().set(&v.ss.intern(b"__sid"), &Value::Integer(sid));
+    bind_backend_inst(v, &inst, backend);
     v.push(Value::Instance(inst));
 }
 
