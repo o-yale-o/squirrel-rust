@@ -434,7 +434,8 @@ fn base_getstackinfos(v: &mut VmData) -> NativeResult {
 /// ↔ __getcallstackinfos（结果表压栈）
 pub fn get_callstack_infos(v: &mut VmData, level: SQInteger) -> Option<()> {
     let cssize = v.callsstack.len() as SQInteger;
-    if cssize > level {
+    // 负 level 在 C++ 里是越界读（UB）；这里返回 null，不 panic
+    if level >= 0 && cssize > level {
         let ci_idx = (cssize - level - 1) as usize;
         let (fn_name, src, line) = match &v.callsstack[ci_idx].closure {
             Value::Closure(c) => {
@@ -467,10 +468,10 @@ pub fn get_callstack_infos(v: &mut VmData, level: SQInteger) -> Option<()> {
             let lt = SQTable::create(&v.ss, 0);
             tt.new_slot(&k, &Value::Table(lt.clone()));
         }
-        // 局部变量（↔ sq_getlocal 循环）
+        // 局部变量（↔ sq_getlocal 循环，seq 从 0 递增直到返回 NULL）
         let mut seq = 0;
         loop {
-            let name = get_local_at(v, ci_idx, seq);
+            let name = get_local_at(v, level, seq);
             match name {
                 Some(nm) => {
                     // 栈顶已是局部变量值（get_local_at 压栈）
@@ -500,32 +501,56 @@ fn string_or(v: &Value, default: &str) -> String {
     }
 }
 
-/// ↔ sq_getlocal
-pub fn get_local_at(v: &mut VmData, ci_idx: usize, nseq: SQInteger) -> Option<String> {
-    let closure = v.callsstack[ci_idx].closure.clone();
-    if let Value::Closure(c) = &closure {
-        let proto = c.borrow().function.clone();
-        let stackbase = v.callsstack[ci_idx].prevstkbase as SQUnsignedInteger + {
-            // ci 的 stackbase = 当前层的下一层 prevstkbase 链——直接用 ci 的绝对基址
-            0
-        };
-        let _ = stackbase;
-        // 用帧基址：callsstack[ci_idx] 的 stackbase 记录在下一帧的 prevstkbase
-        let base = if ci_idx + 1 < v.callsstack.len() {
-            v.callsstack[ci_idx + 1].prevstkbase as SQUnsignedInteger + compute_frame_base(v, ci_idx + 1)
-        } else {
-            v.stackbase as SQUnsignedInteger - v.last_callinfo().prevstkbase as SQUnsignedInteger
-        };
-        let ip = v.callsstack[ci_idx].ip as SQUnsignedInteger;
-        let name = proto.get_local(v, base, nseq as SQUnsignedInteger, ip);
-        name
-    } else {
-        None
+/// ↔ sq_getlocal：level 0 = 当前（原生）帧，1 = 其调用者……
+/// 顺序为「先 outer 变量，再 localvarinfos（声明序）」；值压栈并返回变量名。
+pub fn get_local_at(v: &mut VmData, level: SQInteger, nseq: SQInteger) -> Option<String> {
+    let cstksize = v.callsstack.len() as SQInteger;
+    let lvl = cstksize - level - 1;
+    if level < 0 || lvl < 0 || lvl >= cstksize {
+        return None;
     }
-}
-
-fn compute_frame_base(_v: &VmData, _idx: usize) -> SQUnsignedInteger {
-    0
+    // ↔ stackbase -= ci._prevstkbase 链（prevstkbase 是相对增量）
+    let mut stackbase = v.stackbase;
+    for i in 0..level {
+        let ci = &v.callsstack[(cstksize - i - 1) as usize];
+        stackbase -= ci.prevstkbase as SQInteger;
+    }
+    let fi = lvl as usize;
+    let c = match &v.callsstack[fi].closure {
+        Value::Closure(c) => c.clone(),
+        _ => return None, // 原生帧没有局部变量信息
+    };
+    let proto = c.borrow().function.clone();
+    // ↔ if(_noutervalues > idx)：outer 变量排在局部变量之前
+    let nouter = proto.outervalues.len() as SQInteger;
+    if nouter > nseq {
+        let outer = match c.borrow().outervalues.get(nseq as usize) {
+            Some(Value::Outer(o)) => o.clone(),
+            _ => return None,
+        };
+        // ↔ *_outer(...)->_valptr：打开的 outer 取栈槽，已关闭的取自身 _value
+        let (open_idx, closed) = {
+            let o = outer.borrow();
+            (o.open_idx, o.value.clone())
+        };
+        let val = match open_idx {
+            Some(i) => v.stack[i].clone(),
+            None => closed,
+        };
+        v.push(val);
+        return match proto.outervalues.get(nseq as usize).map(|ov| &ov.name) {
+            Some(Value::String(s)) => Some(String::from_utf8_lossy(&s.val).into_owned()),
+            _ => None,
+        };
+    }
+    // ↔ (ci._ip - func->_instructions) - 1：取指后 ip 已自增，故减一
+    let nop = (v.callsstack[fi].ip as SQInteger - 1).max(0) as SQUnsignedInteger;
+    proto.get_local(
+        v,
+        stackbase as SQUnsignedInteger,
+        (nseq - nouter) as SQUnsignedInteger,
+        nop,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1834,7 +1859,12 @@ fn thread_call(v: &mut VmData) -> NativeResult {
             let val = v.get_at(i + v.stackbase - 1);
             t.borrow_mut().push(val);
         }
-        let closure = t.borrow().stack_get(1);
+        // ↔ sq_call(thread, nparams,…)：闭包取 GetUp(-(nparams+1))，
+        // 而不是固定槽位（挂起的线程栈顶是 suspend 现场）
+        let closure = {
+            let tv = t.borrow();
+            tv.get_up(-(nparams + 1))
+        };
         let base = t.borrow().top - nparams;
         let mut out = Value::Null;
         let ok = {

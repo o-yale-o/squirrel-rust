@@ -1985,7 +1985,13 @@ fn execute_inner(
             vm.temp_reg = closure.clone();
             let clo = match &vm.temp_reg {
                 Value::Closure(c) => c.clone(),
-                _ => unreachable!("execute on non-closure"),
+                // ↔ SQVM::Call 的 default 分支：非闭包入口（宿主 API / thread.call）
+                // 必须报 "attempt to call '<type>'"，而不是 panic
+                other => {
+                    let t = crate::object::get_type_name(other).unwrap_or("?");
+                    vm.raise_error_str(format!("attempt to call '{}'", t));
+                    return Err(vm.lasterror.clone());
+                }
             };
             let target = vm.top - nargs;
             let prevci_len = vm.callsstack.len();
