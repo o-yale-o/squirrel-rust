@@ -3,6 +3,19 @@
 
 用法：python tools/bisect_stderr.py tests-corpus/t_errmsg2.nut
 """
+
+try:  # 关掉系统错误对话框：参考实现在 UB 形态上会真崩溃并弹模态框
+    import os as _os, sys as _sys
+    _d = _os.path.dirname(_os.path.abspath(__file__))
+    for _p in (_d, _os.path.join(_d, "..", "tools"), _os.path.join(_d, "tools")):
+        if _os.path.isdir(_p):
+            _sys.path.insert(0, _p)
+    from safe_run import suppress_crash_dialogs as _scd
+    _scd()
+    del _d, _p, _os, _sys, _scd
+except Exception as _e:  # pragma: no cover
+    import sys as _sys2
+    print("warning: 无法关闭崩溃对话框: %r" % (_e,), file=_sys2.stderr)
 import os
 import subprocess
 import sys

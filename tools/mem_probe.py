@@ -13,6 +13,9 @@ import threading
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safe_run import suppress_crash_dialogs  # noqa: E402
+
 ROOT = r"D:\OpenSource\squirrel-rust"
 REF = os.path.join(ROOT, "build-ref", "bin", "Release", "sq_static.exe")
 RUST = os.path.join(ROOT, "target", "release", "sq.exe")
@@ -57,7 +60,11 @@ def run_with_cap(exe, args, limit_mb, timeout):
     注意：**必须并发把管道读干**。早先这里只在进程结束后才 `communicate()`，
     子进程输出超过管道缓冲（几十 KB）就会阻塞在 write 上——看起来像"脚本死循环"，
     实际是探针自己造成的死锁（t_oopmatrix 整跑就这样被误判过）。
+
+    另外：参考实现在 UB 形态上会**真的崩溃**，跑之前必须关掉系统错误对话框
+    （`SEM_NOGPFAULTERRORBOX`），否则会弹出模态框把整批对拍挂住。
     """
+    suppress_crash_dialogs()
     p = subprocess.Popen([exe] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          stdin=subprocess.DEVNULL)
     bufs = {p.stdout: [], p.stderr: []}

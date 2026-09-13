@@ -476,26 +476,13 @@ impl VmData {
                 BW_OR => i1 | i2,
                 BW_XOR => i1 ^ i2,
                 BW_SHIFTL => {
-                    if i2 < 0 || i2 >= 64 {
-                        0
-                    } else {
-                        i1 << i2
-                    }
+                    // ↔ C++ 的 `<<`：x86 的硬件移位把计数**掩到 6 位**
+                    // （`1 << 2147483647` == `1 << 63` == INT64_MIN，实测参考实现如此）。
+                    // Rust 的 wrapping_shl 语义相同：只用计数低 6 位，负数按补码取低位。
+                    i1.wrapping_shl(i2 as u32)
                 }
-                BW_SHIFTR => {
-                    if i2 < 0 || i2 >= 64 {
-                        0
-                    } else {
-                        i1 >> i2
-                    }
-                }
-                BW_USHIFTR => {
-                    if i2 < 0 || i2 >= 64 {
-                        0
-                    } else {
-                        ((i1 as SQUnsignedInteger) >> i2) as SQInteger
-                    }
-                }
+                BW_SHIFTR => i1.wrapping_shr(i2 as u32),
+                BW_USHIFTR => ((i1 as SQUnsignedInteger).wrapping_shr(i2 as u32)) as SQInteger,
                 _ => {
                     self.raise_error_str("internal vm error bitwise op failed");
                     throw!(self)
