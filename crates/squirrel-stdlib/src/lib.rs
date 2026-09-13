@@ -50,9 +50,15 @@ pub fn register_mathlib(vm: &mut VmData) {
         _ => return,
     };
 
+    // ↔ _DECL_FUNC(name,nparams,tycheck)：掩码首位 '.' 是 `this` 占位，nparamscheck 含 `this`
     macro_rules! m1 {
         ($name:expr, $tm:expr, $f:expr) => {
-            reg_global(&ss, &root, $name, Rc::new($f), 2, Some($tm));
+            reg_global(&ss, &root, $name, Rc::new($f), 2, Some(concat!(".", $tm)));
+        };
+    }
+    macro_rules! m2 {
+        ($name:expr, $tm:expr, $f:expr) => {
+            reg_global(&ss, &root, $name, Rc::new($f), 3, Some(concat!(".", $tm)));
         };
     }
 
@@ -101,13 +107,13 @@ pub fn register_mathlib(vm: &mut VmData) {
         v.push(Value::Float(x.atan()));
         1
     });
-    m1!("atan2", "nn", |v: &mut VmData| {
+    m2!("atan2", "nn", |v: &mut VmData| {
         let y = v.stack_get(2).as_float();
         let x = v.stack_get(3).as_float();
         v.push(Value::Float(y.atan2(x)));
         1
     });
-    m1!("pow", "nn", |v: &mut VmData| {
+    m2!("pow", "nn", |v: &mut VmData| {
         let y = v.stack_get(2).as_float();
         let x = v.stack_get(3).as_float();
         v.push(Value::Float(y.powf(x)));
@@ -134,24 +140,21 @@ pub fn register_mathlib(vm: &mut VmData) {
         SQ_RNG.with(|r| r.borrow_mut().srand(seed));
         0
     });
-    m1!("rand", "n", |v: &mut VmData| {
+    // ↔ _DECL_FUNC(rand,1,NULL)：无掩码，nparamscheck=1（只有 this）
+    reg_global(&ss, &root, "rand", Rc::new(|v: &mut VmData| {
         let r = SQ_RNG.with(|r| r.borrow_mut().rand());
         v.push(Value::Integer(r));
         1
-    });
+    }), 1, None);
     m1!("fabs", "n", |v: &mut VmData| {
         let x = v.stack_get(2).as_float();
         v.push(Value::Float(x.abs()));
         1
     });
     m1!("abs", "n", |v: &mut VmData| {
-        let o = v.stack_get(2);
-        if matches!(o, Value::Integer(_)) {
-            let i = o.as_integer();
-            v.push(Value::Integer(if i < 0 { i.wrapping_neg() } else { i }));
-        } else {
-            v.push(Value::Float(o.as_float().abs()));
-        }
+        // ↔ math_abs：sq_getinteger 先把数值取整，再 abs((int)n)（MSVC 32 位截断/回绕语义）
+        let n = v.stack_get(2).as_integer();
+        v.push(Value::Integer((n as i32).wrapping_abs() as SQInteger));
         1
     });
 
@@ -340,7 +343,7 @@ pub fn register_iolib(vm: &mut VmData) {
 
     reg_global(&ss, &root, "loadfile", Rc::new(io_loadfile), -2, Some(".sb"));
     reg_global(&ss, &root, "dofile", Rc::new(io_dofile), -2, Some(".sb"));
-    reg_global(&ss, &root, "writeclosuretofile", Rc::new(io_writeclosuretofile), 3, Some("cs"));
+    reg_global(&ss, &root, "writeclosuretofile", Rc::new(io_writeclosuretofile), 3, Some(".sc"));
 
     // ↔ declare_stream：stream 基类 + file/blob 派生类（含全部方法）
     let (_stream_cls, file_cls, _blob_cls) = crate::stream::declare_stream_classes(vm);
@@ -429,17 +432,18 @@ fn io_dofile(v: &mut VmData) -> SQInteger {
 }
 
 fn io_writeclosuretofile(v: &mut VmData) -> SQInteger {
-    // ↔ sqstd_writeclosuretofile：栈 [closure, filename]
-    let clo = v.get_up(-2);
-    let fname = v.get_up(-1);
+    // ↔ _g_io_writeclosuretofile：栈 [this, filename, closure]
+    let fname = v.get_up(-2);
+    let clo = v.get_up(-1);
     let filename = String::from_utf8_lossy(fname.as_bytes()).into_owned();
     if let Value::Closure(c) = &clo {
         match squirrel::serialization::write_closure(v, c) {
             Ok(bytes) => {
                 if std::fs::write(&filename, bytes).is_err() {
-                    return throw_error(v, "cannot write closure file");
+                    return throw_error(v, "cannot open the file");
                 }
-                v.push(Value::Integer(0));
+                // C++ 返回 1 且栈顶仍是闭包：返回值就是被写出的闭包本身
+                v.push(clo);
                 1
             }
             Err(_) => SQ_ERROR,
