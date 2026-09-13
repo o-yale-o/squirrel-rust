@@ -4,7 +4,7 @@
 //! RefTable、GC。C++ 的 GC 用侵入式双链 + MARK_FLAG 复用引用计数；
 //! Rust 改为「Weak 注册表 + 从根 BFS 标记」，语义等价（详见 collect_garbage）。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
@@ -59,15 +59,40 @@ pub type PrintFn = Rc<dyn Fn(&VmData, &[u8])>;
 pub type DebugHookFn = Rc<dyn Fn(&VmData, SQInteger, &str, SQInteger, &str)>;
 
 /// ↔ SQStringTable：字符串实习表（C++ 的桶数组不可观测，用 HashMap + Weak）
+///
+/// **已死条目的键必须清掉**：C++ 侧 `SQString` 引用计数归零时会被
+/// `SQStringTable::Remove` 摘除；本实现的值是 `Weak`（字符串对象本身由 `Rc`
+/// 即时释放 ✓），但 HashMap 的**键**（字符串字节）会一直留着——实测
+/// `local s = ""; for (i<20000) s += "x";` 峰值 232MB（正好是所有中间串长度之和），
+/// 而参考实现只要 3MB。所以按"插入字节数"计数，超过预算就清一遍死条目。
 pub struct StringTable {
     map: RefCell<HashMap<Box<[u8]>, Weak<crate::object::SQString>>>,
+    /// 上次清扫以来插入的键字节数
+    dirty: Cell<usize>,
+    /// 上次清扫以来插入的条目数（短串多的时候按字节算永远到不了预算）
+    dirty_count: Cell<usize>,
 }
+
+/// 字符串表清扫预算（插入这么多字节 **或** 这么多条目就清一次死条目）
+const STRINGTABLE_SWEEP_BYTES: usize = 4 << 20;
+const STRINGTABLE_SWEEP_ENTRIES: usize = 4096;
 
 impl StringTable {
     pub fn new() -> Self {
         StringTable {
             map: RefCell::new(HashMap::new()),
+            dirty: Cell::new(0),
+            dirty_count: Cell::new(0),
         }
+    }
+
+    /// 实习表当前条目数（含弱引用已死的条目，供测试断言内存有界）
+    pub fn len(&self) -> usize {
+        self.map.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// ↔ SQStringTable::Add
@@ -84,6 +109,16 @@ impl StringTable {
             weakref_slot: std::cell::RefCell::new(None),
         });
         map.insert(s.into(), Rc::downgrade(&rc));
+        let d = self.dirty.get() + s.len() + 32;
+        let c = self.dirty_count.get() + 1;
+        if d >= STRINGTABLE_SWEEP_BYTES || c >= STRINGTABLE_SWEEP_ENTRIES {
+            map.retain(|_, w| w.strong_count() > 0);
+            self.dirty.set(0);
+            self.dirty_count.set(0);
+        } else {
+            self.dirty.set(d);
+            self.dirty_count.set(c);
+        }
         rc
     }
 }
@@ -178,6 +213,8 @@ pub struct SharedState {
     pub consts: RefCell<Value>,     // Table
     pub constructoridx: RefCell<Value>, // String "constructor"
     pub gc_chain: RefCell<Vec<GcEntry>>,
+    /// 注册表长度到达该值就清一遍"弱引用已死"的条目（见 `gc_add`）
+    pub gc_prune_at: std::cell::Cell<usize>,
     /// ↔ _root_vm：根 VM 的 weakref（sq_open 时设置）
     pub root_vm: RefCell<Value>,
     pub table_default_delegate: RefCell<Value>,
@@ -213,6 +250,7 @@ impl SharedState {
             consts: RefCell::new(Value::Null),
             constructoridx: RefCell::new(Value::Null),
             gc_chain: RefCell::new(Vec::new()),
+        gc_prune_at: std::cell::Cell::new(65536),
             root_vm: RefCell::new(Value::Null),
             table_default_delegate: RefCell::new(Value::Null),
             array_default_delegate: RefCell::new(Value::Null),
@@ -275,7 +313,18 @@ impl SharedState {
     }
 
     pub(crate) fn gc_add(&self, e: GcEntry) {
-        self.gc_chain.borrow_mut().push(e);
+        let mut chain = self.gc_chain.borrow_mut();
+        chain.push(e);
+        // 对象被 `Rc` 即时释放后，注册表里会留一个 `Weak` 已死的条目。
+        // 参考实现不需要这种表（它用引用计数 + 周期回收），本实现的表若不清，
+        // 纯 churn 脚本（`for(i<2e5) local t = {}`）会攒下几十 MB 条目。
+        // 清理只丢"弱引用已失效"的条目——那正是对象已经析构的情况，
+        // 与 GC 的 `None => 已析构` 分支同义，不改变任何可观察语义。
+        if chain.len() >= self.gc_prune_at.get() {
+            chain.retain(|x| x.value().is_some());
+            let live = chain.len();
+            self.gc_prune_at.set(std::cmp::max(65536, live.saturating_mul(2)));
+        }
     }
 
     /// ↔ SQSharedState::GetMetaMethodIdxByName

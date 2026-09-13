@@ -473,6 +473,80 @@ open outer 存成「宿主 VM + 槽位索引」，跨线程时去 `borrow()` 对
 线程里创建生成器再回主线程 resume）。期望值全部先用**参考实现**实测确认
 （`python tmp-c2/check_thread_tests.py` 把测试里的脚本抽出来两侧对跑）。
 
+## 三·补8、第八轮：正则引擎逐行移植 + 两处回收缺口（2GB → 18MB）
+
+### 语料
+
+`tools/gen_rxmatrix.py` → `tests-corpus/t_rxmatrix.nut`：**500 条**自动用例
+（33 种模式 × 13 种主语的 search/capture/subexpcount/match 四件套、17 条非法模式的
+错误文本、22 条 API 边界、12 条 start 偏移、19 条引擎细节）。另加
+`tests-corpus/t_churn.nut`（对象/字符串 churn 语义）。
+
+### 1. 旧引擎不是参考实现：9 处真实差异
+
+原来那版正则引擎是"按正则的常识"写的，跟 `sqstdrex.cpp` 差得很远。矩阵第一轮就抓出 9 条：
+
+| 形态 | 参考实现 | 旧实现 |
+|---|---|---|
+| `regexp("<.*>").search("<a><b>")` | `{0,3}`（贪婪量词**停在第一个能继续的位置**） | `{0,6}` |
+| `\bfoo\b` 搜 `"a foo b"` | **不匹配**（`\b` 是「空格↔非空格转移」，不是词边界） | `{2,5}` |
+| `^b` 带 `start=1` 搜 `"ab"` | `{1,2}`（`^` 锚定的是 **start 偏移**） | 不匹配 |
+| `""` 上 `search(".*")` | 不匹配（`searchrange` 开头就有空串早退） | `{0,0}` |
+| `[z-a]` / `[\d-z]` / `[a-` | `invalid range` | 编译通过 / 别的错误 |
+| `a{1000000000}` | `overflow in numeric constant` | 编译通过 |
+| `(a)+` 对 `"aaa"` 的 capture | `[{0,3},{0,1}]`（记**第一次**迭代） | `[{0,3},{2,3}]` |
+| `[\xe9]` | `letter expected`（`scisprint` 拦下高位字节） | 编译通过 |
+
+结论：不再"修差异"，而是把引擎**按 `sqstdrex.cpp` 逐行重写**（节点数组 + 回溯匹配，
+`OP_GREEDY` / `OP_OR` / `OP_EXPR` / `OP_WB` / `OP_CLASS` / `OP_MB` 一一对应），
+连原版的死代码与怪癖一起搬（例如 `[a-]` 那句 `unfinished range` 写在恒假的
+`*_p++ == ']'` 上；`search` 失败后 `node` 不回退到起始节点）。改完 500/500 一致。
+
+### 2. 空主语、量词链、深嵌套：三个"参考实现会挂"的点
+
+* `(a*)*` 这类**空匹配量词**：原版 `OP_GREEDY` 在 `s` 不前进时靠 `s >= _eol` 才跳出，
+  有死循环风险 → 本实现加**步数上限**（`MAX_RE_STEPS`，超限按不匹配处理）。
+* 5000 字面量字符的模式：原版是尾递归 `element()`，本实现照抄会吃 5000 层栈
+  → 改成**循环**串 `next`，递归深度只与真正的嵌套相关。
+* 深嵌套括号：实测参考实现 4000 层能编、8000 层爆栈（`0xC00000FD`）；
+  而本实现在 **4000 层就爆栈**（Rust 主线程栈 1MB，比 C++ 的 8MB 小）
+  → 编译/匹配都加了深度上限，超过给**可捕获**错误 `regexp too deeply nested`。
+
+### 3. 内存：字符串实习表的键是永久垃圾（实测 2GB）
+
+churn 对拍（20 万次迭代，`tools/mem_probe.py` 量峰值）：
+
+| 形态 | 修复前 | 修复后 | 参考实现 |
+|---|---|---|---|
+| `s += "x"` ×20 万（`str`） | **2000MB（撞 2GB 上限被杀）** | **18.0MB** | 5.2MB |
+| `"v" + i` ×20 万（`str2`） | 54.3MB | 17.7MB | 4.6MB |
+| `local t = {}` ×20 万（`table`） | 28.7MB | 12.9MB | 4.5MB |
+| `local a = [i]` ×20 万（`array`） | 17.1MB | 8.2MB | 4.6MB |
+| `local f = function(){}` ×20 万（`closure`） | 24.7MB | 7.9MB | 4.6MB |
+
+根因两条，**都与可观察语义无关**（只是回收时机）：
+
+1. **字符串实习表把已死字符串的键留着**：C++ 的 `SQString` 引用计数归零时会
+   `SQStringTable::Remove`，而本实现的值虽然是 `Weak`（字符串对象本身由 `Rc` 即时释放），
+   HashMap 的**键**（字符串字节）却一直留着——`s += "x"` 两万次正好留下所有中间串
+   （长度之和 ≈ 232MB，与实测峰值一模一样）。现在按"插入字节数 4MB **或** 插入条目数 4096"
+   清一遍弱引用已死的条目。
+2. **GC 注册表累积已死条目**：`gc_chain` 存的是 `Weak`，对象被 `Rc` 释放后条目还在，
+   纯 churn 脚本会攒下几十 MB。现在表长到阈值就 `retain` 掉弱引用失效的条目
+   （那正是"对象已析构"，与 GC 的 `None => 已析构` 分支同义）。
+
+参考实现是靠引用计数**即时**回收的，本实现是 `Rc` + 显式 GC，所以这两处"清理死条目"
+只是把时机补回来，不改变任何脚本可见结果。
+
+### 4. 固化
+
+* `crates/squirrel-stdlib/tests/regex_semantics.rs`：4 个 Rust 测试（引擎怪癖、
+  编译错误文本、search 偏移/捕获形状、**churn 后实习表与注册表条目数有界**）。
+* `tools/gen_rxmatrix.py` 与 `tests-corpus/t_rxmatrix.nut`、
+  `tests-corpus/t_churn.nut` 进语料，`tools/diff_test.py tests-corpus` 覆盖。
+* 探针：`tmp-c2/rxpath.nut`（病理形态 16 条，两侧一致）、`tmp-c2/churn.nut`（内存对拍）、
+  `tmp-c2/rx_depth.py`（嵌套深度上限实测）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
@@ -489,6 +563,10 @@ open outer 存成「宿主 VM + 槽位索引」，跨线程时去 `borrow()` 对
 | `date` 上界 | UCRT 的上界常量未逐秒定位：实测 32536800000（3001-01-19）可用、32536857599 失败。本实现取前者为上界 |
 | `getstackinfos(-1)` | 参考实现 `_callsstack[cssize]` 越界读（UB，实测返回一个表）；本实现返回 `null`，不 panic |
 | 挂起线程上再 `call()` | 参考实现的 `suspend` 不关帧，`sq_call` 取 `GetUp(-(nparams+1))` 拿到的正是**挂起值**（实测无论传几个实参都是 `attempt to call 'string'`）；本实现关帧后取到的是环境表，文本为 `attempt to call 'table'`。两者都是可捕获错误，只有类型名不同；`wakeup`/`getstatus`/`getstackinfos` 等合法操作两侧完全一致（`tmp-c2/layout.nut`） |
+| 正则引擎的怪癖 | `sqstdrex.cpp` 的行为与"正则常识"差很远，已**逐行移植**（见三·补8）：`.*` 停在第一个能继续的位置、`\b` 是空格转移、`^` 锚定 search 的 start、空主语不匹配、`?` 紧跟量词时是字面量、`[a-]` 不报 `unfinished range`（那句检查恒假）、失败后不回退起始节点。这些都不是 UB，所以照搬 |
+| 正则引擎的怪癖 | `sqstdrex.cpp` 的行为与"正则常识"差很远，已**逐行移植**（见三·补8）：`.*` 停在第一个能继续的位置、`\b` 是空格转移、`^` 锚定 search 的 start、空主语不匹配、`?` 紧跟量词时是字面量、`[a-]` 不报 `unfinished range`（那句检查恒假）、失败后不回退起始节点。这些都不是 UB，所以照搬 |
+| 正则的递归/步数上限 | 参考实现没有上限：空匹配量词（`(a*)*`）有死循环风险，4000 层嵌套括号能吃满 8MB 栈（8000 层实测 `0xC00000FD`）。本实现给 `MAX_RE_STEPS` / `MAX_RE_DEPTH`，超限按不匹配或可捕获错误处理（Rust 主线程栈 1MB，照抄会在 4000 层就爆栈） |
+| 字符串/对象的回收时机 | 参考实现用引用计数**即时**回收；本实现是 `Rc` + 显式 GC，靠"清死条目"把内存拉回同一量级（20 万次拼接 2000MB → 18MB，参考 5.2MB）。`collectgarbage()` 的返回计数因此不同（本实现已经自动清过一部分） |
 | REPL 读到 EOF | 参考实现在 EOF 后死循环（`getchar()` 返回 −1 被当作字符累积）；本实现直接退出 |
 | UCS2 非 ASCII 内容 | 参考实现在非 UNICODE 构建下把码元交给 `isalnum` 等（越界 UB）；本实现按码元喂词法器，ASCII 等价 |
 | 空正则模式 `regexp("")` | 参考实现写 NULL 崩溃（弹模态崩溃框）；本实现报 `letter expected`，不复刻该 UB |
@@ -512,6 +590,11 @@ open outer 存成「宿主 VM + 槽位索引」，跨线程时去 `borrow()` 对
 | `tools/probes/nan_probe.nut` | `fmod`/除法/unary minus 的 NaN 符号矩阵（±0/±1/2.5/±inf/nan 全组合） |
 | `tools/probes/fmt_flags.nut` / `fmt_hash.nut` / `fmt_types.nut` | printf 标志、`#` 与 inf/nan、类型接受的实测记录 |
 | `tools/probes/closure_outer.nut` | 闭包/outer 值夹具源码（编译成 `crates/squirrel-stdlib/tests/fixtures/*.cnut`） |
+| `tools/gen_genmatrix.py` / `tools/gen_rxmatrix.py` | 生成 `tests-corpus/t_genmatrix.nut`（生成器/线程 130 条）与 `t_rxmatrix.nut`（正则 500 条） |
+| `tmp-c2/show.py` | 按前缀对比两侧输出（`python tmp-c2/show.py <file.nut> [前缀…]`） |
+| `tmp-c2/rxpath.nut` / `tmp-c2/rx_depth.py` | 正则病理形态（空匹配量词、深嵌套、长模式）与嵌套深度上限实测 |
+| `tmp-c2/churn.nut` / `tmp-c2/mem_cases.py` | 对象/字符串 churn 的内存对拍（`python -c` 调 `tools/mem_probe.py` 见三·补8） |
+| `tmp-c2/check_rs_scripts.py` | 把 Rust 测试里的脚本抽出来两侧对跑（期望值先经参考实现确认） |
 | `tmp-c2/*.nut` | 一次性探针（BOM/UCS2、date 边界、escape 高位），已被 .gitignore 忽略 |
 
 对拍方式（stderr 也要比，否则错误路径差异不可见）：

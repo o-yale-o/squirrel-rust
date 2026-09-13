@@ -1,8 +1,23 @@
 //! ↔ sqstdlib/sqstdrex.cpp —— regexp 类。
 //!
-//! 原版是自包含回溯正则引擎；此处用等价的 Rust 回溯实现，
-//! 支持相同语法：字面量、`.`、`[...]`（含范围/取反）、`\d \D \w \W \s \S`、
-//! 量词 `* + ?`、分组 `()`（捕获）、 alternation `|`、锚 `^ $`。
+//! 引擎部分是对 `sqstdrex.cpp` 的**逐行移植**（节点数组 + 回溯匹配），
+//! 包括原引擎那些"不像正则"的怪癖，因为脚本能观察到它们：
+//!
+//! * **贪婪量词其实是"停在第一个能继续的位置"**：`OP_GREEDY` 每吃掉一个字符就试一次
+//!   后续节点，一旦后续能匹配就立刻返回，所以 `regexp("<.*>").search("<a><b>")`
+//!   给出 `{0,3}`（"<a>"）而不是 `{0,6}`；
+//! * `\b` 不是词边界，而是 **空格与非空格之间的转移**（且只看 `*str` 与 `*(str+1)`）；
+//! * `search` 每次尝试失败后**不回退到起始节点**（`node` 变量在 do-while 外），
+//!   所以"部分匹配后失败"会让起点扫描从中间节点继续；
+//! * `^` 锚定的是**本次 search 的 start 偏移**（`_bol = text_begin`），不是字符串开头；
+//! * 空主语直接返回不匹配（`if(text_begin >= text_end) return SQFalse`）；
+//! * `?` 紧跟量词时是**字面量** `?`（引擎没有惰性量词语法）；
+//! * `[a-]` 之类不会报 `unfinished range`（那句检查写在 `*_p++ == ']'` 上，恒假）。
+//!
+//! 与参考实现的差异只有**安全阀**（参考实现在这些点上会死循环/爆栈，不是可观察语义）：
+//! 匹配步数与递归深度上限（见 `MAX_RE_STEPS` / `MAX_RE_DEPTH`）、
+//! `start > len` 时返回不匹配（参考实现是指针越界）、高位字节的 ctype 判定按 ASCII 处理
+//! （C 的 `isalpha((char)0xE9)` 是负值下标，属 UB）。
 
 use std::rc::Rc;
 
@@ -10,624 +25,905 @@ use squirrel::config::*;
 use squirrel::object::Value;
 use squirrel::vm::VmData;
 
-#[derive(Clone, Debug)]
-enum Node {
-    Char(u8),
-    Any,
-    Class { neg: bool, ranges: Vec<(u8, u8)>, classes: Vec<u8> }, // classes: b'd' b'w' b's' 等
-    Start,
-    End,
-    Group(Box<Node>, usize), // 捕获组（解析期预分配编号）
-    NonCap(Box<Node>),      // (?:...)
-    Concat(Vec<Node>),
-    Alt(Vec<Node>),
-    /// ↔ OP_GREEDY：right = (p0<<16)|p1，p1 = 0xFFFF 表示无上限；引擎无惰性量词
-    Greedy(Box<Node>, u16, u16),
-    /// ↔ OP_MB：\m(cb)(ce) 嵌套平衡匹配
-    MBalanced(u8, u8),
-    /// ↔ OP_WB：\b / \B 词边界
-    WordBoundary(bool),
+// ---------------------------------------------------------------- 常量
+// ↔ sqconfig.h（非 UNICODE 构建）：MAX_CHAR = 0xFF，scisprint = isprint
+const MAX_CHAR: i32 = 0xFF;
+const OP_GREEDY: i32 = MAX_CHAR + 1;
+const OP_OR: i32 = MAX_CHAR + 2;
+const OP_EXPR: i32 = MAX_CHAR + 3;
+const OP_NOCAPEXPR: i32 = MAX_CHAR + 4;
+const OP_DOT: i32 = MAX_CHAR + 5;
+const OP_CLASS: i32 = MAX_CHAR + 6;
+const OP_CCLASS: i32 = MAX_CHAR + 7;
+const OP_NCLASS: i32 = MAX_CHAR + 8;
+const OP_RANGE: i32 = MAX_CHAR + 9;
+const OP_EOL: i32 = MAX_CHAR + 11;
+const OP_BOL: i32 = MAX_CHAR + 12;
+const OP_WB: i32 = MAX_CHAR + 13;
+const OP_MB: i32 = MAX_CHAR + 14;
+
+const SYM_ANY: u8 = b'.';
+const SYM_PLUS: u8 = b'+';
+const SYM_STAR: u8 = b'*';
+const SYM_QUEST: u8 = b'?';
+const SYM_BRANCH: u8 = b'|';
+const SYM_EOS: u8 = b'$';
+const SYM_BOS: u8 = b'^';
+const SYM_ESC: u8 = b'\\';
+
+/// 编译期/匹配期递归上限（参考实现没有上限，畸形模式会爆栈）
+const MAX_RE_DEPTH: u32 = 4000;
+/// 匹配步数上限：参考实现在 `(a*)*` 这类空匹配量词上会**死循环**
+const MAX_RE_STEPS: u64 = 4_000_000;
+
+// ---------------------------------------------------------------- ctype（C locale）
+fn scisprint(c: u8) -> bool {
+    (0x20..0x7F).contains(&c)
+}
+
+fn scisspace(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
+fn scisdigit(c: u8) -> bool {
+    c.is_ascii_digit()
+}
+
+fn scisalpha(c: u8) -> bool {
+    c.is_ascii_alphabetic()
+}
+
+fn scisalnum(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+fn scisxdigit(c: u8) -> bool {
+    c.is_ascii_hexdigit()
+}
+
+fn sciscntrl(c: u8) -> bool {
+    c < 0x20 || c == 0x7F
+}
+
+fn scispunct(c: u8) -> bool {
+    scisprint(c) && !c.is_ascii_alphanumeric() && !scisspace(c)
+}
+
+// ---------------------------------------------------------------- 节点
+#[derive(Clone, Copy, Default)]
+struct Node {
+    ty: i32,
+    left: i32,
+    right: i32,
+    next: i32,
 }
 
 pub struct Regex {
-    root: Node,
-    /// 捕获组数量（不含整体匹配）
-    ngroups: usize,
+    nodes: Vec<Node>,
+    first: i32,
+    /// ↔ `_nsubexpr`（含整体匹配的 0 号组）
+    nsubexpr: usize,
 }
 
-struct Parser<'a> {
-    pat: &'a [u8],
-    pos: usize,
-    ngroups: usize,
-    err: Option<String>,
+// ---------------------------------------------------------------- 编译（↔ sqstdrex_compile）
+struct Comp {
+    p: Vec<u8>,
+    i: usize,
+    nodes: Vec<Node>,
+    nsubexpr: i32,
+    depth: u32,
 }
 
-impl<'a> Parser<'a> {
-    /// ↔ sqstd_rex_list：可选的起始 `^`，一个 element，其后若为 `|` 则右递归成 OR
-    fn parse_alt(&mut self) -> Node {
-        let bol = if self.pos < self.pat.len() && self.pat[self.pos] == b'^' {
-            self.pos += 1;
-            Some(Node::Start)
+impl Comp {
+    /// 模式字节（末尾隐含 NUL：越界读返回 0，↔ C 字符串终止符）
+    fn cur(&self) -> u8 {
+        if self.i < self.p.len() {
+            self.p[self.i]
         } else {
-            None
-        };
-        let e = self.parse_element();
-        let mut ret = match bol {
-            Some(b) => Node::Concat(vec![b, e]),
-            None => e,
-        };
-        if self.err.is_none() && self.pos < self.pat.len() && self.pat[self.pos] == b'|' {
-            self.pos += 1;
-            let right = self.parse_alt();
-            ret = Node::Alt(vec![ret, right]);
-        }
-        ret
-    }
-
-    fn fail(&mut self, msg: &str) {
-        if self.err.is_none() {
-            self.err = Some(msg.to_string());
+            0
         }
     }
 
-    /// ↔ sqstd_rex_expect
-    fn expect(&mut self, c: u8) {
-        if self.pos >= self.pat.len() || self.pat[self.pos] != c {
-            self.fail("expected paren");
-            return;
+    fn newnode(&mut self, ty: i32) -> i32 {
+        let mut n = Node { ty, left: -1, right: -1, next: -1 };
+        if ty == OP_EXPR {
+            n.right = self.nsubexpr;
+            self.nsubexpr += 1;
         }
-        self.pos += 1;
+        self.nodes.push(n);
+        (self.nodes.len() - 1) as i32
     }
 
-    /// ↔ sqstd_rex_parsenumber
-    fn parse_number(&mut self) -> u16 {
-        let mut n: u32 = 0;
-        while self.pos < self.pat.len() && self.pat[self.pos].is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((self.pat[self.pos] - b'0') as u32);
-            self.pos += 1;
+    fn expect(&mut self, c: u8) -> Result<(), String> {
+        if self.cur() != c {
+            return Err("expected paren".to_string());
         }
-        n as u16
+        self.i += 1;
+        Ok(())
     }
 
-    /// ↔ sqstd_rex_element：一个原子 + **至多一个**量词，之后按条件递归串联。
-    /// 注意参考实现的量词 switch 只走一次，所以 `a*?` 中的 `?` 是**字面问号**。
-    fn parse_element(&mut self) -> Node {
-        let mut ret = self.parse_atom();
-        if self.err.is_some() {
-            return ret;
-        }
-        let mut p0: u16 = 0;
-        let mut p1: u16 = 0;
-        let mut isgreedy = false;
-        if self.pos < self.pat.len() {
-            match self.pat[self.pos] {
-                b'*' => {
-                    p0 = 0;
-                    p1 = 0xFFFF;
-                    self.pos += 1;
-                    isgreedy = true;
+    /// ↔ sqstd_rex_escapechar
+    fn escapechar(&mut self) -> Result<u8, String> {
+        if self.cur() == SYM_ESC {
+            self.i += 1;
+            match self.cur() {
+                b'v' => {
+                    self.i += 1;
+                    Ok(0x0B)
                 }
-                b'+' => {
-                    p0 = 1;
-                    p1 = 0xFFFF;
-                    self.pos += 1;
-                    isgreedy = true;
+                b'n' => {
+                    self.i += 1;
+                    Ok(b'\n')
                 }
-                b'?' => {
-                    p0 = 0;
-                    p1 = 1;
-                    self.pos += 1;
-                    isgreedy = true;
+                b't' => {
+                    self.i += 1;
+                    Ok(b'\t')
                 }
-                b'{' => {
-                    self.pos += 1;
-                    if self.pos >= self.pat.len() || !self.pat[self.pos].is_ascii_digit() {
-                        self.fail("number expected");
-                        return ret;
+                b'r' => {
+                    self.i += 1;
+                    Ok(b'\r')
+                }
+                b'f' => {
+                    self.i += 1;
+                    Ok(0x0C)
+                }
+                _ => {
+                    let c = self.cur();
+                    self.i += 1;
+                    Ok(c)
+                }
+            }
+        } else {
+            if !scisprint(self.cur()) {
+                return Err("letter expected".to_string());
+            }
+            let c = self.cur();
+            self.i += 1;
+            Ok(c)
+        }
+    }
+
+    fn charclass(&mut self, id: u8) -> i32 {
+        let n = self.newnode(OP_CCLASS);
+        self.nodes[n as usize].left = id as i32;
+        n
+    }
+
+    /// ↔ sqstd_rex_charnode
+    fn charnode(&mut self, isclass: bool) -> Result<i32, String> {
+        if self.cur() == SYM_ESC {
+            self.i += 1;
+            match self.cur() {
+                b'n' => {
+                    self.i += 1;
+                    return Ok(self.newnode(b'\n' as i32));
+                }
+                b't' => {
+                    self.i += 1;
+                    return Ok(self.newnode(b'\t' as i32));
+                }
+                b'r' => {
+                    self.i += 1;
+                    return Ok(self.newnode(b'\r' as i32));
+                }
+                b'f' => {
+                    self.i += 1;
+                    return Ok(self.newnode(0x0C));
+                }
+                b'v' => {
+                    self.i += 1;
+                    return Ok(self.newnode(0x0B));
+                }
+                b'a' | b'A' | b'w' | b'W' | b's' | b'S' | b'd' | b'D' | b'x' | b'X' | b'c'
+                | b'C' | b'p' | b'P' | b'l' | b'u' => {
+                    let t = self.cur();
+                    self.i += 1;
+                    return Ok(self.charclass(t));
+                }
+                b'm' => {
+                    self.i += 1;
+                    let cb = self.cur();
+                    self.i += 1;
+                    let ce = self.cur();
+                    self.i += 1;
+                    if cb == 0 || ce == 0 {
+                        return Err("balanced chars expected".to_string());
                     }
-                    p0 = self.parse_number();
-                    match self.pat.get(self.pos).copied() {
-                        Some(b'}') => {
-                            p1 = p0;
-                            self.pos += 1;
-                        }
-                        Some(b',') => {
-                            self.pos += 1;
-                            p1 = 0xFFFF;
-                            if self.pos < self.pat.len() && self.pat[self.pos].is_ascii_digit() {
-                                p1 = self.parse_number();
-                            }
-                            self.expect(b'}');
-                            if self.err.is_some() {
-                                return ret;
-                            }
-                        }
-                        _ => {
-                            self.fail(", or } expected");
-                            return ret;
-                        }
+                    if cb == ce {
+                        return Err("open/close char can't be the same".to_string());
                     }
-                    isgreedy = true;
+                    let node = self.newnode(OP_MB);
+                    self.nodes[node as usize].left = cb as i32;
+                    self.nodes[node as usize].right = ce as i32;
+                    return Ok(node);
                 }
-                _ => {}
+                0 => return Err("letter expected for argument of escape sequence".to_string()),
+                b'b' | b'B' if !isclass => {
+                    // 类里 \b 是普通字符 b/B
+                    let node = self.newnode(OP_WB);
+                    self.nodes[node as usize].left = self.cur() as i32;
+                    self.i += 1;
+                    return Ok(node);
+                }
+                _ => {
+                    let t = self.cur();
+                    self.i += 1;
+                    return Ok(self.newnode(t as i32));
+                }
+            }
+        } else if !scisprint(self.cur()) {
+            return Err("letter expected".to_string());
+        }
+        let t = self.cur();
+        self.i += 1;
+        Ok(self.newnode(t as i32))
+    }
+
+    /// ↔ sqstd_rex_class
+    fn class_(&mut self) -> Result<i32, String> {
+        let ret = if self.cur() == SYM_BOS {
+            let r = self.newnode(OP_NCLASS);
+            self.i += 1;
+            r
+        } else {
+            self.newnode(OP_CLASS)
+        };
+        if self.cur() == b']' {
+            return Err("empty class".to_string());
+        }
+        let mut first: i32 = -1;
+        let mut chain = ret;
+        // ↔ `while(*exp->_p != ']' && exp->_p != exp->_eol)`：编译期 `_eol` 是 NULL，
+        // 所以第二个条件恒真——模式在类里结束时由 charnode 对 NUL 报 "letter expected"
+        while self.cur() != b']' {
+            if self.cur() == b'-' && first != -1 {
+                // ↔ `if(*exp->_p++ == ']') "unfinished range"`：这句读到的恒是 '-'，
+                // 所以原版的 "unfinished range" 是死代码，这里照搬（只跳过 '-'）
+                self.i += 1;
+                let r = self.newnode(OP_RANGE);
+                if self.nodes[first as usize].ty > self.cur() as i32 {
+                    return Err("invalid range".to_string());
+                }
+                if self.nodes[first as usize].ty == OP_CCLASS {
+                    return Err("cannot use character classes in ranges".to_string());
+                }
+                self.nodes[r as usize].left = self.nodes[first as usize].ty;
+                let t = self.escapechar()?;
+                self.nodes[r as usize].right = t as i32;
+                self.nodes[chain as usize].next = r;
+                chain = r;
+                first = -1;
+            } else if first != -1 {
+                let c = first;
+                self.nodes[chain as usize].next = c;
+                chain = c;
+                first = self.charnode(true)?;
+            } else {
+                first = self.charnode(true)?;
             }
         }
-        if isgreedy {
-            ret = Node::Greedy(Box::new(ret), p0, p1);
+        if first != -1 {
+            let c = first;
+            self.nodes[chain as usize].next = c;
         }
-        // ↔ if(*_p 不在 { '|', ')', '*', '+', '\0' }) 继续串联下一个 element
-        if self.err.is_none()
-            && self.pos < self.pat.len()
-            && !matches!(self.pat[self.pos], b'|' | b')' | b'*' | b'+')
-        {
-            let next = self.parse_element();
-            return Node::Concat(vec![ret, next]);
-        }
-        ret
+        // /* hack? */（原版注释）
+        self.nodes[ret as usize].left = self.nodes[ret as usize].next;
+        self.nodes[ret as usize].next = -1;
+        Ok(ret)
     }
 
-    /// ↔ sqstd_rex_element 的原子 switch（`^` 不在此列：它只在 list 起始处有意义）
-    fn parse_atom(&mut self) -> Node {
-        if self.pos >= self.pat.len() {
-            // ↔ charnode 在 '\0' 上：不可打印 → "letter expected"（空模式同样是错误）
-            self.fail("letter expected");
-            return Node::Char(0);
+    /// ↔ sqstd_rex_parsenumber（含 "overflow in numeric constant"）
+    fn parsenumber(&mut self) -> Result<i32, String> {
+        let mut ret = self.cur() as i32 - b'0' as i32;
+        let mut positions: i64 = 10;
+        self.i += 1;
+        while scisdigit(self.cur()) {
+            ret = ret * 10 + (self.cur() as i32 - b'0' as i32);
+            self.i += 1;
+            if positions == 1000000000 {
+                return Err("overflow in numeric constant".to_string());
+            }
+            positions *= 10;
         }
-        let c = self.pat[self.pos];
-        match c {
+        Ok(ret)
+    }
+
+    /// ↔ sqstd_rex_element（= 一个元素 + 量词包装）
+    fn element_body(&mut self) -> Result<i32, String> {
+        let mut ret;
+        match self.cur() {
             b'(' => {
-                self.pos += 1;
-                let noncap = self.pos < self.pat.len() && self.pat[self.pos] == b'?';
-                if noncap {
-                    self.pos += 1;
-                    self.expect(b':');
+                self.i += 1;
+                let expr;
+                if self.cur() == b'?' {
+                    self.i += 1;
+                    self.expect(b':')?;
+                    expr = self.newnode(OP_NOCAPEXPR);
                 } else {
-                    self.ngroups += 1;
+                    expr = self.newnode(OP_EXPR);
                 }
-                let gidx = self.ngroups;
-                let inner = self.parse_alt();
-                if self.err.is_none() {
-                    self.expect(b')');
-                }
-                if noncap {
-                    Node::NonCap(Box::new(inner))
-                } else {
-                    Node::Group(Box::new(inner), gidx)
-                }
+                let newn = self.list()?;
+                self.nodes[expr as usize].left = newn;
+                ret = expr;
+                self.expect(b')')?;
             }
             b'[' => {
-                self.pos += 1;
-                let mut neg = false;
-                if self.pos < self.pat.len() && self.pat[self.pos] == b'^' {
-                    neg = true;
-                    self.pos += 1;
-                }
-                // ↔ if(*_p == ']') sqstd_rex_error("empty class")
-                if self.pos < self.pat.len() && self.pat[self.pos] == b']' {
-                    self.fail("empty class");
-                    return Node::Class { neg, ranges: Vec::new(), classes: Vec::new() };
-                }
-                let mut ranges = Vec::new();
-                let mut classes = Vec::new();
-                while self.pos < self.pat.len() && self.pat[self.pos] != b']' {
-                    let lo = self.parse_class_char();
-                    if self.err.is_some() {
-                        break;
-                    }
-                    if lo == b'\\' {
-                        // 类简写
-                        let cls = self.pat.get(self.pos - 1).copied().unwrap_or(b'd');
-                        classes.push(cls);
-                        continue;
-                    }
-                    if self.pos + 1 < self.pat.len() && self.pat[self.pos] == b'-' && self.pat[self.pos + 1] != b']' {
-                        self.pos += 1;
-                        let hi = self.parse_class_char();
-                        if self.err.is_some() {
-                            break;
-                        }
-                        ranges.push((lo, hi));
-                    } else {
-                        ranges.push((lo, lo));
-                    }
-                }
-                if self.pos >= self.pat.len() {
-                    // ↔ class 循环靠指针比较，实际会撞上结尾 '\0' 的 charnode
-                    self.fail("letter expected");
-                } else {
-                    self.expect(b']');
-                }
-                Node::Class { neg, ranges, classes }
+                self.i += 1;
+                ret = self.class_()?;
+                self.expect(b']')?;
             }
-            b'.' => {
-                self.pos += 1;
-                Node::Any
+            SYM_EOS => {
+                self.i += 1;
+                ret = self.newnode(OP_EOL);
             }
-            b'$' => {
-                self.pos += 1;
-                Node::End
-            }
-            b'\\' => {
-                self.pos += 1;
-                if self.pos >= self.pat.len() {
-                    // ↔ charnode 的转义 switch：case 0
-                    self.fail("letter expected for argument of escape sequence");
-                    return Node::Char(0);
-                }
-                let e = self.pat[self.pos];
-                self.pos += 1;
-                match e {
-                    // ↔ sqstd_rex_charclass 的完整集合
-                    b'a' | b'A' | b'w' | b'W' | b's' | b'S' | b'd' | b'D' | b'x' | b'X'
-                    | b'c' | b'C' | b'p' | b'P' | b'l' | b'u' => Node::Class {
-                        neg: false,
-                        ranges: Vec::new(),
-                        classes: vec![e],
-                    },
-                    b'm' => {
-                        // ↔ \m(cb)(ce)：嵌套平衡匹配
-                        let cb = *self.pat.get(self.pos).unwrap_or(&0);
-                        let ce = *self.pat.get(self.pos + 1).unwrap_or(&0);
-                        self.pos += 2;
-                        Node::MBalanced(cb, ce)
-                    }
-                    b'b' => Node::WordBoundary(true),
-                    b'B' => Node::WordBoundary(false),
-                    b'n' => Node::Char(b'\n'),
-                    b't' => Node::Char(b'\t'),
-                    b'r' => Node::Char(b'\r'),
-                    b'f' => Node::Char(0x0C),
-                    b'v' => Node::Char(0x0B),
-                    b'0' => Node::Char(0),
-                    _ => Node::Char(e), // 其余（含已被 class 分支覆盖的）按字面字符
-
-                }
+            SYM_ANY => {
+                self.i += 1;
+                ret = self.newnode(OP_DOT);
             }
             _ => {
-                // ↔ sqstd_rex_charnode：不可打印字符（含行尾 '\0'）报 "letter expected"
-                if !(0x20..0x7f).contains(&c) {
-                    self.fail("letter expected");
-                    return Node::Char(0);
+                ret = self.charnode(false)?;
+            }
+        }
+
+        let mut isgreedy = false;
+        let mut p0: u32 = 0;
+        let mut p1: u32 = 0;
+        match self.cur() {
+            SYM_STAR => {
+                p0 = 0;
+                p1 = 0xFFFF;
+                self.i += 1;
+                isgreedy = true;
+            }
+            SYM_PLUS => {
+                p0 = 1;
+                p1 = 0xFFFF;
+                self.i += 1;
+                isgreedy = true;
+            }
+            SYM_QUEST => {
+                p0 = 0;
+                p1 = 1;
+                self.i += 1;
+                isgreedy = true;
+            }
+            b'{' => {
+                self.i += 1;
+                if !scisdigit(self.cur()) {
+                    return Err("number expected".to_string());
                 }
-                self.pos += 1;
-                Node::Char(c)
+                p0 = (self.parsenumber()? as u32) & 0xFFFF;
+                match self.cur() {
+                    b'}' => {
+                        p1 = p0;
+                        self.i += 1;
+                    }
+                    b',' => {
+                        self.i += 1;
+                        p1 = 0xFFFF;
+                        if scisdigit(self.cur()) {
+                            p1 = (self.parsenumber()? as u32) & 0xFFFF;
+                        }
+                        self.expect(b'}')?;
+                    }
+                    _ => return Err(", or } expected".to_string()),
+                }
+                isgreedy = true;
             }
+            _ => {}
         }
+        if isgreedy {
+            let nnode = self.newnode(OP_GREEDY);
+            self.nodes[nnode as usize].left = ret;
+            self.nodes[nnode as usize].right = (((p0 & 0xFFFF) << 16) | (p1 & 0xFFFF)) as i32;
+            ret = nnode;
+        }
+
+        // ↔ 原版这里是**尾递归** `nnode = element(); nodes[ret].next = nnode;`
+        // （字符链按 `next` 串起来）。改成循环后，递归深度只与**真正的嵌套**
+        // （括号/量词）相关：5000 字的字面量模式不会再消耗 5000 层栈。
+        let mut tail = ret;
+        while self.cur() != SYM_BRANCH
+            && self.cur() != b')'
+            && self.cur() != SYM_STAR
+            && self.cur() != SYM_PLUS
+            && self.cur() != 0
+        {
+            let nnode = self.element_body()?;
+            self.nodes[tail as usize].next = nnode;
+            tail = nnode;
+        }
+        Ok(ret)
     }
 
-    fn parse_class_char(&mut self) -> u8 {
-        let c = self.pat[self.pos];
-        if c == b'\\' && self.pos + 1 < self.pat.len() {
-            self.pos += 2;
-            // 标记：返回转义符本身，由调用方判断是否类简写
-            let e = self.pat[self.pos - 1];
-            match e {
-                b'd' | b'w' | b's' | b'D' | b'W' | b'S' => b'\\',
-                b'n' => b'\n',
-                b't' => b'\t',
-                b'r' => b'\r',
-                other => other,
-            }
+    /// ↔ 原版 `element()` 的入口：带递归深度保护（真正的嵌套才增加深度）
+    fn element(&mut self) -> Result<i32, String> {
+        self.depth += 1;
+        if self.depth > MAX_RE_DEPTH {
+            self.depth -= 1;
+            return Err("regexp too deeply nested".to_string());
+        }
+        let r = self.element_body();
+        self.depth -= 1;
+        r
+    }
+
+    /// ↔ sqstd_rex_list
+    fn list(&mut self) -> Result<i32, String> {
+        let mut ret: i32 = -1;
+        if self.cur() == SYM_BOS {
+            self.i += 1;
+            ret = self.newnode(OP_BOL);
+        }
+        let e = self.element()?;
+        if ret != -1 {
+            self.nodes[ret as usize].next = e;
         } else {
-            self.pos += 1;
-            c
+            ret = e;
         }
+        if self.cur() == SYM_BRANCH {
+            self.i += 1;
+            let temp = self.newnode(OP_OR);
+            self.nodes[temp as usize].left = ret;
+            let tright = self.list()?;
+            self.nodes[temp as usize].right = tright;
+            ret = temp;
+        }
+        Ok(ret)
     }
 }
 
-fn is_word(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
+// ---------------------------------------------------------------- 匹配（↔ sqstd_rex_matchnode）
+struct M<'a> {
+    nodes: &'a [Node],
+    text: &'a [u8],
+    bol: usize,
+    eol: usize,
+    currsubexp: i32,
+    /// (begin, len)；len == 0 表示"没匹配上"（↔ 原版 memset 0 + `match.len > 0` 判定）
+    matches: Vec<(usize, usize)>,
+    depth: u32,
+    steps: u64,
+    aborted: bool,
 }
 
-fn class_matches(neg: bool, ranges: &[(u8, u8)], classes: &[u8], c: u8) -> bool {
-    // ↔ sqstd_rex_matchcclass
-    let cls_match = |cls: u8| -> bool {
-        match cls {
-            b'a' => c.is_ascii_alphabetic(),
-            b'A' => !c.is_ascii_alphabetic(),
-            b'w' => c.is_ascii_alphanumeric() || c == b'_',
-            b'W' => !(c.is_ascii_alphanumeric() || c == b'_'),
-            b's' => c.is_ascii_whitespace(),
-            b'S' => !c.is_ascii_whitespace(),
-            b'd' => c.is_ascii_digit(),
-            b'D' => !c.is_ascii_digit(),
-            b'x' => c.is_ascii_hexdigit(),
-            b'X' => !c.is_ascii_hexdigit(),
-            b'c' => c.is_ascii_control(),
-            b'C' => !c.is_ascii_control(),
-            b'p' => c.is_ascii_punctuation(),
-            b'P' => !c.is_ascii_punctuation(),
+impl<'a> M<'a> {
+    fn new(rx: &'a Regex, text: &'a [u8], bol: usize, eol: usize) -> M<'a> {
+        M {
+            nodes: &rx.nodes,
+            text,
+            bol,
+            eol,
+            currsubexp: 0,
+            matches: vec![(0, 0); rx.nsubexpr],
+            depth: 0,
+            steps: 0,
+            aborted: false,
+        }
+    }
+
+    /// 文本第 i 字节（越界 = 隐含 NUL，↔ C 字符串终止符）
+    fn ch(&self, i: usize) -> u8 {
+        if i < self.text.len() {
+            self.text[i]
+        } else {
+            0
+        }
+    }
+
+    /// 带符号访问（`*(str-1)`；i < 0 时给 0，参考实现在那一点是越界读）
+    fn at(&self, i: i64) -> u8 {
+        if i < 0 {
+            0
+        } else {
+            self.ch(i as usize)
+        }
+    }
+
+    fn node(&self, i: i32) -> &Node {
+        &self.nodes[i as usize]
+    }
+
+    fn matchcclass(cclass: i32, c: u8) -> bool {
+        match cclass as u8 {
+            b'a' => scisalpha(c),
+            b'A' => !scisalpha(c),
+            b'w' => scisalnum(c) || c == b'_',
+            b'W' => !scisalnum(c) && c != b'_',
+            b's' => scisspace(c),
+            b'S' => !scisspace(c),
+            b'd' => scisdigit(c),
+            b'D' => !scisdigit(c),
+            b'x' => scisxdigit(c),
+            b'X' => !scisxdigit(c),
+            b'c' => sciscntrl(c),
+            b'C' => !sciscntrl(c),
+            b'p' => scispunct(c),
+            b'P' => !scispunct(c),
             b'l' => c.is_ascii_lowercase(),
             b'u' => c.is_ascii_uppercase(),
             _ => false,
         }
-    };
-    let mut m = ranges.iter().any(|(lo, hi)| c >= *lo && c <= *hi);
-    if !m {
-        for cls in classes {
-            m = cls_match(*cls);
-            if m {
-                break;
-            }
-        }
     }
-    m != neg
-}
 
-/// 回溯匹配器：caps[i] = (start, end)
-struct Matcher<'a> {
-    text: &'a [u8],
-    caps: Vec<Option<(usize, usize)>>,
-}
-
-impl<'a> Matcher<'a> {
-    fn m(&mut self, node: &Node, pos: usize, k: &mut dyn FnMut(&mut Matcher<'a>, usize) -> bool) -> bool {
-        match node {
-            Node::Char(c) => {
-                if pos < self.text.len() && self.text[pos] == *c {
-                    k(self, pos + 1)
-                } else {
-                    false
-                }
-            }
-            Node::Any => {
-                if pos < self.text.len() {
-                    k(self, pos + 1)
-                } else {
-                    false
-                }
-            }
-            Node::Class { neg, ranges, classes } => {
-                if pos < self.text.len() && class_matches(*neg, ranges, classes, self.text[pos]) {
-                    k(self, pos + 1)
-                } else {
-                    false
-                }
-            }
-            Node::Start => {
-                if pos == 0 {
-                    k(self, pos)
-                } else {
-                    false
-                }
-            }
-            Node::End => {
-                if pos == self.text.len() {
-                    k(self, pos)
-                } else {
-                    false
-                }
-            }
-            Node::Group(inner, gidx) => {
-                let start = pos;
-                self.m_node_capture(inner, *gidx, start, k)
-            }
-            Node::NonCap(inner) => self.m(inner, pos, k),
-            Node::Concat(items) => self.m_concat(items, 0, pos, k),
-            Node::Alt(branches) => {
-                for b in branches {
-                    if self.m(b, pos, k) {
+    fn matchclass(&self, mut idx: i32, c: u8) -> bool {
+        loop {
+            let n = self.node(idx);
+            match n.ty {
+                OP_RANGE => {
+                    // 原版是 `char` 与 SQInteger 比较：高位字节（负值）落在任何范围外
+                    let sc = c as i8 as i32;
+                    if sc >= n.left && sc <= n.right {
                         return true;
                     }
                 }
-                false
-            }
-            Node::Greedy(inner, p0, p1) => self.m_repeat(
-                inner,
-                pos,
-                *p0 as usize,
-                if *p1 == 0xFFFF { usize::MAX } else { *p1 as usize },
-                true,
-                k,
-            ),
-            Node::MBalanced(cb, ce) => {
-                // ↔ sqstd_rex_matchbalance：嵌套平衡
-                if pos >= self.text.len() || self.text[pos] != *cb {
-                    return false;
+                OP_CCLASS => {
+                    if Self::matchcclass(n.left, c) {
+                        return true;
+                    }
                 }
-                let mut cont = 1i64;
-                let mut i = pos + 1;
-                while i < self.text.len() {
-                    let c = self.text[i];
-                    if c == *ce {
+                _ => {
+                    if c as i8 as i32 == n.ty {
+                        return true;
+                    }
+                }
+            }
+            if n.next != -1 {
+                idx = n.next;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    fn matchnode(&mut self, ni: i32, s: usize, next: Option<i32>) -> Option<usize> {
+        if self.aborted {
+            return None;
+        }
+        self.steps += 1;
+        if self.steps > MAX_RE_STEPS {
+            self.aborted = true;
+            return None;
+        }
+        self.depth += 1;
+        if self.depth > MAX_RE_DEPTH {
+            self.depth -= 1;
+            self.aborted = true;
+            return None;
+        }
+        let r = self.matchnode_inner(ni, s, next);
+        self.depth -= 1;
+        r
+    }
+
+    fn matchnode_inner(&mut self, ni: i32, s: usize, next: Option<i32>) -> Option<usize> {
+        let node = *self.node(ni);
+        match node.ty {
+            OP_GREEDY => {
+                let p0 = ((node.right >> 16) & 0xFFFF) as u32;
+                let p1 = (node.right & 0xFFFF) as u32;
+                let mut nmaches: u32 = 0;
+                let mut str_ = s;
+                let mut good = s;
+                let greedystop: Option<i32> = if node.next != -1 { Some(node.next) } else { next };
+
+                while nmaches == 0xFFFF || nmaches < p1 {
+                    match self.matchnode(node.left, str_, greedystop) {
+                        Some(ns) => str_ = ns,
+                        None => break,
+                    }
+                    nmaches += 1;
+                    good = str_;
+                    if let Some(gs) = greedystop {
+                        let gsn = *self.node(gs);
+                        if gsn.ty != OP_GREEDY
+                            || (gsn.ty == OP_GREEDY && ((gsn.right >> 16) & 0xFFFF) != 0)
+                        {
+                            let gnext = if gsn.next != -1 {
+                                Some(gsn.next)
+                            } else if let Some(nx) = next {
+                                let nxn = *self.node(nx);
+                                if nxn.next != -1 {
+                                    Some(nxn.next)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if self.matchnode(gs, str_, gnext).is_some() {
+                                if p0 == p1 && p0 == nmaches {
+                                    break;
+                                } else if nmaches >= p0 && p1 == 0xFFFF {
+                                    break;
+                                } else if nmaches >= p0 && nmaches <= p1 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if str_ >= self.eol {
+                        break;
+                    }
+                }
+                if p0 == p1 && p0 == nmaches {
+                    return Some(good);
+                } else if nmaches >= p0 && p1 == 0xFFFF {
+                    return Some(good);
+                } else if nmaches >= p0 && nmaches <= p1 {
+                    return Some(good);
+                }
+                None
+            }
+            OP_OR => {
+                let mut temp = node.left;
+                let mut asd = s;
+                loop {
+                    match self.matchnode(temp, asd, None) {
+                        Some(n) => asd = n,
+                        None => break,
+                    }
+                    let tn = *self.node(temp);
+                    if tn.next != -1 {
+                        temp = tn.next;
+                    } else {
+                        return Some(asd);
+                    }
+                }
+                asd = s;
+                temp = node.right;
+                loop {
+                    match self.matchnode(temp, asd, None) {
+                        Some(n) => asd = n,
+                        None => break,
+                    }
+                    let tn = *self.node(temp);
+                    if tn.next != -1 {
+                        temp = tn.next;
+                    } else {
+                        return Some(asd);
+                    }
+                }
+                None
+            }
+            OP_EXPR | OP_NOCAPEXPR => {
+                let mut n = node.left;
+                let mut cur = s;
+                let mut capture: i32 = -1;
+                if node.ty != OP_NOCAPEXPR && node.right == self.currsubexp {
+                    capture = self.currsubexp;
+                    if let Some(slot) = self.matches.get_mut(capture as usize) {
+                        *slot = (cur, 0);
+                    }
+                    self.currsubexp += 1;
+                }
+                let tempcap = self.currsubexp;
+                loop {
+                    let subnext = {
+                        let nn = *self.node(n);
+                        if nn.next != -1 {
+                            Some(nn.next)
+                        } else {
+                            next
+                        }
+                    };
+                    match self.matchnode(n, cur, subnext) {
+                        Some(nc) => cur = nc,
+                        None => {
+                            if capture != -1 {
+                                if let Some(slot) = self.matches.get_mut(capture as usize) {
+                                    *slot = (0, 0);
+                                }
+                            }
+                            return None;
+                        }
+                    }
+                    let nn = *self.node(n);
+                    if nn.next != -1 {
+                        n = nn.next;
+                    } else {
+                        break;
+                    }
+                }
+                self.currsubexp = tempcap;
+                if capture != -1 {
+                    if let Some(slot) = self.matches.get_mut(capture as usize) {
+                        let b = slot.0;
+                        slot.1 = cur.saturating_sub(b);
+                    }
+                }
+                Some(cur)
+            }
+            OP_WB => {
+                let c0 = self.ch(s);
+                let c1 = self.ch(s + 1);
+                let cm1 = self.at(s as i64 - 1);
+                let cond = (s == self.bol && !scisspace(c0))
+                    || (s == self.eol && !scisspace(cm1))
+                    || (!scisspace(c0) && scisspace(c1))
+                    || (scisspace(c0) && !scisspace(c1));
+                if cond {
+                    if node.left == b'b' as i32 {
+                        return Some(s);
+                    }
+                    return None;
+                }
+                if node.left == b'b' as i32 {
+                    return None;
+                }
+                Some(s)
+            }
+            OP_BOL => {
+                if s == self.bol {
+                    Some(s)
+                } else {
+                    None
+                }
+            }
+            OP_EOL => {
+                if s == self.eol {
+                    Some(s)
+                } else {
+                    None
+                }
+            }
+            OP_DOT => {
+                if s == self.eol {
+                    return None;
+                }
+                Some(s + 1)
+            }
+            OP_NCLASS | OP_CLASS => {
+                if s == self.eol {
+                    return None;
+                }
+                let m = self.matchclass(node.left, self.ch(s));
+                let ok = if m { node.ty == OP_CLASS } else { node.ty == OP_NCLASS };
+                if ok {
+                    Some(s + 1)
+                } else {
+                    None
+                }
+            }
+            OP_CCLASS => {
+                if s == self.eol {
+                    return None;
+                }
+                if Self::matchcclass(node.left, self.ch(s)) {
+                    Some(s + 1)
+                } else {
+                    None
+                }
+            }
+            OP_MB => {
+                let cb = node.left as u8;
+                let ce = node.right as u8;
+                if self.ch(s) != cb {
+                    return None;
+                }
+                let mut cont: i32 = 1;
+                let mut str_ = s;
+                loop {
+                    str_ += 1;
+                    if str_ >= self.eol {
+                        break;
+                    }
+                    let c = self.ch(str_);
+                    if c == ce {
                         cont -= 1;
                         if cont == 0 {
-                            return k(self, i + 1);
+                            return Some(str_ + 1);
                         }
-                    } else if c == *cb {
+                    } else if c == cb {
                         cont += 1;
                     }
-                    i += 1;
                 }
-                false
+                None
             }
-            Node::WordBoundary(positive) => {
-                let before = pos > 0 && is_word(self.text[pos - 1]);
-                let after = pos < self.text.len() && is_word(self.text[pos]);
-                let at_boundary = before != after;
-                if at_boundary == *positive {
-                    k(self, pos)
-                } else {
-                    false
+            _ => {
+                // 字面字符
+                if s == self.eol {
+                    return None;
                 }
-            }
-        }
-    }
-
-    fn m_node_capture(
-        &mut self,
-        inner: &Node,
-        gidx: usize,
-        start: usize,
-        k: &mut dyn FnMut(&mut Matcher<'a>, usize) -> bool,
-    ) -> bool {
-        let mut kont = |m: &mut Matcher<'a>, end: usize| {
-            let old = m.caps[gidx];
-            m.caps[gidx] = Some((start, end));
-            if k(m, end) {
-                true
-            } else {
-                m.caps[gidx] = old;
-                false
-            }
-        };
-        self.m(inner, start, &mut kont)
-    }
-
-    fn m_concat(
-        &mut self,
-        items: &[Node],
-        idx: usize,
-        pos: usize,
-        k: &mut dyn FnMut(&mut Matcher<'a>, usize) -> bool,
-    ) -> bool {
-        if idx == items.len() {
-            return k(self, pos);
-        }
-        let mut kont = |m: &mut Matcher<'a>, p: usize| -> bool {
-            m.m_concat(items, idx + 1, p, k)
-        };
-        self.m(&items[idx], pos, &mut kont)
-    }
-
-    fn m_repeat(
-        &mut self,
-        inner: &Node,
-        pos: usize,
-        min: usize,
-        max: usize,
-        greedy: bool,
-        k: &mut dyn FnMut(&mut Matcher<'a>, usize) -> bool,
-    ) -> bool {
-        // 次数已用尽（↔ while(nmaches < p1)）：只能走延续，且必须已满足下限
-        if max == 0 {
-            return min == 0 && k(self, pos);
-        }
-        // 贪心：多优先；惰性：少优先
-        if greedy {
-            let _me: &mut Matcher<'a> = self;
-            let mut kont = |m: &mut Matcher<'a>, p: usize| {
-                if p == pos {
-                    return false; // 空匹配防死循环
+                if self.ch(s) as i8 as i32 != node.ty {
+                    return None;
                 }
-                m.m_repeat(inner, p, min.saturating_sub(1), max - 1, greedy, k)
-            };
-            if self.m(inner, pos, &mut kont) {
-                return true;
+                Some(s + 1)
             }
-            if min == 0 {
-                return k(self, pos);
-            }
-            false
-        } else {
-            if min == 0 && k(self, pos) {
-                return true;
-            }
-            let _me: &mut Matcher<'a> = self;
-            let mut kont = |m: &mut Matcher<'a>, p: usize| {
-                if p == pos {
-                    return false;
-                }
-                m.m_repeat(inner, p, min.saturating_sub(1), max - 1, greedy, k)
-            };
-            self.m(inner, pos, &mut kont)
         }
     }
 }
 
-// 手动补充 next_group 字段
-impl<'a> Matcher<'a> {
-    fn new(text: &'a [u8], ngroups: usize) -> Matcher<'a> {
-        Matcher {
-            text,
-            caps: vec![None; ngroups + 1],
-        }
-    }
-}
-
+// ---------------------------------------------------------------- 公开 API
 impl Regex {
-    /// ↔ sqstd_rex_compile：失败时带出参考实现的错误文本
     pub fn compile(pattern: &[u8]) -> Result<Regex, String> {
-        let mut p = Parser {
-            pat: pattern,
-            pos: 0,
-            ngroups: 0,
-            err: None,
+        let mut c = Comp {
+            p: pattern.to_vec(),
+            i: 0,
+            nodes: Vec::new(),
+            nsubexpr: 0,
+            depth: 0,
         };
-        let root = p.parse_alt();
-        if let Some(e) = p.err {
-            return Err(e);
-        }
-        if p.pos != pattern.len() {
+        let first = c.newnode(OP_EXPR);
+        let res = c.list()?;
+        c.nodes[first as usize].left = res;
+        if c.cur() != 0 {
             return Err("unexpected character".to_string());
         }
-        Ok(Regex {
-            root,
-            ngroups: p.ngroups,
-        })
+        Ok(Regex { nodes: c.nodes, first, nsubexpr: c.nsubexpr as usize })
     }
 
-    /// 从 start 开始查找第一个匹配，返回 (match_start, match_end, caps)
-    pub fn search(&self, text: &[u8], start: usize) -> Option<(usize, usize, Vec<Option<(usize, usize)>>)> {
-        let mut s = start;
+    /// ↔ sqstd_rex_search(str+start)：`_bol` = start 偏移、`_eol` = 字符串结尾。
+    /// 返回 (begin, end, captures) 都是**相对整个 subject** 的下标。
+    pub fn search(
+        &self,
+        text: &[u8],
+        start: usize,
+    ) -> Option<(usize, usize, Vec<(usize, usize)>)> {
+        // 参考实现在 start > len 时做的是越界指针运算（UB），这里给确定性的"不匹配"
+        if start > text.len() {
+            return None;
+        }
+        let mut text_begin = start;
+        let text_end = text.len();
+        if text_begin >= text_end {
+            return None;
+        }
+        let mut m = M::new(self, text, start, text_end);
+        let mut node = self.first;
+        let mut cur: Option<usize>;
         loop {
-            if s > text.len() {
-                return None;
-            }
-            let mut m = Matcher::new(text, self.ngroups);
-            let mut end_found: Option<usize> = None;
-            let root = &self.root;
-            let mut kont = |mm: &mut Matcher, end: usize| {
-                end_found = Some(end);
-                // 保留 caps（第 0 组存整体）
-                if mm.caps[0].is_none() {
-                    mm.caps[0] = Some((s, end));
+            cur = Some(text_begin);
+            while node != -1 {
+                m.currsubexp = 0;
+                match m.matchnode(node, cur.unwrap_or(text_begin), None) {
+                    Some(nc) => cur = Some(nc),
+                    None => {
+                        cur = None;
+                        break;
+                    }
                 }
-                true
-            };
-            if m.m(root, s, &mut kont) {
-                let e = end_found.unwrap_or(s);
-                return Some((s, e, m.caps.clone()));
+                node = self.nodes[node as usize].next;
             }
-            s += 1;
+            text_begin += 1;
+            if !(cur.is_none() && text_begin != text_end) {
+                break;
+            }
+        }
+        if m.aborted {
+            return None;
+        }
+        match cur {
+            Some(end) => {
+                let begin = text_begin - 1;
+                Some((begin, end, m.matches))
+            }
+            None => None,
         }
     }
 
-    /// ↔ sqstd_rex_match：从头完整匹配
-    pub fn match_full(&self, text: &[u8]) -> Option<(usize, usize, Vec<Option<(usize, usize)>>)> {
-        let mut m = Matcher::new(text, self.ngroups);
-        let mut end_found: Option<usize> = None;
-        let root = &self.root;
-        let s = 0usize;
-        let mut kont = |mm: &mut Matcher, end: usize| {
-            if end == text.len() {
-                end_found = Some(end);
-                mm.caps[0] = Some((s, end));
-                true
-            } else {
-                false
-            }
-        };
-        if m.m(root, 0, &mut kont) {
-            let e = end_found?;
-            return Some((0, e, m.caps.clone()));
+    /// ↔ sqstd_rex_match：整串匹配（锚定两端）
+    pub fn match_full(&self, text: &[u8]) -> Option<(usize, usize, Vec<(usize, usize)>)> {
+        let mut m = M::new(self, text, 0, text.len());
+        m.currsubexp = 0;
+        let res = m.matchnode(self.first, 0, None);
+        if m.aborted {
+            return None;
         }
-        None
+        match res {
+            Some(e) if e == text.len() => Some((0, e, m.matches)),
+            _ => None,
+        }
     }
 
     pub fn ngroups(&self) -> usize {
-        self.ngroups
+        self.nsubexpr.saturating_sub(1)
     }
 
-    /// ↔ sqstd_rex_getsubexpcount：含整体匹配（C++ 的根 OP_EXPR 也占一个编号）
     pub fn subexpcount(&self) -> usize {
-        self.ngroups + 1
+        self.nsubexpr
     }
 }
-
-// ---------------------------------------------------------------------------
-// Squirrel 侧的 regexp 类
-// ---------------------------------------------------------------------------
 
 thread_local! {
     static REGEXPS: std::cell::RefCell<Vec<Rc<Regex>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -747,7 +1043,7 @@ pub fn make_regexp_class(ss: &std::rc::Rc<squirrel::state::SharedState>) -> Valu
                 let arr = squirrel::array::SQArray::create(&v.ss, caps.len() as SQInteger);
                 for (i, c) in caps.iter().enumerate() {
                     // ↔ match.len > 0 ? 实际区间 : 空匹配（{begin:0,end:0}），不是 null
-                    let (s, e) = c.unwrap_or((0, 0));
+                    let (s, e) = if c.1 > 0 { (c.0, c.0 + c.1) } else { (0, 0) };
                     let t = squirrel::table::SQTable::create(&v.ss, 2);
                     t.borrow_mut().new_slot(&v.ss.intern(b"begin"), &Value::Integer(s as SQInteger));
                     t.borrow_mut().new_slot(&v.ss.intern(b"end"), &Value::Integer(e as SQInteger));
