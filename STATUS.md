@@ -641,6 +641,50 @@ x86 的 `idiv` 在商溢出时触发**硬件异常**，参考实现直接
 `crates/squirrel-stdlib/tests/weakref_semantics.rs`（2 个测试：各类型弱引用；
 弱引用不保活 + GC 计数），期望值先经参考实现实测确认。
 
+## 三·补11、第十一轮（P1-3）：词法 / 优先级 / 作用域 + 编译错误对拍
+
+### 语料与工具
+
+* `tools/gen_lexmatrix.py` → `tests-corpus/t_lexmatrix.nut`：**203 条**（转义表、
+  `\x`/`\u`/`\U` 的字节值、verbatim 串、优先级与结合性、短路求值、作用域遮蔽、
+  循环里的闭包捕获、`++/--` 返回值、语句形态、`__LINE__`、类/函数语法面）。
+  用 `tmp-c2/byte_diff.py` 按**字节**对比，两侧逐字节一致。
+* `tools/errmsg_matrix.py`：**55 条**语法/词法非法源码，逐条 `-c` 只编译并对比
+  编译器错误消息与行列号 —— **55/55 一致**（含 `unrecognised escaper char`、
+  `expected '{'`、`empty class` 那一类）。语法错的脚本会中断整个文件，
+  所以不能塞进普通语料，必须单独这样跑。
+
+### 抓到的真实差异：字符串下标是**有符号**的
+
+参考实现是非 UNICODE 构建（`SQChar` = `char`），`SQString::_val[idx]` 取出来会
+**符号扩展**：
+
+```nut
+"\xff"[0]     // 参考实现：-1     本实现（改前）：255
+"\u00e9"[0]   // 参考实现：-61    本实现（改前）：195   （字符串是 UTF-8 两字节 C3 A9）
+foreach (c in "\u00e9") …   // 同一条路径，也拿到 -61 / -87
+```
+
+`\u`/`\U` 的**编码**两侧本来就一致（都产出 UTF-8 字节 ✓ 已实测 `\u00e9` → `C3 A9`、
+`\U0001F600` → `F0 9F 98 80`），差的只是取字节时的符号。已改 `vm.rs` 的字符串 `_get`
+与 `SQString::next`（foreach 用）为 `as i8 as SQInteger`。
+
+**blob 不同**：`b[0] = 255` 取回 `255`（`unsigned char`）——已实测确认两侧一致，
+语料里同时守住这两种语义。
+
+### 顺带隔离的一处参考实现 UB：`escape()` 遇高位字节
+
+`escape()` 用 `(char)c` 传给 `%02x`，高位字节会写出 8 位补码（`\xffffffe9`），
+**并越界写它自己的 scratchpad**：实测输出会串行（`esc_xff=1:\xff` 后面直接粘上
+下一个用例的尾巴），还混进别的错误消息片段（`stream' does not exist`）。
+所以语料里高位字节只比**字节值**（`bytes()` 转储），不比 `escape()`；
+已知偏离记在第四节。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/lexer_semantics.rs`（2 个测试：字符串字节有符号性、
+优先级/短路/作用域/循环捕获/自增返回值），期望值先经参考实现实测确认。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
@@ -653,7 +697,7 @@ x86 的 `idiv` 在商溢出时触发**硬件异常**，参考实现直接
 | `.cnut` 的 outer 类型字段 | 参考实现用 `sizeof(SQUnsignedInteger)`（8 字节）写一个 4 字节枚举，高 4 字节是**未初始化内存**：同一脚本连编两次字节都不同（实测 `ff245324…` vs `e4e3c42e…`），而 `e4e3c42e…` 恰好等于本实现的输出。因此含闭包的语料会有几个文件字节不同，`tools/cnut_matrix.py` 把这种只差高 4 字节的情况单独标成 `PAD-ONLY`（低 32 位类型仍逐位相同，其余字段全部一致）；本实现写确定的 0。加载侧已按低 32 位掩码，参考实现产出的字节码能正常执行（51/51 交叉执行一致） |
 | 坏字节码里的越界 outer 索引 | 参考实现不检查该索引，夹具 `ref_closures_badouter.cnut` 让 C++ 侧访问违例崩溃（0xC0000005）；本实现报可捕获的 `invalid outer value index`（`crates/squirrel-stdlib/tests/bytecode_interop.rs` 守门） |
 | `format` 规格串恰好 20 字符 | `validate_format` 的 `n-start > MAX_FORMAT_LEN` 差一，随后 `memcpy` 越界写 `fmt[20]`：`format("%" + 20 个 '+' + "d", 1)` 实测 `STATUS_STACK_BUFFER_OVERRUN` 崩溃。本实现从 20 起就报 `format too long`，不复刻 |
-| `escape` 高位字节 | C++ 用 `(char)c` 传给 `%02x`：≥0x80 输出 8 位补码（`\xffffffe9`）。当字符串很短、scratchpad 不够时参考实现会越界写出**不确定内容**（实测 `escape("\xe9")` 输出 `\xffaaaaa\xffffffe9`）。本实现取确定性的补码值，短字符串场景与参考不同 |
+| `escape` 高位字节 | C++ 用 `(char)c` 传给 `%02x`：≥0x80 输出 8 位补码（`\xffffffe9`），**并越界写自己的 scratchpad**。实测（P1-3）输出会**串行**（`esc_xff=1:\xff` 后面直接粘下一个用例的尾巴）并混进别的错误消息片段（`stream' does not exist`）。本实现取确定性的补码值；语料里高位字节只比字节值、不比 `escape()` |
 | `date` 上界 | UCRT 的上界常量未逐秒定位：实测 32536800000（3001-01-19）可用、32536857599 失败。本实现取前者为上界 |
 | `getstackinfos(-1)` | 参考实现 `_callsstack[cssize]` 越界读（UB，实测返回一个表）；本实现返回 `null`，不 panic |
 | 挂起线程上再 `call()` | 参考实现的 `suspend` 不关帧，`sq_call` 取 `GetUp(-(nparams+1))` 拿到的正是**挂起值**（实测无论传几个实参都是 `attempt to call 'string'`）；本实现关帧后取到的是环境表，文本为 `attempt to call 'table'`。两者都是可捕获错误，只有类型名不同；`wakeup`/`getstatus`/`getstackinfos` 等合法操作两侧完全一致（`tmp-c2/layout.nut`） |

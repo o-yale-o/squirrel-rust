@@ -923,7 +923,10 @@ impl VmData {
                         n += len;
                     }
                     if n >= 0 && n < len {
-                        return Ok(Value::Integer(s.val[n as usize] as SQInteger));
+                        // ↔ C++：`_string(o)->_val[idx]` 是 `SQChar`（本构建 = **有符号** char），
+                        // 所以高位字节会**符号扩展**：`"\xff"[0]` == -1、`"é"[0]` == -61
+                        // （blob 的 `_get` 走 `unsigned char`，是 0..255，两者不同）
+                        return Ok(Value::Integer(s.val[n as usize] as i8 as SQInteger));
                     }
                     if getflags & GET_FLAG_DO_NOT_RAISE_ERROR == 0 {
                         return self.raise_idx_error(key);

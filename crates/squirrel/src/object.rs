@@ -334,13 +334,16 @@ impl SQString {
     }
 
     /// ↔ SQString::Next（按索引迭代，值是字符码）。返回 (下一 refpos, key, val)。
+    ///
+    /// 值同样是 `SQChar`（**有符号** char）→ 高位字节符号扩展：
+    /// `foreach (c in "\xff")` 拿到 -1，与 `"\xff"[0]` 一致（见 vm.rs 的字符串 `_get`）。
     pub fn next(&self, refpos: &Value) -> Option<(SQInteger, Value, Value)> {
         let idx = translate_index(refpos) as SQInteger;
         if idx < self.len() {
             Some((
                 idx + 1,
                 Value::Integer(idx),
-                Value::Integer(self.val[idx as usize] as SQUnsignedInteger as SQInteger),
+                Value::Integer(self.val[idx as usize] as i8 as SQInteger),
             ))
         } else {
             None
