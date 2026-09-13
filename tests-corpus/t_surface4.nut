@@ -1,4 +1,7 @@
 // 广度语料 4：继承元方法 / 字符串转义 / 脚本继承内建类 / 杂项语义
+// const 只在顶层合法，且初值必须是字面量（`const C = 1 + 2;` 两边都报 end of statement expected）
+const TOP_CONST = 3;
+
 function t(tag, f) {
     try { print(tag + "=" + f() + "\n"); }
     catch (e) { print(tag + "!" + e + "\n"); }
@@ -81,9 +84,19 @@ t("ident_dollar", function() { local _a1 = 1; return _a1; });
 t("escape_in_ident", function() { local a = 1; return a; });
 
 // ---- 脚本继承内建类 ----
-t("extends_blob", function() { class MyBlob extends blob {} return typeof MyBlob); });
-t("extends_stream", function() { class MyStream extends stream {} return typeof MyStream); });
-t("extends_array_err", function() { class MyArr extends array {} return "no"; });
+// 注意：`class X {} return ...` 必须换行或加分号（同行会被判 end of statement expected）
+t("extends_blob", function() {
+    class MyBlob extends blob {}
+    return typeof MyBlob;
+});
+t("extends_stream", function() {
+    class MyStream extends stream {}
+    return typeof MyStream;
+});
+t("extends_array_err", function() {
+    class MyArr extends array {}
+    return "no";
+});
 t("blob_subclass_use", function() {
     class B extends blob { }
     local b = B(4);
@@ -108,7 +121,8 @@ t("file_subclass_use", function() {
 // ---- 杂项语义 ----
 t("switch_int", function() { local x = 2; switch (x) { case 1: return "one"; case 2: return "two"; default: return "def"; } });
 t("switch_str", function() { local x = "b"; switch (x) { case "a": return "A"; case "b": return "B"; } return "none"; });
-t("switch_default_first", function() { switch (9) { default: return "d"; case 1: return "one"; } });
+t("switch_default_first", function() { switch (9) { default: return "d"; } });
+t("switch_fallthrough", function() { local s = ""; switch (2) { case 1: s += "1"; break; case 2: s += "2"; default: s += "d"; } return s; });
 t("ternary_nested", function() { return 1 ? (2 ? "a" : "b") : "c"; });
 t("logical_short", function() { local n = 0; local f = function() { n++; return true; }; local r = false && f(); local r2 = true || f(); return n; });
 t("comma_expr", function() { local a = (1, 2, 3); return a; });
@@ -122,8 +136,11 @@ t("closure_getinfos", function() { local f = function(a, b) {}; local i = f.geti
 t("native_getinfos", function() { local i = print.getinfos(); return i.native + "/" + i.name; });
 t("enumerate_negative", function() { enum E { A = -1, B = 1 }; return E.A + "/" + E.B; });
 t("enum_auto", function() { enum E2 { A, B, C }; return E2.A + E2.B + E2.C; });
-t("const_expr", function() { const C = 1 + 2; return C; });
-t("rawcall", function() { local f = function() { return 1; }; return f.rawcall(); });
+// const 只能出现在顶层（函数体内声明 const 两边都报 end of statement expected）
+t("const_expr", function() { return TOP_CONST; });
+// rawcall 是关键字：语法是 rawcall(callee, this, args...)，不能写成 f.rawcall()
+t("rawcall", function() { local f = function(a, b) { return a + b; }; return rawcall(f, this, 1, 2); });
+t("rawcall_native", function() { local s = ""; return rawcall(function() { return 1; }, this); });
 t("if_no_braces", function() { if (true) return 1; else return 2; });
 t("while_break", function() { local i = 0; while (true) { i++; if (i > 3) break; } return i; });
 t("do_while", function() { local i = 0; do { i++; } while (i < 3); return i; });

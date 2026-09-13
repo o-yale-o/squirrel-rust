@@ -89,8 +89,9 @@ t("closure_roundtrip", function() {
     return g(6, 7);
 });
 t("closure_roundtrip_closure_env", function() {
-    local base = 100;
-    local f = function(a) { return base + a; };
+    // 注意：base 是关键字，不能作标识符（两边都会报 "expected '.'"）
+    local captured = 100;
+    local f = function(a) { return captured + a; };
     writeclosuretofile("robust_surface2.cnut", f);
     local g = loadfile("robust_surface2.cnut");
     remove("robust_surface2.cnut");

@@ -9,11 +9,14 @@
 | 验证项 | 复现命令 | 实测结果 |
 |---|---|---|
 | 官方 samples 差分（stdout + stderr + 退出码） | `python tools/diff_test.py` | **17/17 一致** |
-| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **40/40 一致** |
+| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **47/47 一致** |
 | REPL 交互会话差分 | `python tools/repl_diff.py` | **5/5 一致** |
 | `.cnut` 字节级一致 | 双方 `-o out -c x.nut` 后比对 SHA256 | **17/17 一致** |
 | `.cnut` 双向互通 | C++ 编译→Rust 执行 / Rust 编译→C++ 执行 | **17/17 一致** |
-| 单元 + 集成测试 | `cargo test` | **50/50 通过**（33 单元 + 1 dump + 16 集成） |
+| 指令覆盖 | `cargo test --test opcode_coverage` | **61/61 条指令被语料覆盖** |
+| 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` | **4/4 通过**，输出与 C++ minimal.c 一致 |
+| 委托表成员 | `python tools/audit_delegates.py` | **10 张表 88 个成员全一致** |
+| 单元 + 集成 + 健壮性测试 | `cargo test` | **68/68 通过** |
 | 全局环境覆盖 | `getroottable()` 快照对比 | root 表 **77 个名字逐字一致** |
 | 原生错误消息文本 | 15 条参数/类型错误对拍 | **15/15 逐字一致** |
 | CLI 保真 | `-v` / `-h` / 编译错误消息 / `-o` 必须前置的怪癖 / 退出码 | 与原版一致 |
@@ -153,6 +156,34 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 > 顺带发现：参考实现自己也会**写 NULL 崩溃**——`regexp("")` 触发 Windows 崩溃框
 > （不是死循环，是模态框让子进程看起来卡住）。本实现对该输入报可捕获的
 > `letter expected`，并不把这条 UB 复刻进语料。
+
+## 三·补2、验收标准补齐（宿主 API / 指令覆盖 / 委托表）
+
+| 计划书验收项 | 现状 |
+|---|---|
+| #5 用 Rust 宿主 API 复刻 `etc/minimal.c` 嵌入示例 | ✅ `crates/squirrel-stdlib/examples/minimal.rs`（输出与 C++ 版一致：`Called foo(), i=1, f=2.5, s='teststring'`）+ `crates/squirrel-stdlib/tests/host_api.rs`（4 个测试：注册 native、宿主调脚本取返回值、dofile 后按名调用、错误路径与调用栈、全局读写、从宿主构造类并调方法）。为此给 `api.rs` 补了 `get_global/set_global/register_native/call` |
+| 61 条指令被差分语料覆盖 | ✅ `crates/squirrel/tests/opcode_coverage.rs` 统计语料+samples 的指令直方图，**61/61**；新增 `tests-corpus/t_ops.nut`（本地/字段/数组元素/全局的自增自减、`!`、位运算、复合赋值、三目、`in`、`delete`、`clone`、`instanceof`）补齐原本缺失的 `Inc/PInc/Not` |
+| 默认委托表成员审计 | ✅ `tools/audit_delegates.py`：C++ 的 10 张 `_*_default_delegate_funcz` 与 Rust 的 `fill_*_ddel` 逐项对比，**88 个成员 + nparamscheck + 掩码全部一致** |
+
+**这一轮最有价值的发现是测试方法本身的漏洞**：`diff_test.py` 原本只比 stdout/stderr/退出码，
+而**两边报同一个编译错误时完全一致 → 假绿**。我新写的 5 个广度语料里有 4 个其实根本没编译通过
+（`{ b <- 2 }`、`local base`、`class X {} return` 同行、`const` 在函数内、`x &= 1`、
+`f.rawcall()`、`-8 >>> 1`、裸枚举名……全是 Squirrel 不接受、两边报同样错误的写法），
+于是"PASS"了一整轮却什么都没测到。现在：
+
+- `diff_test.py` 对 `Error [ ...` 开头的输出判 **SUSPECT 失败**（可白名单）；
+- `tools/lint_corpus.py` 扫语法陷阱 + 逐个试编译；
+- `opcode_coverage.rs` 顺带把"编译失败的文件"列出来。
+
+修好语法后立刻暴露了两个被掩盖的真问题（都已修）：
+1. **`o.setdelegate(o)` 让 Rust 侧 panic**（`RefCell already mutably borrowed`，rc=101）——
+   环检测的 `this_identity` 用了内部结构体地址、与遍历时的 `Rc::as_ptr` 不一致，且 `borrow()`
+   撞上调用方持有的 `borrow_mut`。改为身份统一用 `Rc::as_ptr` + 遍历用 `try_borrow`
+   （借用失败等价于 C++ 的 `temp == this`，判环返回 false）。
+2. **委托环错误文本**：参考是 `delegate cycle`（非表 this / 非表非空参数是 `unexpected type X`）。
+3. **含 NUL 字符串的打印**：C++ 的 `_printfunc(v,"%s",str)` 在第一个 NUL 处截断
+   （`print((0).tochar())` 整行不输出），Rust 侧原来把 NUL 也写出去 → 现在 `print/error/printf`
+   都按 `%s` 语义截断。
 
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 

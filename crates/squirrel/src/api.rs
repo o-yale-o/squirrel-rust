@@ -3,7 +3,10 @@
 //! C++ 的 sq_open/sq_compile/sq_call 对应：
 //! - `Vm::new(stacksize)`：创建 VM（含 SharedState、root table、base 库）
 //! - `Vm::compile_buffer(src, name)`：编译为闭包
-//! - `Vm::call(&closure, args)`：以 root table 为 this 调用
+//! - `Vm::call(&closure, this, &args)`：带 this 调用（↔ sq_call）
+//! - `Vm::get_global(name)` / `Vm::register_native(name, f, …)`：读写全局符号
+//!
+//! 典型嵌入流程见 `crates/squirrel-stdlib/examples/minimal.rs`（原版 `etc/minimal.c` 的移植）。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -79,6 +82,85 @@ impl Vm {
                 Ok(Value::Closure(clo))
             }
             Err(()) => Err(()),
+        }
+    }
+
+    /// ↔ sq_pushroottable + sq_pushstring + sq_get：从 root table 取全局符号
+    pub fn get_global(&self, name: &str) -> Option<Value> {
+        let v = self.rc.borrow();
+        let key = v.ss.intern(name.as_bytes());
+        match &v.roottable {
+            Value::Table(t) => t.borrow().get(&key),
+            _ => None,
+        }
+    }
+
+    /// ↔ sq_pushroottable + sq_newslot：注册全局符号（宿主注册原生函数用）
+    pub fn set_global(&self, name: &str, value: Value) {
+        let v = self.rc.borrow();
+        let key = v.ss.intern(name.as_bytes());
+        if let Value::Table(t) = &v.roottable {
+            t.borrow_mut().new_slot(&key, &value);
+        }
+    }
+
+    /// ↔ sq_newclosure + sq_setparamscheck + sq_setnativeclosurename：注册原生函数到全局
+    ///
+    /// `nparamscheck` 含 `this`（与 C++ 一致）：例如「1 个参数」的全局原生函数写 2；
+    /// `typemask` 的首个 `.` 是 `this` 的占位，例如 `".n"`。
+    pub fn register_native(
+        &self,
+        name: &str,
+        f: crate::closure::NativeFn,
+        nparamscheck: SQInteger,
+        typemask: Option<&str>,
+    ) {
+        let v = self.rc.borrow();
+        let nc = crate::closure::SQNativeClosure::create(&v.ss, f, 0);
+        {
+            let mut n = nc.borrow_mut();
+            n.nparamscheck = nparamscheck;
+            n.name = v.ss.intern(name.as_bytes());
+            if let Some(tm) = typemask {
+                crate::state::compile_typemask(&mut n.typecheck, tm.as_bytes());
+            }
+        }
+        self.set_global(name, Value::NativeClosure(nc));
+    }
+
+    /// ↔ sq_call：以 `this` 调用一个可调用值（闭包 / 原生闭包 / 类构造）
+    ///
+    /// 与 `call_top` 的区别是这里自己压栈、自己收尾，宿主不必手工维护栈布局。
+    pub fn call(
+        &self,
+        f: &Value,
+        this: Value,
+        args: &[Value],
+        raiseerror: bool,
+    ) -> Result<Value, Value> {
+        let mut v = self.rc.borrow_mut();
+        let oldtop = v.top;
+        v.push(f.clone());
+        v.push(this);
+        for a in args {
+            v.push(a.clone());
+        }
+        let nparams = args.len() as SQInteger + 1;
+        let base = v.top - nparams;
+        let mut out = Value::Null;
+        let r = crate::vm::execute(
+            &mut v,
+            f,
+            nparams,
+            base,
+            &mut out,
+            raiseerror,
+            ExecutionType::Call,
+        );
+        v.top = oldtop;
+        match r {
+            Ok(()) => Ok(out),
+            Err(e) => Err(e),
         }
     }
 

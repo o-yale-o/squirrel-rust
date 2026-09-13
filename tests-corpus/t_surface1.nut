@@ -96,7 +96,7 @@ t("tbl_filter", function() { local o = { a = 1, b = 2 }; local r = o.filter(func
 t("tbl_map", function() { local o = { a = 1 }; local r = o.map(function(k,v){ return v * 2; }); return r.a; });
 t("tbl_setdelegate", function() { local p = { x = 1 }; local c = {}; c.setdelegate(p); return c.x; });
 t("tbl_delegate_cycle", function() { local o = {}; o.setdelegate(o); return "ok"; });
-t("tbl_nested_newslot", function() { local o = {}; o.a <- { b <- 2 }; return o.a.b; });
+t("tbl_nested_newslot", function() { local o = {}; o.a <- { b = 2 }; return o.a.b; });
 t("tbl_len_after_set", function() { local o = {}; o.a <- 1; o.a = 2; return o.len(); });
 
 // ---- 字符串边界 ----

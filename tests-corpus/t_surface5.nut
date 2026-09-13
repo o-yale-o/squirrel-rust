@@ -116,8 +116,9 @@ t("static_after_instance", function() {
     return a.s;
 });
 t("enumerate_enum_typeof", function() {
-    enum E { X }
-    return typeof E + ":" + typeof E.X;
+    // 枚举名只能以 `E.MEMBER` 形式出现：裸写 `E` 两边都报 "expected '.'"
+    enum E { X, Y = 5 }
+    return E.X + ":" + E.Y + ":" + typeof E.X;
 });
 t("weakref_after_clone", function() { local o = { a = 1 }; local c = clone o; local w = o.weakref(); o = null; collectgarbage(); return typeof w.ref(); });
 t("array_nested_deep_tostring", function() { local a = [1, [2, [3, [4]]]]; return "" + a.len(); });

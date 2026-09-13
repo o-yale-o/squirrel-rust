@@ -772,9 +772,12 @@ fn string_format_impl(v: &mut VmData, push_result: bool) -> Option<()> {
         let s = v.ss.intern(&out);
         v.push(s);
     } else {
-        // printf：走 printfunc
+        // printf：走 printfunc（↔ _printfunc(v, "%s", dest)，同样在 NUL 处截断）
         if let Some(pf) = v.ss.printfunc.borrow().clone() {
-            pf(v, &String::from_utf8_lossy(&out));
+            pf(
+                v,
+                &String::from_utf8_lossy(squirrel::baselib::c_string_prefix(&out)),
+            );
         }
     }
     Some(())
@@ -1055,6 +1058,25 @@ fn string_or(v: &Value, default: &str) -> String {
         Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
         _ => default.to_string(),
     }
+}
+
+/// ↔ sqstd_dofile：加载脚本文件并以 root table 为 this 执行（宿主嵌入用）
+///
+/// `printerror` 即 C++ 的 raiseerror：为真时编译错误走 compilererrorhandler。
+pub fn run_file(vm: &squirrel::api::Vm, path: &str, printerror: bool) -> Result<Value, String> {
+    let clo = {
+        let mut v = vm.data_mut();
+        match sqstd_load_file(&mut v, path, printerror) {
+            Ok(()) => v.pop_get(),
+            Err(()) => {
+                let e = v.lasterror.clone();
+                return Err(squirrel::api::value_to_error_string(&e));
+            }
+        }
+    };
+    let this = vm.data().roottable.clone();
+    vm.call(&clo, this, &[], true)
+        .map_err(|e| squirrel::api::value_to_error_string(&e))
 }
 
 /// 注册全部标准库（sq.c 的调用顺序）

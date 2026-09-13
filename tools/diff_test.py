@@ -28,6 +28,19 @@ def norm(b):
     return re.sub(rb"0x[0-9a-fA-F]+", b"0xPTR", b)
 
 
+def load_failed(out):
+    """CLI 的「加载/编译失败」路径：stdout 以 Error [ 开头。
+
+    两边报同一个编译错误时，stdout/stderr 完全一致 —— 但如果用例本意是跑语义，
+    这其实是**假绿**（什么都没测到）。除白名单外一律判失败。
+    """
+    return out.lstrip().startswith(b"Error [")
+
+
+# 允许「故意加载失败」的用例（目前没有）
+EXPECT_LOAD_FAILURE = set()
+
+
 def main(paths, check_stderr=True):
     npass = nfail = 0
     for path in paths:
@@ -36,12 +49,17 @@ def main(paths, check_stderr=True):
         same = norm(out_r) == norm(out_u) and rc_r == rc_u
         if check_stderr:
             same = same and norm(err_r) == norm(err_u)
+        name = os.path.basename(path)
+        if same and load_failed(norm(out_r)) and name not in EXPECT_LOAD_FAILURE:
+            same = False
+            print("SUSPECT %s：脚本本身编译/加载失败（未测到语义）" % name)
+            print("  output: %r" % norm(out_r)[:200])
         if same:
             npass += 1
-            print("PASS %s" % os.path.basename(path))
+            print("PASS %s" % name)
         else:
             nfail += 1
-            print("FAIL %s (rc %d vs %d)" % (os.path.basename(path), rc_r, rc_u))
+            print("FAIL %s (rc %d vs %d)" % (name, rc_r, rc_u))
             if norm(out_r) != norm(out_u):
                 print("  stdout ref : %r" % norm(out_r)[:300])
                 print("  stdout rust: %r" % norm(out_u)[:300])

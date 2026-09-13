@@ -294,12 +294,21 @@ fn set_debug_hook(v: &mut VmData, hook: Value) {
     }
 }
 
+/// ↔ `_printfunc(v, "%s", str)`：C 的 `%s` 在第一个 NUL 处截断。
+/// 例如 `print((0).tochar())` 在原版里什么都不输出（整行都被截掉），必须一致。
+pub fn c_string_prefix(s: &[u8]) -> &[u8] {
+    match s.iter().position(|b| *b == 0) {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
 fn base_print(v: &mut VmData) -> NativeResult {
     let o = v.stack_get(2);
     match v.to_string_value(&o) {
         Ok(s) => {
             if let Some(pf) = v.ss.printfunc.borrow().clone() {
-                pf(v, &String::from_utf8_lossy(s.as_bytes()));
+                pf(v, &String::from_utf8_lossy(c_string_prefix(s.as_bytes())));
             }
             ok0()
         }
@@ -312,7 +321,7 @@ fn base_error(v: &mut VmData) -> NativeResult {
     match v.to_string_value(&o) {
         Ok(s) => {
             if let Some(ef) = v.ss.errorfunc.borrow().clone() {
-                ef(v, &String::from_utf8_lossy(s.as_bytes()));
+                ef(v, &String::from_utf8_lossy(c_string_prefix(s.as_bytes())));
             }
             ok0()
         }
@@ -840,22 +849,41 @@ fn container_rawexists(v: &mut VmData) -> NativeResult {
     1
 }
 
+/// ↔ sq_setdelegate + table_setdelegate：
+/// table + table → 环检测失败报 "delegate cycle"；table + null → 清除委托；
+/// 其它组合 → "unexpected type <类型名>"。
 fn table_setdelegate(v: &mut VmData) -> NativeResult {
     let self_ = v.get_up(-2);
     let mt = v.pop_get();
-    if let Value::Table(t) = &self_ {
-        let ok = t.borrow_mut().set_delegate(match &mt {
-            Value::Table(d) => Some(d.clone()),
-            _ => None,
-        });
-        if !ok {
-            return throw_error(v, "del cycle into a native delegate");
+    match &self_ {
+        Value::Table(t) => match &mt {
+            Value::Table(d) => {
+                // 身份用 RefCell 分配地址（与 Value::identity() 一致），
+                // 这样自环/间接环的检测才和 C++ 的指针比较等价
+                let identity = std::rc::Rc::as_ptr(t) as usize;
+                let ok = {
+                    let mut tb = t.borrow_mut();
+                    crate::object::set_delegate_checked(&mut tb.delegate, identity, Some(d.clone()))
+                };
+                if !ok {
+                    return throw_error(v, "delegate cycle");
+                }
+            }
+            Value::Null => {
+                t.borrow_mut().delegate = None;
+            }
+            other => {
+                let name = crate::object::get_type_name(other).unwrap_or("unknown");
+                return throw_error(v, &format!("unexpected type {}", name));
+            }
+        },
+        other => {
+            let name = crate::object::get_type_name(other).unwrap_or("unknown");
+            return throw_error(v, &format!("unexpected type {}", name));
         }
-        v.push(self_);
-        1
-    } else {
-        throw_error(v, "invalid object")
     }
+    v.push(self_);
+    1
 }
 
 fn table_getdelegate(v: &mut VmData) -> NativeResult {

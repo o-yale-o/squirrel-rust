@@ -414,6 +414,10 @@ pub fn get_type_name(obj: &Value) -> Option<&'static str> {
 
 /// ↔ SQDelegable::SetDelegate 的环检测（sqobject.cpp:120-132）。
 /// 委托是强引用。
+///
+/// `this_identity` 必须是该对象在身份体系里的地址（表用 `Rc::as_ptr`）。
+/// 遍历用 `try_borrow`：调用方通常正持有自身的 `borrow_mut`，这时借用失败
+/// 恰好等价于 C++ 的 `temp == this`（自环）→ 直接判环返回 false，绝不 panic。
 pub fn set_delegate_checked(
     current: &mut Option<TableRef>,
     this_identity: usize,
@@ -427,7 +431,11 @@ pub fn set_delegate_checked(
     }
     loop {
         let next = match &temp {
-            Some(t) => t.borrow().delegate.clone(),
+            Some(t) => match t.try_borrow() {
+                Ok(tb) => tb.delegate.clone(),
+                // 正在被可变借用 = 就是调用方自己 → 成环
+                Err(_) => return false,
+            },
             None => break,
         };
         match next {
