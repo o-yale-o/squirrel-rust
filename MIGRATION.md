@@ -121,6 +121,7 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `array(size, fill?)` | `size` 走 `tointeger` 截断（`array(2.9)` 长度 2、`array(0.5)` 空）；多余实参忽略；`array` 没有 `getclass` |
 | 非引用类型的 `weakref()` 返回**自身** | `(5).weakref()` 还是 `5`（`type()` 给 `integer`）；只有 table/array/… 才真给 weakref |
 | `dummy(...)` 不做参数个数检查 | 它是 `nparams=0`，`dummy(1,2,3,…)` 恒返回 `null` |
+| **更新流（`"wb+"`）写入后必须先定位再读** | C 标准（C11 7.21.5.3）规定更新流"输出后不能直接输入"，中间必须有 `fflush` 或文件定位调用；少了这一步就是 UB —— **实测参考实现会给出"读越界却把文件撑大"的怪行为**（4 字节文件 `readn('l')` 之后 `len()` 变 12，而且同一段代码只因"读完后是否调用 `len()`"就一个报错一个成功）。本实现在这种序列上给确定行为（`io error`），但**不要依赖任何一侧**：写脚本时老老实实 `seek` 或 `flush` |
 
 ## 5. 迁移检查清单
 
