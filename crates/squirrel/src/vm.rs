@@ -100,6 +100,38 @@ macro_rules! throw {
     };
 }
 
+/// ↔ C 的 `fmod`（参考实现走 UCRT 的 `fmod((double)f1,(double)f2)`）。
+///
+/// 正常输入与 Rust 的 `%` 完全一致（fmod 是精确运算），但**异常输入上的 NaN 符号位**
+/// 不同：Rust 的 `%` 会把 `x % 0` 算成负 NaN，UCRT 给的是正 NaN。逐条对齐实测结果
+/// （`tools/probes/nan_probe.nut` 覆盖 ±0/±1/2.5/±inf/nan 全组合，两引擎逐行一致）：
+///
+/// | 输入 | 参考实现 |
+/// |---|---|
+/// | `x` 是 NaN 或 `y` 是 NaN | 原样传播该 NaN（本实现里的 NaN 都是 `-nan(ind)`） |
+/// | `x` 是 ±inf | NaN，符号跟 `x`（`+inf → nan`、`-inf → -nan(ind)`） |
+/// | `y` 是 ±0（`x` 有限） | `nan`，与 `x` 的符号无关 |
+/// | 其它 | 普通 fmod |
+pub fn sq_fmod(x: SQFloat, y: SQFloat) -> SQFloat {
+    if x.is_nan() {
+        return x;
+    }
+    if y.is_nan() {
+        return y;
+    }
+    if x.is_infinite() {
+        return if x.is_sign_negative() {
+            -SQFloat::NAN
+        } else {
+            SQFloat::NAN
+        };
+    }
+    if y == 0.0 {
+        return SQFloat::NAN;
+    }
+    (x as f64 % y as f64) as SQFloat
+}
+
 /// ↔ SQVM::SQVM
 impl VmData {
     pub fn new(ss: Rc<SharedState>, stacksize: SQInteger) -> VmData {
@@ -370,7 +402,7 @@ impl VmData {
                     b'-' => f1 - f2,
                     b'/' => f1 / f2,
                     b'*' => f1 * f2,
-                    b'%' => (f1 as f64 % f2 as f64) as SQFloat,
+                    b'%' => sq_fmod(f1, f2),
                     _ => 0x0f as SQFloat,
                 };
                 Ok(Value::Float(res))
@@ -509,6 +541,11 @@ impl VmData {
                 }
                 OT_INTEGER => return Ok(if o1.as_integer() < o2.as_integer() { -1 } else { 1 }),
                 OT_FLOAT => return Ok(if o1.as_float() < o2.as_float() { -1 } else { 1 }),
+                OT_BOOL => {
+                    // ↔ ObjCmp 的 default 分支：`_userpointer(o)` 读的是 union 里的整数，
+                    // 布尔就是 0/1，于是 false < true 恒成立（不是身份地址比较）
+                    return Ok(if o1.as_integer() < o2.as_integer() { -1 } else { 1 });
+                }
                 OT_TABLE | OT_USERDATA | OT_INSTANCE => {
                     if let Some(closure) = self.get_meta_method_of(o1, 10 /*MT_CMP*/) {
                         self.push(o1.clone());
@@ -1658,13 +1695,26 @@ impl VmData {
                 };
                 match otype {
                     crate::funcproto::SQOuterType::OtLocal => {
+                        // ↔ CLOSURE_OP：otLOCAL 的 src 是栈槽偏移。畸形/外部字节码里
+                        // 它可能越界，必须先查范围再索引（否则宿主进程直接 abort）
+                        if src < 0 || self.stackbase + src >= self.stack.len() as SQInteger {
+                            self.raise_error_str("invalid outer value index");
+                            throw!(self)
+                        }
                         let otr = self.find_outer((self.stackbase + src) as usize);
                         closure.borrow_mut().outervalues[i] = Value::Outer(otr);
                     }
                     crate::funcproto::SQOuterType::OtOuter => {
                         let cur = self.last_callinfo().closure.clone();
                         if let Value::Closure(c) = &cur {
-                            let v = c.borrow().outervalues[src as usize].clone();
+                            // 同上：当前闭包的 outervalues 长度可能小于 src
+                            let v = match c.borrow().outervalues.get(src as usize) {
+                                Some(v) => v.clone(),
+                                None => {
+                                    self.raise_error_str("invalid outer value index");
+                                    throw!(self)
+                                }
+                            };
                             closure.borrow_mut().outervalues[i] = v;
                         }
                     }
@@ -1675,11 +1725,20 @@ impl VmData {
         if ndefparams > 0 {
             for i in 0..ndefparams {
                 let spos = func.defaultparams[i];
+                // 默认参数槽同样来自字节码，先查范围
+                if spos < 0 || self.stackbase + spos >= self.stack.len() as SQInteger {
+                    self.raise_error_str("invalid default parameter index");
+                    throw!(self)
+                }
                 let v = self.stack[(self.stackbase + spos) as usize].clone();
                 closure.borrow_mut().defaultparams[i] = v;
             }
         }
         if boundtarget != 0xFF {
+            if boundtarget < 0 || self.stackbase + boundtarget >= self.stack.len() as SQInteger {
+                self.raise_error_str("invalid bind target");
+                throw!(self)
+            }
             let val = self.stack[(self.stackbase + boundtarget) as usize].clone();
             let t = val.type_();
             if matches!(t, x if x == OT_TABLE || x == OT_CLASS || x == OT_INSTANCE || x == OT_ARRAY)
@@ -1808,7 +1867,15 @@ impl VmData {
                     if itr.is_null() {
                         return Ok(exitpos);
                     }
-                    let v = self.get_value(o1, &itr, 0, DONT_FALL_BACK)?;
+                    // ↔ FOREACH_OP：取不到值时**覆盖**成 _nexti 的错误（参考实现先
+                    // Raise_IdxError 再 Raise_Error("_nexti returned an invalid idx")）
+                    let v = match self.get_value(o1, &itr, 0, DONT_FALL_BACK) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            self.raise_error_str("_nexti returned an invalid idx");
+                            throw!(self)
+                        }
+                    };
                     self.stk_set(o3_idx, v);
                     Ok(1)
                 } else {
@@ -2880,4 +2947,31 @@ pub fn execute_resume(
     et: ExecutionType,
 ) -> bool {
     execute_inner(vm, vm_rc, &Value::Null, 0, 0, outres, true, et).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sq_fmod;
+
+    /// ↔ UCRT mod 的 NaN 符号位（实测见 tools/probes/nan_probe.nut 全组合）
+    #[test]
+    fn fmod_matches_msvc_nan_signs() {
+        // x % 0（x 有限）→ 正 NaN，与 x 的符号无关
+        assert_eq!(sq_fmod(1.0, 0.0).to_bits(), f32::NAN.to_bits());
+        assert_eq!(sq_fmod(-1.0, 0.0).to_bits(), f32::NAN.to_bits());
+        assert_eq!(sq_fmod(-0.0, 0.0).to_bits(), f32::NAN.to_bits());
+        // x 是 inf → NaN，符号跟 x
+        assert_eq!(sq_fmod(f32::INFINITY, 1.0).to_bits(), f32::NAN.to_bits());
+        let n = sq_fmod(f32::NEG_INFINITY, 1.0);
+        assert!(n.is_nan() && n.is_sign_negative());
+        // NaN 操作数原样传播
+        let q = f32::from_bits(0xFFC0_0000);
+        assert_eq!(sq_fmod(q, 1.0).to_bits(), q.to_bits());
+        assert_eq!(sq_fmod(1.0, q).to_bits(), q.to_bits());
+        // 正常值仍然是普通 fmod
+        assert_eq!(sq_fmod(7.0, 2.0), 1.0);
+        assert_eq!(sq_fmod(-7.0, 2.0), -1.0);
+        assert_eq!(sq_fmod(0.0, 2.0), 0.0);
+        assert_eq!(sq_fmod(-0.0, 2.0).to_bits(), (-0.0f32).to_bits());
+    }
 }

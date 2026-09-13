@@ -327,7 +327,7 @@ fn base_print(v: &mut VmData) -> NativeResult {
     match v.to_string_value(&o) {
         Ok(s) => {
             if let Some(pf) = v.ss.printfunc.borrow().clone() {
-                pf(v, &String::from_utf8_lossy(c_string_prefix(s.as_bytes())));
+                pf(v, c_string_prefix(s.as_bytes()));
             }
             ok0()
         }
@@ -340,7 +340,7 @@ fn base_error(v: &mut VmData) -> NativeResult {
     match v.to_string_value(&o) {
         Ok(s) => {
             if let Some(ef) = v.ss.errorfunc.borrow().clone() {
-                ef(v, &String::from_utf8_lossy(c_string_prefix(s.as_bytes())));
+                ef(v, c_string_prefix(s.as_bytes()));
             }
             ok0()
         }

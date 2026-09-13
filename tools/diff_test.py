@@ -25,7 +25,9 @@ def run_one(exe, path, timeout=10):
 
 def norm(b):
     b = b.replace(b"\r\n", b"\n")  # CRT stdout/stderr 文本模式翻译，非语言语义
-    return re.sub(rb"0x[0-9a-fA-F]+", b"0xPTR", b)
+    # 只把**指针**归一化：至少 8 位十六进制。早先写成 0x[0-9a-fA-F]+ 会把
+    # `format("%#x", 1)` 这类正常输出也吃掉（0x1 → 0xPTR），等于掩盖差异。
+    return re.sub(rb"0x[0-9a-fA-F]{8,}", b"0xPTR", b)
 
 
 def load_failed(out):

@@ -50,7 +50,11 @@ pub const MM_NAMES: [&str; 18] = [
 /// ↔ SQCOMPILERERROR
 pub type CompilerErrorHandler = Rc<dyn Fn(&VmData, &str, &str, SQInteger, SQInteger)>;
 /// ↔ SQPRINTFUNCTION（宿主已格式化好的文本）
-pub type PrintFn = Rc<dyn Fn(&VmData, &str)>;
+///
+/// 参数是**字节切片**而不是 `&str`：参考实现是非 UNICODE 的 `char` 构建，
+/// `print((255).tochar())` 写出的是裸字节 0xFF；如果这里用 `&str`，
+/// 所有宿主都被迫走 `from_utf8_lossy`，非法 UTF-8 会被换成 U+FFFD（实测差异）。
+pub type PrintFn = Rc<dyn Fn(&VmData, &[u8])>;
 /// ↔ SQDEBUGHOOK
 pub type DebugHookFn = Rc<dyn Fn(&VmData, SQInteger, &str, SQInteger, &str)>;
 

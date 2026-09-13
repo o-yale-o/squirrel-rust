@@ -24,8 +24,12 @@ fn make_vm() -> (Vm, Rc<Sink>) {
         let o = sink.clone();
         let e = sink.clone();
         vm.set_print_funcs(
-            Some(Rc::new(move |_v, s| o.out.borrow_mut().push_str(s))),
-            Some(Rc::new(move |_v, s| e.err.borrow_mut().push_str(s))),
+            Some(Rc::new(move |_v, s: &[u8]| {
+                o.out.borrow_mut().push_str(&String::from_utf8_lossy(s))
+            })),
+            Some(Rc::new(move |_v, s: &[u8]| {
+                e.err.borrow_mut().push_str(&String::from_utf8_lossy(s))
+            })),
         );
     }
     squirrel_stdlib::register_all(&mut vm.data_mut());
@@ -36,6 +40,29 @@ fn make_vm() -> (Vm, Rc<Sink>) {
 fn intern(vm: &Vm, s: &str) -> Value {
     let v = vm.data();
     v.ss.intern(s.as_bytes())
+}
+
+/// print/format 必须**原样写出非 UTF-8 字节**：参考实现是非 UNICODE 的 `char` 构建，
+/// `print((255).tochar())` 写出的就是单个字节 0xFF（不是 UTF-8 的 U+FFFD）。
+#[test]
+fn print_writes_raw_bytes() {
+    let vm = Vm::new(1024);
+    let sink: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let s = sink.clone();
+        vm.set_print_funcs(
+            Some(Rc::new(move |_v, b: &[u8]| s.borrow_mut().extend_from_slice(b))),
+            None,
+        );
+    }
+    squirrel_stdlib::register_all(&mut vm.data_mut());
+    // (255).tochar() 得到单字节 0xFF；format("%c", 255) 同样
+    vm.run_buffer(
+        b"print((255).tochar()); print(format(\"%c\", 255)); print(\"A\\xffB\");",
+        b"raw.nut",
+    )
+    .expect("script failed");
+    assert_eq!(&*sink.borrow(), &[0xFF, 0xFF, b'A', 0xFF, b'B']);
 }
 
 /// ↔ minimal.c：注册原生函数 → 脚本调用它 → 宿主读回结果

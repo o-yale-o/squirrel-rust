@@ -105,6 +105,24 @@ fn adversarial_native_calls_do_not_panic() {
         t(function() { format("%", 1); });
         t(function() { format("%q", 1); });
         t(function() { format(null, 1); });
+        // 整型最小值：`abs()` 会溢出（release 得到 "--9223372036854775808"，debug 直接 panic）
+        t(function() { format("%d", -9223372036854775807 - 1); });
+        t(function() { format("%x", -9223372036854775807 - 1); });
+        t(function() { format("%u", -9223372036854775807 - 1); });
+        t(function() { format("%+d", -9223372036854775807 - 1); });
+        // 精度/宽度/标志的边界组合
+        t(function() { format("%.99f", 1.5); });
+        t(function() { format("%99.99f", 1.5); });
+        t(function() { format("%0f", 0.0/0.0); });
+        t(function() { format("%-+ #0.3f", 1.5); });
+        t(function() { format("%#.0f", 1.0/0.0); });
+        t(function() { format("%#.0f", 0.0/0.0); });
+        t(function() { format("%c", 1.0e300); });
+        t(function() { format("%d", 1.0e300); });
+        t(function() { format("%d", 0.0/0.0); });
+        t(function() { format("%.5x", -1); });
+        t(function() { format("%#o", -1); });
+        t(function() { format("%++++++++++++++++++d", 1); });
         t(function() { split("abc", ""); });
         t(function() { split(null, null); });
         t(function() { escape(null); });

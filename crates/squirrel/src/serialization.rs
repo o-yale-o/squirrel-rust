@@ -313,7 +313,10 @@ fn proto_load_depth(
         return None;
     }
     for _ in 0..noutervalues {
-        let ty = r.i64()?;
+        // 参考实现这里写的是 `sizeof(SQUnsignedInteger)`（8 字节），但 _type 是
+        // 4 字节的枚举 → 高 4 字节是**未初始化内存**（实测同一脚本两次编译内容都不同）。
+        // 只有低 32 位有意义，必须掩码后再判断，否则 otLOCAL 会被读成 otOUTER。
+        let ty = r.i64()? as u64 as u32;
         let src = read_object(vm, r)?;
         let nm = read_object(vm, r)?;
         f.outervalues.push(SQOuterVar {

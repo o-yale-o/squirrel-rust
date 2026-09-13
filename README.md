@@ -11,11 +11,16 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 | 验证项 | 结果 |
 |---|---|
 | 官方 samples/ 全部 17 个脚本差分 | **17/17 一致** |
-| 自建边界语料 40 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **40/40 一致** |
+| 自建边界语料 **51** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **51/51 一致** |
+| 自动生成的组合矩阵：运算符 × 类型（3181 条）、metamethod（343 条）、格式串（1305 条） | **逐行一致** |
 | REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
-| `.cnut` 字节码：同一脚本双方 `-c` 输出 | **17/17 字节级完全一致** |
-| `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **17/17 通过** |
-| `cargo test`（单元 + 集成） | **50/50 通过** |
+| `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17 字节级一致**；语料 48/51（差额全部来自参考实现自己写入的**未初始化填充**，见 STATUS.md 第四节） |
+| `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **51/51 通过** |
+| `cargo test`（单元 + 集成 + 健壮性 + 字节码互通） | **72/72 通过** |
+
+> 「字节级一致」这条要小心理解：参考实现保存闭包的 outer 值时写 8 字节、字段只有 4 字节，
+> 高 4 字节是未初始化内存，**同一个脚本连编两次输出都不同**。本实现写确定的 0，
+> 其余字段逐字节相同（`tools/cnut_fields.py` 可逐字段核对）。
 
 ## 构建
 
@@ -28,10 +33,18 @@ cargo test                     # 单元 + 集成测试
 
 ```bash
 python tools/diff_test.py                       # 官方 samples
-python tools/diff_test.py tests-corpus          # 边界语料
+python tools/diff_test.py tests-corpus          # 边界语料 + 三张生成矩阵
 python tools/diff_test.py --no-stderr ...       # 只比 stdout（旧行为）
+python tools/line_diff.py tests-corpus/t_opmx.nut   # 大语料按行定位差异
 python tools/repl_diff.py                       # REPL 会话（tests-repl/*.txt）
+python tools/cnut_matrix.py tests-corpus        # .cnut 字节一致 + 双向交叉执行
+python tools/audit_globals.py                   # 全局注册（名字/参数个数/类型掩码）
+python tools/audit_delegates.py                 # 11 张默认委托表成员
+python tools/lint_corpus.py                     # 语料语法陷阱 + 逐个试编译
 ```
+
+三张矩阵语料由脚本生成，改语料请改生成器（`tools/gen_opmatrix.py`、
+`tools/gen_metaprobe.py`、`tools/gen_formatmx.py`）后重新生成。
 
 参考 C++ 二进制的构建（一次性）：
 
@@ -100,6 +113,11 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 ## 已复刻的 C++ 怪癖（差分测试覆盖）
 
 - `%` 除零**静默失败**（`_OP_MOD` 无 `_GUARD`，目标槽保持原值）；
+- `false < true` 恒成立（`ObjCmp` 对 bool 走指针分支，读的是 union 里的 0/1）；
+- `fmod` 在异常输入上的 NaN 符号（`x % 0` 给 `nan`、`-inf % y` 给 `-nan(ind)` 等，见 `vm::sq_fmod`）；
+- `format`/`printf`：MSVC 的整套标志语义，含 `%#g` 保留尾随零、`%#.0f` 遇 inf/nan 把小数点
+  插在第 2 个字符位置（`i.nf`）、`%o` 的 `#` 补前导 0、整型给精度时忽略 `0`、
+  inf/nan 忽略 `0`、宽度/精度各最多 2 位数字；
 - 表构造器内不允许匿名函数值（`{ f = function(){} }` 编译错误）；
 - 表内函数用 `function name(){}`；`base` 是关键字不能作标识符；
 - REPL 每行独立编译（`local` 不跨行）；`}` 出现在字符串里也会减少花括号计数；
@@ -107,7 +125,8 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 - `-o` 必须写在脚本路径之前，否则被当作脚本参数忽略；
 - 整数除法向零截断；`10/4 == 2`；float 打印走 CRT `%g` 语义；
 - `escape` 对 ≥0x80 的字节输出 32 位补码十六进制（`\xffffffe9`）；
-- `date` 的 `month`/`wday`/`yday` 沿用 `tm` 约定（0 基），`'u'` 走 gmtime。
+- `date` 的 `month`/`wday`/`yday` 沿用 `tm` 约定（0 基），`'u'` 走 gmtime；
+- `print` 按裸字节输出（非 UNICODE 构建），`%s`/`print` 在第一个 NUL 处截断。
 
 ## 已知限制
 
@@ -117,7 +136,10 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
   （实测脚本：`python tools/eos_diff.py`、`tools/stdin_diff.py`）；
 - 少数**参考实现自身越界/UB** 的场景取确定性行为（详见 `STATUS.md` 第四节）：
   `escape` 短字符串中的高位字节、`getstackinfos(-1)`、UCRT `date` 上界、
-  在已挂起的线程上再次 `call()`、REPL 读到 EOF、空正则模式（参考实现会写 NULL 崩溃）。
+  在已挂起的线程上再次 `call()`、REPL 读到 EOF、空正则模式（参考实现会写 NULL 崩溃）、
+  `.cnut` 里 outer 类型字段的高 4 字节（参考实现写的是未初始化内存）、
+  坏字节码里的越界 outer 索引（参考实现访问违例崩溃）、
+  `format` 规格串恰好 20 字符（参考实现栈溢出崩溃）。
 
 ## 健壮性约定（硬约束）
 
@@ -130,8 +152,9 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 
 | 测试 | 覆盖 |
 |---|---|
-| `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用、畸形 `.cnut`、畸形正则、深递归、深嵌套值释放、超深嵌套编译 |
+| `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用（含 `format` 的宽度/精度/标志/`INT64_MIN` 边界）、畸形 `.cnut`、畸形正则、深递归、深嵌套值释放、超深嵌套编译 |
+| `crates/squirrel-stdlib/tests/bytecode_interop.rs` | 直接执行**参考实现编译出来的** `.cnut`；夹具被改成越界 outer 索引时必须报可捕获错误（参考实现会访问违例崩溃） |
 | `crates/squirrel/tests/deep_release.rs` | 释放循环嵌套深度 ≤ 3（10 万层数组/表/闭包/生成器/线程，含 1MB 栈线程） |
 
 对应实现：`crates/squirrel/src/release.rs`（迭代式释放）、编译器嵌套/栈预算守卫、
-反序列化长度上界校验。
+反序列化长度上界校验、`CLOSURE_OP` 的 outer/默认参数槽范围检查。

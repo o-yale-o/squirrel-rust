@@ -11,9 +11,11 @@ fn run_script(src: &str) -> String {
         let o2 = out.clone();
         let o3 = out.clone();
         vm.set_print_funcs(
-            Some(Rc::new(move |_v, s| o2.borrow_mut().push_str(s))),
-            Some(Rc::new(move |_v, s| {
-                o3.borrow_mut().push_str(s);
+            Some(Rc::new(move |_v, s: &[u8]| {
+                o2.borrow_mut().push_str(&String::from_utf8_lossy(s))
+            })),
+            Some(Rc::new(move |_v, s: &[u8]| {
+                o3.borrow_mut().push_str(&String::from_utf8_lossy(s));
             })),
         );
     }

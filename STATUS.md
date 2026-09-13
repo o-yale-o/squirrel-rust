@@ -9,16 +9,20 @@
 | 验证项 | 复现命令 | 实测结果 |
 |---|---|---|
 | 官方 samples 差分（stdout + stderr + 退出码） | `python tools/diff_test.py` | **17/17 一致** |
-| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **47/47 一致** |
+| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **51/51 一致** |
+| 运算符 × 类型矩阵（3181 条断言） | `python tools/diff_test.py tests-corpus` | **逐行一致** |
+| metamethod 全矩阵（343 个用例 × 18 个 metamethod） | 同上 | **逐行一致** |
+| `format`/`printf` 格式串矩阵（1305 行） | 同上 | **逐行一致** |
 | REPL 交互会话差分 | `python tools/repl_diff.py` | **5/5 一致** |
-| `.cnut` 字节级一致 | 双方 `-o out -c x.nut` 后比对 SHA256 | **17/17 一致** |
-| `.cnut` 双向互通 | C++ 编译→Rust 执行 / Rust 编译→C++ 执行 | **17/17 一致** |
+| `.cnut` 字节级一致 | `python tools/cnut_matrix.py` | samples **17/17**；语料 **48/51**（3 个只差参考实现的未初始化填充，见第四节） |
+| `.cnut` 双向互通 | `python tools/cnut_matrix.py tests-corpus` | **51/51 一致**（含参考实现编译的字节码在本实现上执行） |
 | 指令覆盖 | `cargo test --test opcode_coverage` | **61/61 条指令被语料覆盖** |
-| 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` | **4/4 通过**，输出与 C++ minimal.c 一致 |
+| 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` | **5/5 通过**，输出与 C++ minimal.c 一致 |
 | 委托表成员 | `python tools/audit_delegates.py` | **10 张表 88 个成员全一致** |
-| 单元 + 集成 + 健壮性测试 | `cargo test` | **68/68 通过** |
+| 全局注册（nparamscheck + 掩码） | `python tools/audit_globals.py` | **62/62 全一致** |
+| 单元 + 集成 + 健壮性测试 | `cargo test` | **72/72 通过** |
 | 全局环境覆盖 | `getroottable()` 快照对比 | root 表 **77 个名字逐字一致** |
-| 原生错误消息文本 | 15 条参数/类型错误对拍 | **15/15 逐字一致** |
+| 原生错误消息文本 | 自动生成的错误对拍语料（331 处调用） | **逐行一致** |
 | CLI 保真 | `-v` / `-h` / 编译错误消息 / `-o` 必须前置的怪癖 / 退出码 | 与原版一致 |
 
 结论：**引擎主体（词法、编译器、VM、对象模型、类/OOP、生成器、GC、序列化、主要标准库）与 CLI 已完工，保真度高。**
@@ -199,10 +203,71 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 8. **具名参数块**的语义确认：`{ key = value }` 是 SET 到**调用返回值**上（配合返回实例/表的调用），
    例如 `C() { a = 1, b = 2 }`；写成 `print(kw(1) { b = 2 })` 两边都报错，原语料写法有误。
 
+## 三·补3、第三轮：三张自动生成矩阵 + 字节码互通
+
+前两轮的教训是「**没测到的路径等于没写**」，而手工挑样例总会漏。这一轮把「运算符 × 类型」
+「metamethod × 触发方式」「格式串 × 值 × 标志」三张组合矩阵**直接生成**成语料
+（共 4800+ 条断言，全部逐行对拍），另外把 `.cnut` 互通做成了可复现脚本。
+
+| 生成器 | 产物 | 规模 |
+|---|---|---|
+| `tools/gen_opmatrix.py` | `tests-corpus/t_opmx.nut` | 3181 条：13 种运算符 × 12 种类型两两组合 + 一元/索引/成员/默认委托/赋值/自增自减 |
+| `tools/gen_metaprobe.py` | `tests-corpus/t_meta3.nut` | 343 条：18 个 metamethod 的正常路径 / 返回值类型错 / 抛异常 / 参数个数错 / 值不是函数 / 没有 metamethod 时的回退与报错 |
+| `tools/gen_formatmx.py` | `tests-corpus/t_formatmx.nut` | 1305 条：29 个浮点值 × 32 种说明符、10 个整数值 × 29 种说明符、字符串宽度精度、类型接受与解析错误 |
+
+**这一轮抓到的真问题（全部已修）**：
+
+1. **`false < true` 判反**（矩阵一跑就现形）。参考实现的 `ObjCmp` 对 `OT_BOOL` 走
+   `default:` 分支，而 `_userpointer(o)` 读的是 union 里的整数（bool 就是 0/1），
+   所以 `false <=> true` 恒为 −1。本实现原来按身份地址比较，结果随机。
+2. **`fmod` 的 NaN 符号位**。参考走 UCRT 的 `fmod`，异常输入上的 NaN 符号与 Rust 的 `%`
+   不同（`1.0 % 0.0` 参考给 `nan`、Rust 给 `-nan(ind)`）。新增 `vm::sq_fmod` 逐条对齐
+   （±0/±inf/nan 全组合 64 条实测），并配单元测试。
+3. **`_nexti` 取不到值时的错误文本**：参考实现先把 `Raise_IdxError` 的结果**覆盖**成
+   `_nexti returned an invalid idx`，本实现直接透出了 `the index '0' does not exist`。
+4. **`format` 的整套语义**（这一轮最大的一块，全部按 `sqstd_format` + MSVC printf 实测复刻）：
+   - 类型接受：`%s` 只收字符串；整型说明符收 `integer|float|bool`（float 截断，
+     越界给 `INT64_MIN`）；浮点说明符收 `integer|float`（**bool 不行**）；
+     错误文本 `string/integer/float expected for the specified format`。
+   - 标志：`-` `+` ` ` `#` `0`。`%#x/%#X` 前缀 `0x/0X`、`%#o` 补前导 0、
+     `%#g` **保留尾随零**、`%#f/%#e` 一定带小数点、整型给了精度时忽略 `0`、
+     inf/nan 忽略 `0`（空格填充）。
+   - 精度：整型是最少位数、字符串是截断、`%.d` 是精度 0（`%.0d` 打印 0 得空串）。
+   - 限制：宽度/精度各最多 2 位数字（`width format too long` / `precision format too long`）、
+     整段最长 20 字符（`format too long`）、`%` 结尾先报 `not enough parameters`。
+   - MSVC 怪癖：`%#.0f`/`%#.0e` 遇到 inf/nan 会把小数点插在**整段第 2 个字符**位置
+     （`i.nf`、`-.inf`、`n.an`、`-.nan(ind)`），其它精度不插。
+   - `%d` 的 `INT64_MIN`：原来用 `abs()`，release 下打出 `--9223372036854775808`、
+     debug 下直接 panic → 改 `unsigned_abs()`。
+5. **非 UTF-8 字节被吞**（`PrintFn` 从 `&str` 改成 `&[u8]`）。参考实现是非 UNICODE 的
+   `char` 构建，`print((255).tochar())` 写出的是裸字节 `0xFF`；本实现原先所有输出都要过
+   `from_utf8_lossy`，被换成 `U+FFFD`（`format("%c", 255)` 实测 3 字节 vs 1 字节）。
+   `print`/`error`/`printf`/CALLSTACK/LOCALS 全部改为裸字节，并加测试
+   `host_api::print_writes_raw_bytes`。
+6. **加载参考实现编译的 `.cnut` 会让宿主 panic**（本轮最严重的一条）。参考实现保存 outer
+   值时写了 8 字节而字段只有 4 字节，高 4 字节是垃圾 → 本实现原来直接 `i64` 判零，
+   把 `otLOCAL` 读成 `otOUTER`，接着 `outervalues[src]` 越界 panic
+   （`vm.rs:1704`，rc=101）。修法：加载时掩码低 32 位；`CLOSURE_OP` 的 outer 索引、
+   默认参数槽、绑定目标全部加范围检查，退化为可捕获的 `invalid outer value index`。
+   新增夹具测试 `crates/squirrel-stdlib/tests/bytecode_interop.rs`。
+
+**顺带修好的测试方法学问题**：
+
+- `diff_test.py`/`line_diff.py` 的指针归一化从 `0x[0-9a-fA-F]+` 收紧到 `{8,}`——
+  原先会把 `format("%#x", 1)` 的正常输出也归一化成 `0xPTR`，等于自己把差异抹掉。
+- `tools/lint_corpus.py` 的规则全部换成**实测踩过的坑**（位运算复合赋值、`>>>` 其实存在、
+  `rawcall` 当成员、`65.tochar()` 词法陷阱、函数体内 `const`），原来那条
+  「`class {}` 后同行紧跟语句」是纯误报（`class X {} return 1;` 完全合法），已被删掉。
+- 新增 `tools/line_diff.py`（按行定位差异）、`tools/bisect_cases.py`（把探针逐条单独跑，
+  找出崩溃/差异的那一条）、`tools/cnut_fields.py`（按 `Save` 布局逐字段比对 `.cnut`）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
 |---|---|
+| `.cnut` 的 outer 类型字段 | 参考实现用 `sizeof(SQUnsignedInteger)`（8 字节）写一个 4 字节枚举，高 4 字节是**未初始化内存**：同一脚本连编两次字节都不同（实测 `ff245324…` vs `e4e3c42e…`），而 `e4e3c42e…` 恰好等于本实现的输出。因此「字节完全一致」在这 3 个含闭包的语料上不可达；本实现写确定的 0。加载侧已按低 32 位掩码，参考实现产出的字节码能正常执行（51/51 交叉执行一致） |
+| 坏字节码里的越界 outer 索引 | 参考实现不检查该索引，夹具 `ref_closures_badouter.cnut` 让 C++ 侧访问违例崩溃（0xC0000005）；本实现报可捕获的 `invalid outer value index`（`crates/squirrel-stdlib/tests/bytecode_interop.rs` 守门） |
+| `format` 规格串恰好 20 字符 | `validate_format` 的 `n-start > MAX_FORMAT_LEN` 差一，随后 `memcpy` 越界写 `fmt[20]`：`format("%" + 20 个 '+' + "d", 1)` 实测 `STATUS_STACK_BUFFER_OVERRUN` 崩溃。本实现从 20 起就报 `format too long`，不复刻 |
 | `escape` 高位字节 | C++ 用 `(char)c` 传给 `%02x`：≥0x80 输出 8 位补码（`\xffffffe9`）。当字符串很短、scratchpad 不够时参考实现会越界写出**不确定内容**（实测 `escape("\xe9")` 输出 `\xffaaaaa\xffffffe9`）。本实现取确定性的补码值，短字符串场景与参考不同 |
 | `date` 上界 | UCRT 的上界常量未逐秒定位：实测 32536800000（3001-01-19）可用、32536857599 失败。本实现取前者为上界 |
 | `getstackinfos(-1)` | 参考实现 `_callsstack[cssize]` 越界读（UB，实测返回一个表）；本实现返回 `null`，不 panic |
@@ -227,14 +292,21 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 | `tools/probes/errmsg.nut` | F 的错误消息对拍（15 条） |
 | `tools/probes/breadth.nut` | 约 90 项标准库广度探针 |
 | `tools/probes/locals_fmt.nut` / `err_obj.nut` | D 的 CALLSTACK/LOCALS 与错误对象格式 |
+| `tools/probes/nan_probe.nut` | `fmod`/除法/unary minus 的 NaN 符号矩阵（±0/±1/2.5/±inf/nan 全组合） |
+| `tools/probes/fmt_flags.nut` / `fmt_hash.nut` / `fmt_types.nut` | printf 标志、`#` 与 inf/nan、类型接受的实测记录 |
+| `tools/probes/closure_outer.nut` | 闭包/outer 值夹具源码（编译成 `crates/squirrel-stdlib/tests/fixtures/*.cnut`） |
 | `tmp-c2/*.nut` | 一次性探针（BOM/UCS2、date 边界、escape 高位），已被 .gitignore 忽略 |
 
 对拍方式（stderr 也要比，否则错误路径差异不可见）：
 
 ```powershell
 python tools/diff_test.py                 # 官方 samples（stdout + stderr + 退出码）
-python tools/diff_test.py tests-corpus    # 边界语料
+python tools/diff_test.py tests-corpus    # 边界语料 + 三张生成矩阵
 python tools/diff_test.py --no-stderr ... # 退回只比 stdout
 python tools/repl_diff.py                 # REPL 交互会话
-python tools/repl_diff.py tests-repl/s1_expr.txt
+python tools/line_diff.py tests-corpus/t_opmx.nut   # 大语料按行定位差异
+python tools/bisect_cases.py tools/probes/fmt_types.nut   # 逐条单独跑探针
+python tools/cnut_matrix.py tests-corpus  # .cnut 字节一致 + 双向交叉执行
+python tools/cnut_fields.py a.cnut b.cnut # .cnut 逐字段比对（定位差异字段）
+python tools/lint_corpus.py               # 语料语法陷阱 + 逐个试编译
 ```

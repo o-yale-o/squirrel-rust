@@ -634,11 +634,40 @@ fn string_format(v: &mut VmData) -> SQInteger {
     }
 }
 
+/// 格式说明符（↔ validate_format 的解析结果 + 转换字符）
+#[derive(Default)]
+struct FmtSpec {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    hash: bool,
+    zero: bool,
+    width: usize,
+    prec: Option<usize>,
+    conv: u8,
+}
+
+/// ↔ sq_getinteger：数值（float 截断，越界给 INT64_MIN）或布尔，其余类型不接受
+fn fmt_int(aval: &Value) -> Option<SQInteger> {
+    match aval.type_() {
+        OT_INTEGER | OT_FLOAT | OT_BOOL => Some(aval.as_integer()),
+        _ => None,
+    }
+}
+
+/// ↔ sq_getfloat：只接受数值（integer 可以，**bool 不行**）
+fn fmt_float(aval: &Value) -> Option<f64> {
+    match aval.type_() {
+        OT_INTEGER | OT_FLOAT => Some(aval.as_float() as f64),
+        _ => None,
+    }
+}
+
 fn string_format_impl(v: &mut VmData, push_result: bool) -> Option<()> {
-    // ↔ sqstd_format：this 在槽 0（newbase），格式串在槽 1（stack_get(2) 语义）
+    // ↔ sqstd_format：this 在槽 1，格式串在槽 2，第一个可变参数在槽 3
     let nparams = v.top - v.stackbase - 1; // 参数个数（不含 this）
     let fmt_val = v.stack_get(2);
-    let fmt = fmt_val.as_bytes();
+    let fmt = fmt_val.as_bytes().to_vec();
     let mut out: Vec<u8> = Vec::new();
     let mut i = 0usize;
     let mut arg = 2usize;
@@ -650,122 +679,253 @@ fn string_format_impl(v: &mut VmData, push_result: bool) -> Option<()> {
             continue;
         }
         i += 1;
-        if i >= fmt.len() {
-            break;
-        }
-        if fmt[i] == b'%' {
+        if i < fmt.len() && fmt[i] == b'%' {
             out.push(b'%');
             i += 1;
             continue;
         }
-        // flags/width/precision
-        let mut flags = String::new();
-        while i < fmt.len() && matches!(fmt[i], b'-' | b'+' | b' ' | b'#' | b'0') {
-            flags.push(fmt[i] as char);
-            i += 1;
-        }
-        let mut width = String::new();
-        while i < fmt.len() && fmt[i].is_ascii_digit() {
-            width.push(fmt[i] as char);
-            i += 1;
-        }
-        let mut prec = String::new();
-        if i < fmt.len() && fmt[i] == b'.' {
-            i += 1;
-            while i < fmt.len() && fmt[i].is_ascii_digit() {
-                prec.push(fmt[i] as char);
-                i += 1;
-            }
-        }
-        if i >= fmt.len() {
-            break;
-        }
-        let conv = fmt[i];
-        i += 1;
+        // ↔ sqstd_format：**先**查参数个数，所以 "abc%" 报的是 not enough parameters
         if arg > nparams as usize {
             v.raise_error_str("not enough parameters for the given format string");
             return None;
         }
-        // 参数 i 在栈槽 i+1（this 在 0）
+        let start = i;
+        let mut sp = FmtSpec::default();
+        while i < fmt.len() && matches!(fmt[i], b'-' | b'+' | b' ' | b'#' | b'0') {
+            match fmt[i] {
+                b'-' => sp.minus = true,
+                b'+' => sp.plus = true,
+                b' ' => sp.space = true,
+                b'#' => sp.hash = true,
+                _ => sp.zero = true,
+            }
+            i += 1;
+        }
+        let mut wdigits = 0usize;
+        while i < fmt.len() && fmt[i].is_ascii_digit() {
+            sp.width = sp.width * 10 + (fmt[i] - b'0') as usize;
+            i += 1;
+            wdigits += 1;
+            // ↔ MAX_WFORMAT_LEN=3：第 3 位数字就报错（"%" + 最多两位宽度）
+            if wdigits >= 3 {
+                v.raise_error_str("width format too long");
+                return None;
+            }
+        }
+        if i < fmt.len() && fmt[i] == b'.' {
+            i += 1;
+            let mut p = 0usize;
+            let mut pdigits = 0usize;
+            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                p = p * 10 + (fmt[i] - b'0') as usize;
+                i += 1;
+                pdigits += 1;
+                if pdigits >= 3 {
+                    v.raise_error_str("precision format too long");
+                    return None;
+                }
+            }
+            sp.prec = Some(p); // "%.d" 是精度 0，不是“没有精度”
+        }
+        // ↔ validate_format 的 "format too long"：整段最长 20 字符。参考实现在**恰好 20**
+        // 时会越界写 fmt[20]（实测 STATUS_STACK_BUFFER_OVERRUN 崩溃），本实现从 20 起就报错。
+        if i - start >= 20 {
+            v.raise_error_str("format too long");
+            return None;
+        }
+        if i >= fmt.len() {
+            // ↔ validate_format 读到 '\0'：转换字符成了 '\0' → invalid format
+            v.raise_error_str("invalid format");
+            return None;
+        }
+        sp.conv = fmt[i];
+        i += 1;
+
         let aval = v.stack_get(arg as SQInteger + 1);
         arg += 1;
-        let w: usize = width.parse().unwrap_or(0);
-        let p: Option<usize> = if prec.is_empty() { None } else { Some(prec.parse().unwrap_or(0)) };
-        let left = flags.contains('-');
-        let zeropad = flags.contains('0') && !left;
-        let piece: Vec<u8> = match conv {
+
+        // 各转换字符产出 (符号, 前缀, 主体, 是否允许零填充)。
+        // 主体是**裸字节**：%c/%s 可能不是合法 UTF-8，参考实现是非 UNICODE 构建，
+        // 0xFF 这类字节会原样写出去。
+        let (sign, prefix, body, zero_ok): (Vec<u8>, Vec<u8>, Vec<u8>, bool) = match sp.conv {
             b's' => {
-                let s = match v.to_string_value(&aval) {
-                    Ok(s) => s,
-                    Err(_) => return None,
+                // ↔ sq_getstring：%s 只收真字符串（不做 ToString）
+                if aval.type_() != OT_STRING {
+                    v.raise_error_str("string expected for the specified format");
+                    return None;
+                }
+                let mut b = aval.as_bytes().to_vec();
+                // ↔ CRT 的 %s 走 C 字符串：第一个 NUL 之后不输出
+                if let Some(z) = b.iter().position(|x| *x == 0) {
+                    b.truncate(z);
+                }
+                if let Some(p) = sp.prec {
+                    b.truncate(p);
+                }
+                (Vec::new(), Vec::new(), b, true)
+            }
+            b'c' => match fmt_int(&aval) {
+                Some(n) => (Vec::new(), Vec::new(), vec![n as u8], true),
+                None => {
+                    v.raise_error_str("integer expected for the specified format");
+                    return None;
+                }
+            },
+            b'd' | b'i' | b'u' | b'o' | b'x' | b'X' => {
+                let n = match fmt_int(&aval) {
+                    Some(n) => n,
+                    None => {
+                        v.raise_error_str("integer expected for the specified format");
+                        return None;
+                    }
                 };
-                let mut b = s.as_bytes().to_vec();
-                if let Some(p) = p {
-                    if b.len() > p {
-                        b.truncate(p);
+                let u = n as u64;
+                let signed = sp.conv == b'd' || sp.conv == b'i';
+                let mut digits: Vec<u8> = match sp.conv {
+                    b'd' | b'i' => n.unsigned_abs().to_string().into_bytes(),
+                    b'u' => u.to_string().into_bytes(),
+                    b'o' => format!("{:o}", u).into_bytes(),
+                    b'x' => format!("{:x}", u).into_bytes(),
+                    _ => format!("{:X}", u).into_bytes(),
+                };
+                // 精度 = 最少位数；精度 0 且值为 0 → 空串
+                if let Some(p) = sp.prec {
+                    if p == 0 && u == 0 {
+                        digits.clear();
+                    } else if digits.len() < p {
+                        let mut z = vec![b'0'; p - digits.len()];
+                        z.extend_from_slice(&digits);
+                        digits = z;
                     }
                 }
-                b
-            }
-            b'i' | b'd' => {
-                let n = aval.as_integer();
-                let mut s = n.abs().to_string();
-                if let Some(p) = p {
-                    while s.len() < p {
-                        s.insert(0, '0');
+                let mut prefix: Vec<u8> = Vec::new();
+                if sp.hash {
+                    match sp.conv {
+                        b'x' if u != 0 => prefix = b"0x".to_vec(),
+                        b'X' if u != 0 => prefix = b"0X".to_vec(),
+                        b'o' if digits.first() != Some(&b'0') => prefix = b"0".to_vec(),
+                        _ => {}
                     }
                 }
-                if n < 0 {
-                    s.insert(0, '-');
-                } else if flags.contains('+') {
-                    s.insert(0, '+');
+                let sign: Vec<u8> = if signed && n < 0 {
+                    b"-".to_vec()
+                } else if signed && sp.plus {
+                    b"+".to_vec()
+                } else if signed && sp.space {
+                    b" ".to_vec()
+                } else {
+                    Vec::new()
+                };
+                // ↔ C：整型指定了精度时忽略 '0' 标志
+                (sign, prefix, digits, sp.prec.is_none())
+            }
+            b'f' | b'e' | b'E' | b'g' | b'G' => {
+                let val = match fmt_float(&aval) {
+                    Some(f) => f,
+                    None => {
+                        v.raise_error_str("float expected for the specified format");
+                        return None;
+                    }
+                };
+                let prec = sp.prec.unwrap_or(6);
+                let nan = val.is_nan();
+                let inf = val.is_infinite();
+                let neg = val.is_sign_negative();
+                // 主体不含符号：符号位负责（负 NaN 也是 sign 位 + "nan(ind)"）
+                let raw: String = if nan {
+                    squirrel::cformat::nan_str(val)
+                        .trim_start_matches('-')
+                        .to_string()
+                } else if inf {
+                    "inf".to_string()
+                } else {
+                    let a = val.abs();
+                    let mut t = match sp.conv {
+                        b'f' => squirrel::cformat::format_f(a, prec),
+                        b'e' | b'E' => squirrel::cformat::format_e_crt(a, prec),
+                        _ => {
+                            if sp.hash {
+                                squirrel::cformat::format_g_alt(a, prec)
+                            } else {
+                                squirrel::cformat::format_g_prec(a, prec)
+                            }
+                        }
+                    };
+                    // ↔ '#'：一定带小数点（e 风格要插在指数之前）
+                    if sp.hash && !t.contains('.') {
+                        match t.find(['e', 'E']) {
+                            Some(pos) => t.insert(pos, '.'),
+                            None => t.push('.'),
+                        }
+                    }
+                    if sp.conv == b'E' || sp.conv == b'G' {
+                        t = t.to_uppercase();
+                    }
+                    t
+                };
+                // ↔ MSVC：%E/%G 连 inf/nan 一起大写（"INF"、"-NAN(IND)"）
+                let raw = if sp.conv == b'E' || sp.conv == b'G' {
+                    raw.to_uppercase()
+                } else {
+                    raw
+                };
+                let mut body = raw.into_bytes();
+                // 符号：负 NaN 永远是 "-nan(ind)"，'+'/' ' 标志只作用于非负数
+                let mut sign: Vec<u8> = if neg { b"-".to_vec() } else { Vec::new() };
+                if sign.is_empty() {
+                    if sp.plus {
+                        sign = b"+".to_vec();
+                    } else if sp.space {
+                        sign = b" ".to_vec();
+                    }
                 }
-                s.into_bytes()
-            }
-            b'u' => {
-                let n = aval.as_integer() as SQUnsignedInteger;
-                n.to_string().into_bytes()
-            }
-            b'x' => format!("{:x}", aval.as_integer()).into_bytes(),
-            b'X' => format!("{:X}", aval.as_integer()).into_bytes(),
-            b'o' => format!("{:o}", aval.as_integer()).into_bytes(),
-            b'c' => vec![aval.as_integer() as u8],
-            b'f' => squirrel::cformat::format_f(aval.as_float() as f64, p.unwrap_or(6)).into_bytes(),
-            b'g' | b'G' => {
-                let mut s = squirrel::cformat::format_g_prec(aval.as_float() as f64, p.unwrap_or(6));
-                if conv == b'G' {
-                    s = s.to_uppercase();
+                // ↔ MSVC 的怪癖：`%#.0f`/`%#.0e` 遇到 inf/nan 时把小数点插在**整段文本的
+                // 第 2 个字符位置**（"i.nf"、"-." + "inf"、小写时 "n.an"、"-." + "nan(ind)"）；
+                // 其它精度下 inf/nan 完全不插小数点（`%#f` → "inf"）。
+                if sp.hash
+                    && (nan || inf)
+                    && sp.prec == Some(0)
+                    && matches!(sp.conv, b'f' | b'e' | b'E')
+                {
+                    let pos = if sign.is_empty() { 1 } else { 0 };
+                    if pos <= body.len() {
+                        body.insert(pos, b'.');
+                    }
                 }
-                s.into_bytes()
-            }
-            b'e' => squirrel::cformat::format_e_crt(aval.as_float() as f64, p.unwrap_or(6)).into_bytes(),
-            b'E' => {
-                let s = squirrel::cformat::format_e_crt(aval.as_float() as f64, p.unwrap_or(6));
-                s.to_uppercase().into_bytes()
+                // ↔ C：inf/nan 忽略 '0' 标志（`format("%010f", inf)` → 空格填充）
+                (sign, Vec::new(), body, !nan && !inf)
             }
             _ => {
                 v.raise_error_str("invalid format");
                 return None;
             }
         };
-        if piece.len() < w {
-            let pad = w - piece.len();
-            if left {
-                out.extend_from_slice(&piece);
+
+        // 宽度与填充：'-' 优先于 '0'；'0' 被忽略时退化为空格
+        let zeropad = sp.zero && !sp.minus && zero_ok;
+        let total = sign.len() + prefix.len() + body.len();
+        if total < sp.width {
+            let pad = sp.width - total;
+            if sp.minus {
+                out.extend_from_slice(&sign);
+                out.extend_from_slice(&prefix);
+                out.extend_from_slice(&body);
                 out.extend(std::iter::repeat(b' ').take(pad));
-            } else if zeropad && matches!(conv, b'd' | b'i' | b'u' | b'x' | b'X' | b'o') && piece.first() != Some(&b'-') {
+            } else if zeropad {
+                out.extend_from_slice(&sign);
+                out.extend_from_slice(&prefix);
                 out.extend(std::iter::repeat(b'0').take(pad));
-                out.extend_from_slice(&piece);
-            } else if zeropad && matches!(conv, b'd' | b'i' | b'u' | b'x' | b'X' | b'o') && piece.first() == Some(&b'-') {
-                out.push(b'-');
-                out.extend(std::iter::repeat(b'0').take(pad));
-                out.extend_from_slice(&piece[1..]);
+                out.extend_from_slice(&body);
             } else {
                 out.extend(std::iter::repeat(b' ').take(pad));
-                out.extend_from_slice(&piece);
+                out.extend_from_slice(&sign);
+                out.extend_from_slice(&prefix);
+                out.extend_from_slice(&body);
             }
         } else {
-            out.extend_from_slice(&piece);
+            out.extend_from_slice(&sign);
+            out.extend_from_slice(&prefix);
+            out.extend_from_slice(&body);
         }
     }
     if push_result {
@@ -774,10 +934,7 @@ fn string_format_impl(v: &mut VmData, push_result: bool) -> Option<()> {
     } else {
         // printf：走 printfunc（↔ _printfunc(v, "%s", dest)，同样在 NUL 处截断）
         if let Some(pf) = v.ss.printfunc.borrow().clone() {
-            pf(
-                v,
-                &String::from_utf8_lossy(squirrel::baselib::c_string_prefix(&out)),
-            );
+            pf(v, squirrel::baselib::c_string_prefix(&out));
         }
     }
     Some(())
@@ -946,7 +1103,7 @@ pub fn set_error_handlers(vm: &squirrel::api::Vm) {
             let _ = v;
             if let Some(ef) = ss.errorfunc.borrow().clone() {
                 let msg = format!("{} line = ({}) column = ({}) : error {}\n", source, line, column, desc);
-                ef(v, &msg);
+                ef(v, msg.as_bytes());
             }
         });
         *vm.ss.compilererrorhandler.borrow_mut() = Some(handler);
@@ -961,10 +1118,14 @@ pub fn set_error_handlers(vm: &squirrel::api::Vm) {
                 // ↔ sq_getstring(v,2)：只有真字符串才内联，其余一律 [unknown]
                 let e = v.stack_get(2);
                 let msg = match &e {
-                    Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
-                    _ => "unknown".to_string(),
+                    // ↔ sq_getstring：字符串按裸字节内联（非 UNICODE 构建，不做 UTF-8 校验）
+                    Value::String(s) => squirrel::baselib::c_string_prefix(&s.val).to_vec(),
+                    _ => b"unknown".to_vec(),
                 };
-                ef(v, &format!("\nAN ERROR HAS OCCURRED [{}]\n", msg));
+                let mut line = b"\nAN ERROR HAS OCCURRED [".to_vec();
+                line.extend_from_slice(&msg);
+                line.extend_from_slice(b"]\n");
+                ef(v, &line);
             }
             print_callstack(v);
         }
@@ -980,7 +1141,7 @@ fn print_callstack(v: &mut VmData) {
     let ss_ = v.ss.clone();
     let ef_ = ss_.errorfunc.borrow().clone();
     if let Some(ef) = ef_ {
-        ef(v, "\nCALLSTACK\n");
+        ef(v, b"\nCALLSTACK\n");
         let mut level: SQInteger = 1; // 1 is to skip this function that is level 0
         loop {
             // ↔ sq_stackinfos(v, level, &si)
@@ -1004,16 +1165,17 @@ fn print_callstack(v: &mut VmData) {
                 }
                 _ => ("unknown".to_string(), "unknown".to_string(), 0),
             };
-            ef(v, &format!("*FUNCTION [{}()] {} line [{}]\n", fname, src, line));
+            let line_txt = format!("*FUNCTION [{}()] {} line [{}]\n", fname, src, line);
+            ef(v, line_txt.as_bytes());
             level += 1;
         }
-        ef(v, "\nLOCALS\n");
+        ef(v, b"\nLOCALS\n");
         for level in 0..10 {
             let mut seq: SQInteger = 0;
             while let Some(name) = squirrel::baselib::get_local_at(v, level, seq) {
                 seq += 1;
-                let line = format_local_line(v, &name);
-                ef(v, &line);
+                let line_txt = format_local_line(v, &name);
+                ef(v, &line_txt);
                 v.pop_get(); // ↔ sq_pop(v,1)
             }
         }
@@ -1021,35 +1183,45 @@ fn print_callstack(v: &mut VmData) {
 }
 
 /// ↔ sqstd_printcallstack 的 LOCALS 单项（类型化打印）
-fn format_local_line(v: &VmData, name: &str) -> String {
+///
+/// 返回裸字节：参考实现是非 UNICODE 构建，`pf("%s", ...)` 原样写出字符串内容，
+/// 非 UTF-8 字节不能被 U+FFFD 替换掉。
+fn format_local_line(v: &VmData, name: &str) -> Vec<u8> {
     let val = v.top_val();
     match &val {
-        Value::Null => format!("[{}] NULL\n", name),
+        Value::Null => format!("[{}] NULL\n", name).into_bytes(),
         // ↔ pf("%d", SQInteger)：x64 varargs 下 %d 只取低 32 位
-        Value::Integer(i) => format!("[{}] {}\n", name, (*i) as i32),
+        Value::Integer(i) => format!("[{}] {}\n", name, (*i) as i32).into_bytes(),
         Value::Float(f) => format!(
             "[{}] {}\n",
             name,
             squirrel::cformat::format_g_prec(*f as f64, 14)
-        ),
-        Value::Bool(b) => format!("[{}] {}\n", name, if *b { "true" } else { "false" }),
-        Value::String(s) => format!("[{}] \"{}\"\n", name, String::from_utf8_lossy(&s.val)),
-        Value::UserPointer(_) => format!("[{}] USERPOINTER\n", name),
-        Value::Table(_) => format!("[{}] TABLE\n", name),
-        Value::Array(_) => format!("[{}] ARRAY\n", name),
-        Value::Closure(_) => format!("[{}] CLOSURE\n", name),
-        Value::NativeClosure(_) => format!("[{}] NATIVECLOSURE\n", name),
-        Value::Generator(_) => format!("[{}] GENERATOR\n", name),
-        Value::Userdata(_) => format!("[{}] USERDATA\n", name),
-        Value::Thread(_) => format!("[{}] THREAD\n", name),
-        Value::Class(_) => format!("[{}] CLASS\n", name),
-        Value::Instance(_) => format!("[{}] INSTANCE\n", name),
-        Value::WeakRef(_) => format!("[{}] WEAKREF\n", name),
+        )
+        .into_bytes(),
+        Value::Bool(b) => format!("[{}] {}\n", name, if *b { "true" } else { "false" }).into_bytes(),
+        Value::String(s) => {
+            let mut b = format!("[{}] \"", name).into_bytes();
+            b.extend_from_slice(squirrel::baselib::c_string_prefix(&s.val));
+            b.extend_from_slice(b"\"\n");
+            b
+        }
+        Value::UserPointer(_) => format!("[{}] USERPOINTER\n", name).into_bytes(),
+        Value::Table(_) => format!("[{}] TABLE\n", name).into_bytes(),
+        Value::Array(_) => format!("[{}] ARRAY\n", name).into_bytes(),
+        Value::Closure(_) => format!("[{}] CLOSURE\n", name).into_bytes(),
+        Value::NativeClosure(_) => format!("[{}] NATIVECLOSURE\n", name).into_bytes(),
+        Value::Generator(_) => format!("[{}] GENERATOR\n", name).into_bytes(),
+        Value::Userdata(_) => format!("[{}] USERDATA\n", name).into_bytes(),
+        Value::Thread(_) => format!("[{}] THREAD\n", name).into_bytes(),
+        Value::Class(_) => format!("[{}] CLASS\n", name).into_bytes(),
+        Value::Instance(_) => format!("[{}] INSTANCE\n", name).into_bytes(),
+        Value::WeakRef(_) => format!("[{}] WEAKREF\n", name).into_bytes(),
         other => format!(
             "[{}] {}\n",
             name,
             squirrel::object::get_type_name(other).unwrap_or("unknown")
-        ),
+        )
+        .into_bytes(),
     }
 }
 

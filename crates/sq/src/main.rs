@@ -216,14 +216,14 @@ fn main() {
         let out = std::io::stdout();
         let err = std::io::stderr();
         vm.set_print_funcs(
-            Some(Rc::new(move |_v, s| {
+            Some(Rc::new(move |_v, s: &[u8]| {
                 let mut o = out.lock();
-                let _ = o.write_all(s.as_bytes());
+                let _ = o.write_all(s);
                 let _ = o.flush();
             })),
-            Some(Rc::new(move |_v, s| {
+            Some(Rc::new(move |_v, s: &[u8]| {
                 let mut o = err.lock();
-                let _ = o.write_all(s.as_bytes());
+                let _ = o.write_all(s);
                 let _ = o.flush();
             })),
         );

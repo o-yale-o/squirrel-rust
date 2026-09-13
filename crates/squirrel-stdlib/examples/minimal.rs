@@ -48,16 +48,16 @@ fn main() {
 
     // ↔ sq_setprintfunc(v, printfunc, errorfunc)
     vm.set_print_funcs(
-        Some(Rc::new(|_v, s| {
+        Some(Rc::new(|_v, s: &[u8]| {
             use std::io::Write;
             let mut o = std::io::stdout();
-            let _ = o.write_all(s.as_bytes());
+            let _ = o.write_all(s);
             let _ = o.flush();
         })),
-        Some(Rc::new(|_v, s| {
+        Some(Rc::new(|_v, s: &[u8]| {
             use std::io::Write;
             let mut o = std::io::stderr();
-            let _ = o.write_all(s.as_bytes());
+            let _ = o.write_all(s);
             let _ = o.flush();
         })),
     );
