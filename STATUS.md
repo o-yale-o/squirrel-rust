@@ -853,6 +853,34 @@ C.getattributes(null)                            // → {z=9}
 
 `crates/squirrel-stdlib/tests/attributes_semantics.rs`（2 个测试：读、写）。
 
+## 三·补16、第十六轮（P1-8）：`suspend` 穿透 native / 元方法
+
+* `tools/gen_suspmap.py` → `tests-corpus/t_suspmap.nut`：**16 条** stdout + **47 行**
+  stderr，两侧完全一致（stderr 也用 `tmp-c2/err_diff.py` 逐行比过）。
+* `tests-corpus/t_suspend_main.nut`：主脚本里 `suspend` 的单独用例。
+
+### 结果：无语义差异，但几条语义值得钉住
+
+| 形态 | 两侧一致的结果 |
+|---|---|
+| 线程顶层调用链里 `suspend` | 正常挂起（`1/suspended`） |
+| 穿过**闭包回调**（`array.map` 的回调） | `cannot suspend through native calls/metamethods` |
+| 穿过 `_call` 元方法 | 同上 |
+| 穿过 `_get` 元方法 | **`stack overflow, cannot resize stack while in a metamethod`** —— 先撞上"元方法里不能扩栈"的守卫，不是那句 canonical 文本 |
+| 挂起失败的线程状态 | 仍是 `idle`；再次 `call()` 会重新执行并再次报同一个错 |
+| `array.each` | **3.2 里没有这个方法**（`the index 'each' does not exist`），测 native 回调得用 `array.map` |
+| 嵌套线程 | 内层线程能正常挂起，外层把挂起值当返回值带回 |
+| **主脚本里 `suspend`** | 主 VM 挂起、后面的语句**不执行**；已打印的输出保留；退出码 = `suspend` 的参数（`sq.c` 用脚本返回值当退出码）。所以这类用例必须单独一个文件，混排会让后面的用例跑不到 |
+
+顺带修了工具/文档两处：`tmp-c2/err_diff.py`（对比 stderr 的逐行 diff，
+之前只看 stdout 会漏掉 stderr 差异）与 `t_suspend_main.nut` 的注释
+（原先写"无任何输出"是错的：正常 `exit` 会 flush，之前的输出留得住）。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/suspend_semantics.rs`（2 个测试：穿透 native/元方法的
+错误文本与事后状态；主 VM 挂起的返回值与 `suspended` 标志）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
