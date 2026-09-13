@@ -4,10 +4,24 @@
 > 大致工作量（"轮" ≈ 一次 生成矩阵 → 差分 → 修 → 进语料 → 加测试 → 提交 的循环）。
 > 盘点脚本全部可重跑，见文末"复现命令"。
 >
-> **进度（最新）**：P1 十项**全部完成**（详见 STATUS 三·补9 ~ 三·补18）；
-> 语料 57 → **69 个文件**、Rust 测试 85 → **109**，全程未回退任何既有绿灯。
-> 下一步：P2（宿主 API 补齐）→ P3（健壮性加固）→ P4（文档与迁移指南）。
+> **进度（最新）**：P1 十项**全部完成**（STATUS 三·补9 ~ 三·补18）；
+> **P2 宿主 API 补齐完成**（三·补19：member handle / `getfunctioninfo` /
+> `setfreevariable` + userdata/typetag/releasehook/refcount/foreignptr/resurrect 公开面，
+> 顺带修掉一个 panic 和一个"release hook 从不触发"）。
+> 语料 57 → **69 个文件**、Rust 测试 85 → **113**，全程未回退任何既有绿灯。
+> 下一步：P3（健壮性加固）→ P4（文档与迁移指南）。
 > **P0（C ABI）仍在等用户确认宿主形态**（纯解释器用则不需要）。
+
+### P2 完成情况
+
+| # | 子项 | 结果 |
+|---|---|---|
+| P2-1 | member handle | `hostapi.rs` 的 `get_member_handle`/`get_by_handle`/`set_by_handle`；用**参考实现的静态库编 C 探针**实测出三条关键语义：**只接受类**、成功时消费键、`_static` = 不是字段 |
+| P2-2 | `getfunctioninfo` | 按栈层级取（name/source/line/native）；`native` 区分 native closure |
+| P2-3 | `setfreevariable` | 替换槽位语义；**修出 panic**：`_OP_GETOUTER` 假设槽里一定是 `Outer` |
+| P2-4 | userdata/typetag/releasehook/refcount/foreignptr/resurrect | 内部早有，钉成公开宿主面；**修出"release hook 从不触发"**（挂到 `Drop`） |
+| P2-5 | 宿主 API 测试 | `host_api_ext.rs` 4 个测试 |
+
 
 ## P1 完成情况（2026-09 本轮）
 
