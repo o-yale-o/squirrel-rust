@@ -34,7 +34,7 @@
 | # | 项 | 结果 |
 |---|---|---|
 | P10-1 | 验证入口入库：`tools/check_all.py` | 10 项（8 项差分/审计 + health + writes + cargo test）；原来的 `tmp-c2/final_check.py` 在 gitignore 里、不可复现，且步骤名写死数量（`corpus(69)` 早已过时）→ 改成薄壳转发 |
-| P10-2 | **语料写文件审计**：`tools/audit_corpus_writes.py` | 查"谁在仓库根目录写文件却不删"。根因确认：`t_surface2.nut` 漏删 `robust_surface3.txt` —— **就是那个被误提交进仓库的文件**；另有 `t_surface5.nut`、`t_closure_io.nut` 两处。三处都补了 `try { remove(...) } catch`，改完仍与参考逐字节一致 |
+| P10-2 | **语料写文件审计**：`tools/audit_corpus_writes.py`（静态）+ `check_all` 里的**动态**守卫 | 静态：`t_surface2.nut` 漏删 `robust_surface3.txt`（**就是被误提交进仓库的那个**）、`t_surface5.nut`、`t_closure_io.nut` 三处补上清理。但静态审计有盲点：它只看"写之后有没有 remove"，抓不到**"remove 在一条走不到的路径上"** —— `closure_roundtrip_closure_env` 先写出 `robust_surface2.cnut` 再抛 `a closure with free variables bound cannot be serialized`，于是 remove 永远不执行（文件被 `*.cnut` 忽略，`git status` 也看不见），**每次差分都留一个**。修法：用例改成"catch 记错误 → 无条件清理 → 再 throw 回去"（可观察行为不变），并给 `check_all.py` 每步加**仓库根目录文件集合快照**，多出文件即 FAIL —— 这类问题只能动态抓 |
 | P10-3 | 模糊测试变异模式放大到 **1000 个种子** | **830 ok / 0 差异**；167 个变异把语法改坏（预期内）；1 个已知偏离（线程二次 call 的类型名）；2 个超时 → 分类后 1 个"两侧都挂"（死循环，语义一致）+ 1 个 **ref-limit**（变异把 `depth(n-1)` 改成 `depth(n*1)` → 无限递归：参考实现无上限，一路涨到系统杀进程；我们封顶给可捕获错误 = MIGRATION.md 记录的资源上限偏离） |
 | P10-4 | 模糊测试健壮性：超时不再让整轮扫描崩溃 | `subprocess.TimeoutExpired` 之前直接把 1000 个种子的扫描打断在中间（实测 seed 451）；现在按哨兵码返回并分类成 `timeout` / `ref-limit`，单脚本上限 60s → 20s |
 

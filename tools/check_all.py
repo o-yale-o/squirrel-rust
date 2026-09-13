@@ -14,8 +14,10 @@
   cnut          .cnut 字节一致 + 双向交叉执行（C++ 编译的给 Rust 跑，反之亦然）
   lint          语料自检（文件能编译、不残留副作用文件等）
   health        语料"假绿"体检：用例是否真的执行到了（详见 tools/corpus_health.py）
-  writes        语料里的"写文件"用例是否都配了删除（漏删会污染工作区，详见
-                tools/audit_corpus_writes.py）
+  writes        语料里的"写文件"用例是否都配了删除（静态看：写之后有没有 remove）。
+                **静态看不够** —— "remove 在一条走不到的路径上"（比如写到一半就抛错）
+                只能靠下面这个动态检查发现：每一步跑完都会对比仓库根目录的文件集合，
+                多出文件就把该步判为 FAIL。
   audit-*       全局函数表 / 委托表 / 根表插入顺序与参考实现逐项对照
   cargo test    单元 + 集成 + 健壮性 + 字节码互通 + 各语义矩阵
 """
@@ -51,6 +53,11 @@ def ascii_summary(text, width=64):
     return ""
 
 
+def repo_root_files():
+    """仓库根目录的普通文件集合（用来抓"跑完语料留下垃圾"）。"""
+    return set(n for n in os.listdir(ROOT) if os.path.isfile(os.path.join(ROOT, n)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="跳过 cargo test")
@@ -61,9 +68,17 @@ def main():
     print("%-18s %-5s | %s" % ("step", "state", "summary"))
     print("-" * 96)
     for name, cmd in steps:
+        before = repo_root_files()
         r = subprocess.run(cmd, capture_output=True, cwd=ROOT)
         text = (r.stdout + r.stderr).decode("utf8", "replace")
         ok = r.returncode == 0
+        # 动态卫生检查：跑完不能往仓库根目录留新文件。
+        # 静态审计（tools/audit_corpus_writes.py）只能看"写之后有没有 remove"，
+        # 抓不到"remove 在一条走不到的路径上" —— 实测 t_surface2 就是这样一直漏删的。
+        new_files = sorted(repo_root_files() - before)
+        if new_files:
+            ok = False
+            text += "\n跑完在仓库根目录留下新文件：%s" % new_files
         if not ok:
             failed.append(name)
         print("%-18s %-5s | %s" % (name, "OK" if ok else "FAIL", ascii_summary(text)))

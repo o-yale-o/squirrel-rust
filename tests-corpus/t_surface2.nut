@@ -99,10 +99,18 @@ t("closure_roundtrip_closure_env", function() {
     // 注意：base 是关键字，不能作标识符（两边都会报 "expected '.'"）
     local captured = 100;
     local f = function(a) { return captured + a; };
-    writeclosuretofile("robust_surface2.cnut", f);
-    local g = loadfile("robust_surface2.cnut");
-    remove("robust_surface2.cnut");
-    return g(1);
+    local r = null; local err = null;
+    // 这条会**先写出 robust_surface2.cnut 再报错**（自由变量闭包不能序列化），
+    // 所以清理必须放在失败路径上也走得到的地方：静态看"写后有 remove"是不够的
+    // （tools/check_all.py 的动态检查就是这样抓到它一直漏删的）。
+    try {
+        writeclosuretofile("robust_surface2.cnut", f);
+        local g = loadfile("robust_surface2.cnut");
+        r = g(1);
+    } catch (e) { err = "" + e; }
+    try { remove("robust_surface2.cnut"); } catch (e) {}
+    if (err != null) throw err;   // 保持原来的可观察行为（同样的错误文本）
+    return r;
 });
 t("dofile_env", function() {
     local holder = { marker = "H" };
