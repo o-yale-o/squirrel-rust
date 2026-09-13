@@ -111,7 +111,10 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 
 ## 已知限制
 
-- `file` 的 stdin 读取为行缓冲近似（CRT 是完全缓冲，交互式逐字节读有差异）；
+- **不可 seek 流（stdin/stdout/stderr 走管道时）的 `eos()/tell()/len()`**：参考实现基于 CRT 的
+  `ftell`/`fseek`，在管道上 `fseek(SEEK_END)` 会失败并破坏流状态（其后 `readn` 报 `io error`），
+  `stdout.eos()` 返回 `null`。本实现返回正常值，不复刻这个平台副作用
+  （实测脚本：`python tools/eos_diff.py`、`tools/stdin_diff.py`）；
 - 少数**参考实现自身越界/UB** 的场景取确定性行为（详见 `STATUS.md` 第四节）：
   `escape` 短字符串中的高位字节、`getstackinfos(-1)`、UCRT `date` 上界、
   在已挂起的线程上再次 `call()`、REPL 读到 EOF、空正则模式（参考实现会写 NULL 崩溃）。

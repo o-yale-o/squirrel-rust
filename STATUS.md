@@ -198,6 +198,7 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 | 空正则模式 `regexp("")` | 参考实现写 NULL 崩溃（弹模态崩溃框）；本实现报 `letter expected`，不复刻该 UB |
 | `castf2i` 高位字节 | 参考实现把 `f32` 的 4 字节当 `i64` 读（顺带读相邻栈内存，UB）；本实现只取确定的低 32 位（`f.to_bits()`），低 32 位与参考一致 |
 | 超深嵌套 / 深嵌套值 | 参考实现分别会 `STATUS_STACK_OVERFLOW`；本实现给出可捕获错误或迭代释放（见上节） |
+| 不可 seek 流的 `eos()/tell()/len()` | 实测（`tools/eos_diff.py`）：参考实现走 CRT `ftell`/`fseek`，在管道上 `fseek(SEEK_END)` 失败会破坏流（其后 `readn` 报 `io error`），`stdout.eos()` 返回 `null`、`stdin.eos()` 视剩余数据而 `null`/抛错。本实现返回正常值，不复刻该平台副作用 |
 
 > 注：`}` 出现在字符串里仍会减少花括号计数（参考实现的怪癖），本实现按原样复刻——因此
 > 这类会话会让参考实现读到 EOF 后卡死，无法作为差分会话用例。
