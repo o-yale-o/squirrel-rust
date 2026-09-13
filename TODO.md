@@ -4,13 +4,19 @@
 > 大致工作量（"轮" ≈ 一次 生成矩阵 → 差分 → 修 → 进语料 → 加测试 → 提交 的循环）。
 > 盘点脚本全部可重跑，见文末"复现命令"。
 >
-> **进度（最新）**：P1 十项**全部完成**（STATUS 三·补9 ~ 三·补18）；
-> **P2 宿主 API 补齐完成**（三·补19：member handle / `getfunctioninfo` /
-> `setfreevariable` + userdata/typetag/releasehook/refcount/foreignptr/resurrect 公开面，
-> 顺带修掉一个 panic 和一个"release hook 从不触发"）。
-> 语料 57 → **69 个文件**、Rust 测试 85 → **113**，全程未回退任何既有绿灯。
-> 下一步：P3（健壮性加固）→ P4（文档与迁移指南）。
-> **P0（C ABI）仍在等用户确认宿主形态**（纯解释器用则不需要）。
+> **进度（最新）：P1 / P2 / P3 / P4 全部完成**，唯一未做的是 **P0（C ABI）**，
+> 它按约定"等用户确认宿主形态后再定"。
+>
+> | 档 | 内容 | 状态 |
+> |---|---|---|
+> | P1 | 脚本语义未覆盖面 10 项（数值/weakref+GC/词法/blob/io/异常/属性/suspend/线程×GC/序列化） | ✅ 三·补9 ~ 三·补18，语料 57 → 69 个文件 |
+> | P2 | 宿主 API 补齐（member handle / `getfunctioninfo` / `setfreevariable` + 公开面） | ✅ 三·补19，顺带修一个 panic 与一个"release hook 从不触发" |
+> | P3 | 健壮性加固（dump 限深 / `--mem-limit` / `--max-ops` / 压缩器嵌套上限可调） | ✅ 三·补20，全部实测有效 |
+> | P4 | 文档（README 对齐实测 + 迁移指南 `MIGRATION.md`） | ✅ 本节之后 |
+> | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
+>
+> 基线：语料 **69/69**、samples **17/17**、编译错误对拍 **60/60**、
+> `.cnut` **69/69**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **113/113**、lint 0。
 
 ### P2 完成情况
 
