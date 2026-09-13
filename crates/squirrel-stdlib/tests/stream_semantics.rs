@@ -266,6 +266,46 @@ fn file_seek_negative_absolute_offset_fails() {
     let _ = std::fs::remove_file(&dir);
 }
 
+/// 文件句柄开着时 `remove()` 必须**失败**（↔ CRT `fopen` 用 `_SH_DENYNO`，即
+/// `FILE_SHARE_READ|FILE_SHARE_WRITE`，**不含 `FILE_SHARE_DELETE`**）。
+///
+/// Rust 的 `std::fs::File` 默认三种共享齐全 —— 开着也能删，与参考实现不同。
+/// 已在 `FileBackend::from_path` 里显式 `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)`；
+/// 前提是后端随实例死亡释放（见 `backend_released_when_instance_dies` 与 TODO.md P14）。
+///
+/// 注意：三条断言都用**非尾调用**写法（`local r = f(); return r;`）。
+/// `return f(x)` 是尾调用，我们会在那一步提前释放当前帧的局部（参考实现保留到帧弹出），
+/// 这一格是已知差异（TODO.md P14 子问题 2），语料里也刻意回避。
+#[test]
+fn open_handle_blocks_remove_like_crt_fopen() {
+    let dir = std::env::temp_dir().join("sqrust_share_test.bin");
+    let _ = std::fs::remove_file(&dir);
+    let p = dir.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        r#"
+        function try_remove(p) {{ try {{ remove(p); return "ok"; }} catch (e) {{ return "E:" + e; }} }}
+        local h1 = file("{p}", "wb+");
+        local h2 = file("{p}", "wb+");
+        local a = try_remove("{p}");
+        print("while_open=" + a + "\n");
+        h1.close();
+        local b = try_remove("{p}");
+        print("after_one_close=" + b + "\n");
+        h2.close();
+        local c = try_remove("{p}");
+        print("after_all_close=" + c + "\n");
+    "#
+    );
+    let (out, _err) = run_capture(&src);
+    assert_eq!(
+        out,
+        "while_open=E:remove() failed\n\
+         after_one_close=E:remove() failed\n\
+         after_all_close=ok\n"
+    );
+    let _ = std::fs::remove_file(&dir);
+}
+///
 /// 后端随实例死亡而释放（↔ 参考实现"引用计数归零即释放"）。
 ///
 /// 背景（TODO.md P14）：`BACKENDS` 注册表原来只增不减 —— 每个创建过的 file/blob/stream
