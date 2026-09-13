@@ -143,6 +143,19 @@ pub fn sq_fmod(x: SQFloat, y: SQFloat) -> SQFloat {
 }
 
 /// ↔ SQVM::SQVM
+/// 取当前帧闭包的第 `idx` 个 outer 槽（↔ `_closure(o)->_outervalues[idx]`）。
+/// 宿主 API 可以把槽换成普通值，所以返回的是 `Value` 而不一定是 `Outer`。
+fn outer_slot(vm: &VmData, idx: SQInteger) -> Option<Value> {
+    let ci = vm.last_callinfo();
+    match &ci.closure {
+        Value::Closure(c) => {
+            let cb = c.borrow();
+            cb.outervalues.get(idx as usize).cloned()
+        }
+        _ => None,
+    }
+}
+
 impl VmData {
     pub fn new(ss: Rc<SharedState>, stacksize: SQInteger) -> VmData {
         VmData {
@@ -2546,38 +2559,44 @@ fn run_instructions(
                 }
             }
             Op::GetOuter => {
-                let otr = {
-                    let ci = vm.last_callinfo();
-                    match &ci.closure {
-                        Value::Closure(c) => {
-                            let cb = c.borrow();
-                            match &cb.outervalues[arg1 as usize] {
-                                Value::Outer(o) => o.clone(),
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => unreachable!(),
+                // ↔ _OP_GETOUTER：`_outervalues[n]` **要么是 OT_OUTER、要么直接就是值**
+                // （C++：`if(_outervalues[arg2]._type == OT_OUTER) TARGET = _outer(...)->_value;
+                //        else TARGET = _closure(o)->_outervalues[arg2];`）。
+                // 宿主 API `sq_setfreevariable` 正是往这个槽里塞普通值 ——
+                // 这里以前是 `unreachable!()`，一塞就 panic。
+                let slot = outer_slot(vm, arg1);
+                match slot {
+                    Some(Value::Outer(o)) => {
+                        let v = vm.outer_read(&o);
+                        vm.stk_set(arg0, v);
                     }
-                };
-                let v = vm.outer_read(&otr);
-                vm.stk_set(arg0, v);
+                    Some(v) => vm.stk_set(arg0, v),
+                    None => {
+                        vm.raise_error_str("invalid outer value index");
+                        throw!(vm)
+                    }
+                }
             }
             Op::SetOuter => {
-                let otr = {
-                    let ci = vm.last_callinfo();
-                    match &ci.closure {
-                        Value::Closure(c) => {
-                            let cb = c.borrow();
-                            match &cb.outervalues[arg1 as usize] {
-                                Value::Outer(o) => o.clone(),
-                                _ => unreachable!(),
+                let slot = outer_slot(vm, arg1);
+                let v = vm.stk(arg2);
+                match slot {
+                    Some(Value::Outer(o)) => vm.outer_write(&o, v),
+                    Some(_) => {
+                        // 槽里已经是普通值：直接替换（↔ C++ 的 `_outervalues[arg2] = val` 分支
+                        // 实际走的是 SetOuter 的 else 路径）
+                        if let Value::Closure(c) = vm.last_callinfo().closure.clone() {
+                            let mut cb = c.borrow_mut();
+                            if let Some(slot) = cb.outervalues.get_mut(arg1 as usize) {
+                                *slot = v.clone();
                             }
                         }
-                        _ => unreachable!(),
                     }
-                };
-                let v = vm.stk(arg2);
-                vm.outer_write(&otr, v);
+                    None => {
+                        vm.raise_error_str("invalid outer value index");
+                        throw!(vm)
+                    }
+                }
                 if arg0 != 0xFF {
                     let v = vm.stk(arg2);
                     vm.stk_set(arg0, v);

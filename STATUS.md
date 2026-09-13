@@ -967,6 +967,46 @@ wrong argument type, expected 'function' got 'function'
 `crates/squirrel-stdlib/tests/serialization_semantics.rs`（2 个测试：
 闭包往返与错误文本、`loadfile` 的文本/空文件嗅探）。
 
+## 三·补19、第十九轮（P2）：宿主 API 补齐（含一个 panic 与一个"回调从不触发"）
+
+### 方法：把对拍搬到宿主 API 这一层
+
+脚本层看不见 member handle / `getfunctioninfo` 这些接口，所以这轮把**参考实现的静态库**
+（`tmp-c2/lib/squirrel.lib` + `sqstdlib.lib`）用 MSVC 编了一个 C 探针
+`tmp-c2/hostapi/ref_host.c`（`build_ref_host.bat`），按固定顺序跑一遍并打印规范化报告
+（`ref_host.txt`）；Rust 侧的断言与那份报告逐项对应。
+
+探针也顺手把**真实签名**暴露了出来（我最初按印象写的几个都是错的）：
+`sq_getfunctioninfo(v, **level**, &fi)` 收的是栈层级；`sq_getrefcount/addref/release`
+收的是 `HSQOBJECT`；`sq_setfreevariable(v, idx, nval)` 是"把栈顶写进第 n 个自由变量"。
+
+### 补齐的 API（`crates/squirrel/src/hostapi.rs`）
+
+| API | 语义（按 `sqapi.cpp` + C 探针实测） |
+|---|---|
+| `get_member_handle(cls, key)` | **只接受类**；成功时参考实现会把键弹掉；`_static` = "不是字段"（方法/静态字段为真）；缺失 → `wrong index`，非类 → `wrong type(expected class or instance)` |
+| `get_by_handle(target, h)` | 静态成员取类的 `methods[i]`、实例字段取实例的 `values[i]`、传类时取 `defaultvalues[i]` |
+| `set_by_handle(target, h, v)` | 不走 `_set` 元方法、不弹栈（栈纪律由调用方负责） |
+| `get_function_info(level)` | 栈层级（0 = 最内层），`native` 标识 native closure；无帧返回 `None` |
+| `set_free_variable(closure, n, v)` | **替换槽位**（不是写穿 open outer），越界 `index out of range` |
+| userdata / typetag / release hook / 引用计数 / foreignptr / resurrect | 内部早就有，这轮当**公开宿主面**钉住（`host_api_ext.rs` 4 个测试） |
+
+### 抓到的两个真缺陷
+
+1. **`_OP_GETOUTER` / `_OP_SETOUTER` 假设 outer 槽里一定是 `Outer`**：
+   `set_free_variable` 往槽里塞普通值后，调用闭包直接 `unreachable!()` panic ✗。
+   参考实现本来就是两个分支（`if(_type == OT_OUTER) … else TARGET = _outervalues[arg2]`），
+   现改成 `outer_slot()` 辅助函数 + 普通值分支，越界索引报可捕获错误。
+2. **userdata 的 release hook 根本不会被调用**：本实现是 `Rc` + GC 链，userdata 通常在
+   `Rc` 析构时就释放了，而 hook 只在 GC finalize 路径里跑 ✗。
+   参考实现是 `SQUserData::Release()` 里"引用计数归零就 `_hook(_data,_size)`"。
+   现把 hook 挂到 `Drop` 上（先走 finalize 就 `take()` 过了，不会重复调）。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/host_api_ext.rs`（4 个测试：member handle、
+`getfunctioninfo`、`setfreevariable`、userdata+refcount+foreignptr+resurrect）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |

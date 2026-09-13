@@ -26,6 +26,7 @@ pub mod config;
 pub mod debug_util;
 pub mod funcproto;
 pub mod funcstate;
+pub mod hostapi;
 pub mod lexer;
 pub mod object;
 pub mod opcodes;
