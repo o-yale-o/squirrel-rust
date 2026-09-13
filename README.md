@@ -6,10 +6,13 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 
 ## 兼容性验证（对齐 C++ Win64 默认构建：`_SQ64`、`SQFloat=f32`、非 UNICODE）
 
+差分一律比对 **stdout + stderr + 退出码**（错误钩子的 CALLSTACK/LOCALS 全在 stderr）。
+
 | 验证项 | 结果 |
 |---|---|
-| 官方 samples/ 全部 17 个脚本，stdout + 退出码差分 | **17/17 一致** |
-| 自建边界语料 26 个（浮点/整数溢出/位运算/错误消息/GC/委托/metamethod/闭包/生成器/format…） | **26/26 一致** |
+| 官方 samples/ 全部 17 个脚本差分 | **17/17 一致** |
+| 自建边界语料 40 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **40/40 一致** |
+| REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
 | `.cnut` 字节码：同一脚本双方 `-c` 输出 | **17/17 字节级完全一致** |
 | `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **17/17 通过** |
 | `cargo test`（单元 + 集成） | **50/50 通过** |
@@ -26,6 +29,8 @@ cargo test                     # 单元 + 集成测试
 ```bash
 python tools/diff_test.py                       # 官方 samples
 python tools/diff_test.py tests-corpus          # 边界语料
+python tools/diff_test.py --no-stderr ...       # 只比 stdout（旧行为）
+python tools/repl_diff.py                       # REPL 会话（tests-repl/*.txt）
 ```
 
 参考 C++ 二进制的构建（一次性）：
@@ -38,10 +43,10 @@ cmake --build build-ref --config Release --target sq_static
 ## 用法（sq.exe 与原版 CLI 一致）
 
 ```bash
-sq.exe script.nut [args...]     # 执行脚本
-sq.exe -c script.nut -o out.cnut  # 编译为字节码（与 C++ 格式互通）
-sq.exe -d script.nut            # 生成调试信息
-sq.exe                          # 交互式 REPL（支持 =expr 求值、花括号续行）
+sq.exe script.nut [args...]       # 执行脚本
+sq.exe -o out.cnut -c script.nut  # 编译为字节码（-o 必须写在脚本路径之前，与原版一致）
+sq.exe -d script.nut              # 生成调试信息
+sq.exe                            # 交互式 REPL（支持 =expr 求值、花括号续行、quit()）
 ```
 
 ## 作为 Rust 库使用
@@ -97,12 +102,16 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 - `%` 除零**静默失败**（`_OP_MOD` 无 `_GUARD`，目标槽保持原值）；
 - 表构造器内不允许匿名函数值（`{ f = function(){} }` 编译错误）；
 - 表内函数用 `function name(){}`；`base` 是关键字不能作标识符；
-- REPL 每行独立编译（`local` 不跨行）；
-- 运行时错误退出码为 0（retval 不被错误覆盖）；
-- 整数除法向零截断；`10/4 == 2`；float 打印走 CRT `%g` 语义。
+- REPL 每行独立编译（`local` 不跨行）；`}` 出现在字符串里也会减少花括号计数；
+- 运行时错误退出码为 0（retval 不被错误覆盖）；CLI 加载失败时退出码为 −2；
+- `-o` 必须写在脚本路径之前，否则被当作脚本参数忽略；
+- 整数除法向零截断；`10/4 == 2`；float 打印走 CRT `%g` 语义；
+- `escape` 对 ≥0x80 的字节输出 32 位补码十六进制（`\xffffffe9`）；
+- `date` 的 `month`/`wday`/`yday` 沿用 `tm` 约定（0 基），`'u'` 走 gmtime。
 
 ## 已知限制
 
-- `getstackinfos` 的 LOCALS 输出为简化格式；
-- `sqstd_loadfile` 的 UTF-8 BOM/UCS2 嗅探未实现（.cnut 嗅探已实现）；
-- `file` 的 stdin 读取为行缓冲近似（CRT 是完全缓冲，交互式逐字节读有差异）。
+- `file` 的 stdin 读取为行缓冲近似（CRT 是完全缓冲，交互式逐字节读有差异）；
+- 少数**参考实现自身越界/UB** 的场景取确定性行为（详见 `STATUS.md` 第四节）：
+  `escape` 短字符串中的高位字节、`getstackinfos(-1)`、UCRT `date` 上界、
+  在已挂起的线程上再次 `call()`、REPL 读到 EOF。

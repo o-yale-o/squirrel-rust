@@ -271,15 +271,39 @@ fn date_fn(v: &mut VmData) -> SQInteger {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // ↔ _system_date：date() / date(t) / date(t, 'u'|'l')
+    let mut format = b'l' as SQInteger;
     if top > 1 {
         t = v.stack_get(2).as_integer();
+        if top > 2 {
+            format = v.stack_get(3).as_integer();
+        }
     }
-    // 简易 UTC 日期换算（localtime 与 UTC 的差异按环境而定；用 UTC）
+    // ↔ MSVC CRT 的可表示范围：gmtime 自 −43200 起，localtime 不接受负值；
+    // 上界为 UCRT 内部常量（约 3001-01-19，此处取实测可用上界）。超范围时 CRT 返回 NULL。
+    const CRT_MAX_TIME: i64 = 32_536_800_000;
+    let is_utc = format == b'u' as SQInteger;
+    if t > CRT_MAX_TIME || (is_utc && t < -43200) || (!is_utc && t < 0) {
+        return throw_error(v, "crt api failure");
+    }
     let days = t.div_euclid(86400);
     let secs = t.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    let wday = ((days + 4).rem_euclid(7)) as SQInteger; // 1970-01-01 是周四
-    let yday = day_of_year(y, m, d);
+    let (y0, m1, d0) = civil_from_days(days);
+    let (mut y, mut d, mut mon0) = (y0, d0, m1 - 1); // tm_mon 是 0 基
+    let (mut hour, mut minute, mut sec) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    if !is_utc {
+        // ↔ localtime（含夏令时）；非 Windows 平台退回 UTC
+        if let Some((ly, lm0, ld, lh, lmi, ls)) = to_local_time(y, mon0, d, hour, minute, sec) {
+            y = ly;
+            mon0 = lm0;
+            d = ld;
+            hour = lh;
+            minute = lmi;
+            sec = ls;
+        }
+    }
+    let wday = ((days_from_civil(y, mon0 + 1, d) + 4).rem_euclid(7)) as SQInteger; // 1970-01-01 是周四
+    let yday = day_of_year(y, mon0 + 1, d);
     let t2 = SQ_TABLE_CREATE!(v);
     {
         let tt = match &t2 {
@@ -287,17 +311,80 @@ fn date_fn(v: &mut VmData) -> SQInteger {
             _ => unreachable!(),
         };
         let mut b = tt.borrow_mut();
-        b.new_slot(&v.ss.intern(b"sec"), &Value::Integer(secs % 60));
-        b.new_slot(&v.ss.intern(b"min"), &Value::Integer((secs / 60) % 60));
-        b.new_slot(&v.ss.intern(b"hour"), &Value::Integer(secs / 3600));
+        b.new_slot(&v.ss.intern(b"sec"), &Value::Integer(sec));
+        b.new_slot(&v.ss.intern(b"min"), &Value::Integer(minute));
+        b.new_slot(&v.ss.intern(b"hour"), &Value::Integer(hour));
         b.new_slot(&v.ss.intern(b"day"), &Value::Integer(d));
-        b.new_slot(&v.ss.intern(b"month"), &Value::Integer(m));
+        b.new_slot(&v.ss.intern(b"month"), &Value::Integer(mon0));
         b.new_slot(&v.ss.intern(b"year"), &Value::Integer(y));
         b.new_slot(&v.ss.intern(b"wday"), &Value::Integer(wday));
         b.new_slot(&v.ss.intern(b"yday"), &Value::Integer(yday));
     }
     v.push(t2);
     1
+}
+
+/// ↔ civil_from_days 的逆运算（m 为 1 基，与 C++ days_from_civil 相同）
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// ↔ localtime：Windows 用 SystemTimeToTzSpecificLocalTime（自动处理夏令时）
+#[cfg(windows)]
+fn to_local_time(y: i64, m0: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct WinSystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    extern "system" {
+        fn SystemTimeToTzSpecificLocalTime(
+            tz: *const core::ffi::c_void,
+            utc: *const WinSystemTime,
+            local: *mut WinSystemTime,
+        ) -> i32;
+    }
+    let utc = WinSystemTime {
+        year: y as u16,
+        month: (m0 + 1) as u16,
+        day_of_week: 0,
+        day: d as u16,
+        hour: h as u16,
+        minute: mi as u16,
+        second: s as u16,
+        milliseconds: 0,
+    };
+    let mut local = utc;
+    let ok = unsafe { SystemTimeToTzSpecificLocalTime(core::ptr::null(), &utc, &mut local) };
+    if ok == 0 {
+        return None;
+    }
+    Some((
+        local.year as i64,
+        local.month as i64 - 1,
+        local.day as i64,
+        local.hour as i64,
+        local.minute as i64,
+        local.second as i64,
+    ))
+}
+
+#[cfg(not(windows))]
+fn to_local_time(_y: i64, _m0: i64, _d: i64, _h: i64, _mi: i64, _s: i64) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    None
 }
 
 macro_rules! SQ_TABLE_CREATE {
@@ -517,14 +604,14 @@ pub fn register_stringlib(vm: &mut VmData) {
         _ => return,
     };
 
-    reg_global(&ss, &root, "format", Rc::new(string_format), -1, Some("."));
+    reg_global(&ss, &root, "format", Rc::new(string_format), -2, Some(".s"));
     reg_global(&ss, &root, "printf", Rc::new(|v: &mut VmData| {
         // ↔ printf：format 到 scratchpad 后经 printfunc 输出
         match string_format_impl(v, false) {
             Some(_) => 0,
             None => SQ_ERROR,
         }
-    }), -1, Some("."));
+    }), -2, Some(".s"));
     reg_global(&ss, &root, "strip", Rc::new(|v| string_strip_impl(v, Trim::Both)), 2, Some(".s"));
     reg_global(&ss, &root, "lstrip", Rc::new(|v| string_strip_impl(v, Trim::Left)), 2, Some(".s"));
     reg_global(&ss, &root, "rstrip", Rc::new(|v| string_strip_impl(v, Trim::Right)), 2, Some(".s"));
@@ -651,9 +738,9 @@ fn string_format_impl(v: &mut VmData, push_result: bool) -> Option<()> {
                 }
                 s.into_bytes()
             }
-            b'e' => squirrel::cformat::format_e(aval.as_float() as f64, p.unwrap_or(6)).into_bytes(),
+            b'e' => squirrel::cformat::format_e_crt(aval.as_float() as f64, p.unwrap_or(6)).into_bytes(),
             b'E' => {
-                let s = squirrel::cformat::format_e(aval.as_float() as f64, p.unwrap_or(6));
+                let s = squirrel::cformat::format_e_crt(aval.as_float() as f64, p.unwrap_or(6));
                 s.to_uppercase().into_bytes()
             }
             _ => {
@@ -717,34 +804,36 @@ fn string_strip_impl(v: &mut VmData, t: Trim) -> SQInteger {
 }
 
 fn string_split(v: &mut VmData) -> SQInteger {
-    let s = v.stack_get(1);
-    let seps = v.stack_get(2);
+    // ↔ _string_split：栈 [this, str, seps, skipempty?]
+    let s = v.stack_get(2);
+    let seps = v.stack_get(3);
+    if seps.as_bytes().is_empty() {
+        return throw_error(v, "empty separators string");
+    }
     let mut skipempty = false;
-    if v.top - v.stackbase > 2 {
-        skipempty = !VmData::is_false(&v.stack_get(3));
+    if v.top - v.stackbase > 3 {
+        skipempty = !VmData::is_false(&v.stack_get(4));
     }
     let src = s.as_bytes();
     let seps = seps.as_bytes();
     let arr = squirrel::array::SQArray::create(&v.ss, 0);
     let mut start = 0usize;
-    let mut i = 0usize;
-    while i < src.len() {
-        if seps.contains(&src[i]) {
-            let piece = &src[start..i];
-            if !piece.is_empty() || !skipempty {
-                let s2 = v.ss.intern(piece);
+    let mut end = 0usize;
+    while end < src.len() {
+        let cur = src[end];
+        if seps.contains(&cur) {
+            if !skipempty || end != start {
+                let s2 = v.ss.intern(&src[start..end]);
                 arr.borrow_mut().append(&s2);
             }
-            start = i + 1;
+            start = end + 1;
         }
-        i += 1;
+        end += 1;
     }
-    if start <= src.len() {
-        let piece = &src[start..];
-        if !piece.is_empty() || !skipempty {
-            let s2 = v.ss.intern(piece);
-            arr.borrow_mut().append(&s2);
-        }
+    // ↔ if(end != start)：尾段为空时不追加（与 skipempty 无关）
+    if end != start {
+        let s2 = v.ss.intern(&src[start..end]);
+        arr.borrow_mut().append(&s2);
     }
     v.push(Value::Array(arr));
     1
@@ -753,23 +842,25 @@ fn string_split(v: &mut VmData) -> SQInteger {
 fn string_escape(v: &mut VmData) -> SQInteger {
     let s = v.stack_get(2);
     let src = s.as_bytes();
-    let mut out = Vec::with_capacity(src.len());
+    let mut out: Vec<u8> = Vec::with_capacity(src.len() * 4);
     for &c in src {
-        match c {
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\'' => out.extend_from_slice(b"\\'"),
-            0x07 => out.extend_from_slice(b"\\a"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0B => out.extend_from_slice(b"\\v"),
-            0x0C => out.extend_from_slice(b"\\f"),
-            c if c < 32 || c >= 127 => {
-                out.extend_from_slice(format!("\\x{:02x}", c).as_bytes())
+        // ↔ _string_escape：scisprint(c) || c == 0 走「具名转义」分支（控制字符因 isprint
+        // 为假实际落到 \xNN），其余一律 sprintf("\\x%02x", c)
+        if c == 0 {
+            out.extend_from_slice(b"\\0");
+        } else if (0x20..0x7f).contains(&c) {
+            match c {
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\'' => out.extend_from_slice(b"\\'"),
+                _ => out.push(c),
             }
-            c => out.push(c),
+        } else if c < 0x80 {
+            out.extend_from_slice(format!("\\x{:02x}", c).as_bytes());
+        } else {
+            // SQChar 是有符号 char：%02x 收到负数 → 32 位补码的 8 位十六进制
+            // （参考实现在小字符串上会越界写出不确定内容，这里取确定性的同一取值）
+            out.extend_from_slice(format!("\\x{:08x}", (c as i8) as i32 as u32).as_bytes());
         }
     }
     let s2 = v.ss.intern(&out);

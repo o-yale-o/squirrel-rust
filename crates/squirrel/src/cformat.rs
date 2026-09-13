@@ -59,6 +59,22 @@ pub fn format_g_prec(value: f64, prec: usize) -> String {
     }
 }
 
+/// ↔ printf("%.<prec>e", v)（MSVC 指数至少 2 位，**不**去尾随零）
+///
+/// CRT 的 %e 与 %g 不同：%e 保留全部有效位（`format("%e", 1234.5)` → `1.234500e+03`）。
+pub fn format_e_crt(value: f64, prec: usize) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    let s = format!("{:.*e}", prec, value);
+    let (m, e) = s.split_once('e').unwrap();
+    let x: i32 = e.parse().unwrap();
+    format!("{}e{}{:02}", m, if x < 0 { "-" } else { "+" }, x.abs())
+}
+
 /// ↔ printf("%.<prec>f", v)
 pub fn format_f(value: f64, prec: usize) -> String {
     if value.is_nan() {

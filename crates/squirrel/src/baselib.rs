@@ -734,8 +734,7 @@ fn container_rawget(v: &mut VmData) -> NativeResult {
     // ↔ sq_rawget(v,-2)：self 在 -2，key 在 -1
     let self_ = v.get_up(-2);
     let key = v.get_up(-1);
-    let r = raw_get(v, &self_, &key);
-    match r {
+    match raw_get(v, &self_, &key) {
         Some(val) => {
             v.pop();
             v.push(val);
@@ -743,7 +742,17 @@ fn container_rawget(v: &mut VmData) -> NativeResult {
         }
         None => {
             v.pop();
-            let _: Result<Value, Value> = v.raise_idx_error(&key);
+            // ↔ sq_rawget 的失败分支：只有数组的非法索引类型是另一条消息
+            let msg = match &self_ {
+                Value::Array(_) if !matches!(key, Value::Integer(_) | Value::Float(_)) => {
+                    "invalid index type for an array"
+                }
+                Value::Table(_) | Value::Class(_) | Value::Instance(_) | Value::Array(_) => {
+                    "the index doesn't exist"
+                }
+                _ => "rawget works only on array/table/instance and class",
+            };
+            v.raise_error_str(msg);
             SQ_ERROR
         }
     }
@@ -754,6 +763,13 @@ fn raw_get(_v: &mut VmData, self_: &Value, key: &Value) -> Option<Value> {
         Value::Table(t) => t.borrow().get(key),
         Value::Class(c) => c.borrow().get(key),
         Value::Instance(i) => i.borrow().get(key),
+        Value::Array(a) => {
+            if matches!(key, Value::Integer(_) | Value::Float(_)) {
+                a.borrow().get(key.as_integer())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
