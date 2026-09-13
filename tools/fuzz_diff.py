@@ -408,7 +408,13 @@ def compare(src, tag, require_done=True):
     rc_r, out_r, err_r = run(RUST, path)
     rc_f, out_f, err_f = run(REF, path)
     if rc_r == TIMEOUT_RC or rc_f == TIMEOUT_RC:
-        # 变异把有界循环改成了死循环是常事；两侧任一超时就跳过（不算差异）
+        # 变异把有界循环/有界递归改成死循环是常事。
+        #   - 只有**参考实现**超时：属于 MIGRATION.md 记录的资源上限偏离
+        #     （参考实现没有栈/指令上限，无限递归会一路涨到系统杀进程，实测吃满 32GB），
+        #     我们封顶并给可捕获错误 → 归 ref-limit，不算差异；
+        #   - 两侧都超时：语义一致（都判定为死循环），跳过。
+        if rc_f == TIMEOUT_RC and rc_r != TIMEOUT_RC:
+            return "ref-limit", "ref 超时 >%ds，rust 正常返回（资源上限偏离）" % TIMEOUT
         side = ("rust" if rc_r == TIMEOUT_RC else "") + ("+ref" if rc_f == TIMEOUT_RC else "")
         return "timeout", "%s 超过 %ds" % (side.strip("+") or "?", TIMEOUT)
     if require_done:
@@ -502,7 +508,7 @@ def main():
 
     seeds = [args.seed] if args.seed is not None else list(range(1, args.seeds + 1))
     stat = {"ok": 0, "diff": 0, "ref-ub": 0, "rust-fail": 0, "both-fail": 0,
-            "known-dev": 0, "timeout": 0}
+            "known-dev": 0, "timeout": 0, "ref-limit": 0}
     fails = []
     badgen = []
     for s in seeds:
@@ -537,6 +543,8 @@ def main():
             print("known-dev seed=%d %s from=%s" % (s, detail, origin))
         elif kind == "timeout":
             print("timeout seed=%d %s from=%s" % (s, detail, origin))
+        elif kind == "ref-limit":
+            print("ref-limit seed=%d %s from=%s" % (s, detail, origin))
         elif kind == "rust-fail":
             path = os.path.join(WORK, "rustfail_%d.nut" % s)
             shutil.copy(os.path.join(WORK, "case_%s.nut" % tag), path)
@@ -556,7 +564,8 @@ def main():
                 pass
 
     print("\n== 结果 ==")
-    for k in ("ok", "diff", "ref-ub", "rust-fail", "both-fail", "known-dev", "timeout"):
+    for k in ("ok", "diff", "ref-ub", "rust-fail", "both-fail", "known-dev",
+              "timeout", "ref-limit"):
         print("  %-10s %d" % (k, stat[k]))
     if fails:
         print("\n需要人工看的（真实差异/我方失败）：")
