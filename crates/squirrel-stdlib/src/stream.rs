@@ -237,8 +237,40 @@ fn std_handle_info(_fd: u8) -> (bool, Option<SQInteger>) {
     (false, None)
 }
 
+/// CRT 模式串是否合法（↔ `fopen` 接受的那一档）。
+///
+/// 第一个字符必须是 `r`/`w`/`a`，其余只允许 `+ b t c n`（同一个字符不能重复；
+/// 空格按实测是允许的：参考实现 `file(p,"r b")` 正常，`"r\tb"` 则崩）。
+fn mode_is_valid(mode: &str) -> bool {
+    let b = mode.as_bytes();
+    if b.is_empty() || !matches!(b[0], b'r' | b'w' | b'a') {
+        return false;
+    }
+    let mut seen = [false; 128];
+    for &c in &b[1..] {
+        match c {
+            b' ' => continue,
+            b'+' | b'b' | b't' | b'c' | b'n' => {
+                if seen[c as usize] {
+                    return false;
+                }
+                seen[c as usize] = true;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl FileBackend {
     pub fn from_path(filename: &str, mode: &str) -> Option<FileBackend> {
+        // ↔ CRT 模式串校验。参考实现把模式串**直接**交给 `fopen`：非法模式会落到
+        // UCRT 的 invalid parameter handler（`__fastfail`），实测
+        // `file("x","z")` / `""` / `"R"` / `"rbb"` / `"trash"` 全部 `0xC0000409` 崩溃
+        // （STATUS 第四节）。本实现改成**可捕获**的 `cannot open file`。
+        if !mode_is_valid(mode) {
+            return None;
+        }
         let mut opts = std::fs::OpenOptions::new();
         // ↔ CRT 模式串
         let read = mode.contains('r');

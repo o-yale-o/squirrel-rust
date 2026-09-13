@@ -685,6 +685,46 @@ foreach (c in "\u00e9") …   // 同一条路径，也拿到 -61 / -87
 `crates/squirrel-stdlib/tests/lexer_semantics.rs`（2 个测试：字符串字节有符号性、
 优先级/短路/作用域/循环捕获/自增返回值），期望值先经参考实现实测确认。
 
+## 三·补12、第十二轮（P1-4）：blob / stream 二进制矩阵
+
+`tools/gen_blobmap.py` → `tests-corpus/t_blobmap.nut`：**133 条**
+（源探针 `tmp-c2/blobprobe.nut` 56 条 + 生成式扩充：`writen`/`readn` 的
+**格式 × 值** 往返矩阵、`seek`/`resize` 组合、`swap2/swap4`、`readblob`/`writeblob`、
+文件流往返与模式），两侧**逐字节一致**。
+
+覆盖到的类型分派（↔ `sqstdstream.cpp`）：`l`(int64) `i`(int32) `s`(short) `w`(u16)
+`c`(char) `b`(uchar) `f`(float) `d`(double)，含截断（`writen(70000,'s')` → `70 11`）、
+小端字节序、`readn` 到 EOF 报 `io error`、`readblob` 无数据报 `no data left to read`、
+`writen` 非法格式报 `invalid format`、`swap2/swap4` 的成对/四字节翻转。
+
+### 抓到的一处参考实现崩溃：非法文件模式
+
+参考实现把模式串**直接**交给 `fopen`，非法模式会落到 UCRT 的 invalid parameter
+handler（`__fastfail`），实测这些全部 `0xC0000409` 崩溃：
+
+```
+file(p, "")  file(p, "z")  file(p, "zz")  file(p, "R")  file(p, "RB")
+file(p, "rx")  file(p, "rw")  file(p, "rbb")  file(p, "trash")  file(p, "r\tb")
+```
+
+而 `r rb r+ rb+ rt w wb w+ wb+ a ab a+ ab+ w+b` 与 `"r b"`（空格）都能正常打开。
+本实现原来用 `mode.contains('r'/'w'/'a')` 解析，垃圾模式会被当成只读打开 ✗；
+现改为**显式白名单校验**（首字符 r/w/a，其余只允许 `+ b t c n`、不重复、空格忽略），
+非法模式给可捕获的 `cannot open file` —— 接受集与参考实现实测一致，崩的那一档
+变成可捕获错误（记入第四节）。
+
+### 工具
+
+`tmp-c2/bisect_cases2.py`：按**括号配对**切分探针用例并二分定位"让参考实现崩/卡住"
+的那一条（原来的 `find_bad.py` 按行切，遇到多行用例会切坏）。这一轮就是靠它定位的
+（现象是参考实现**完全没有输出**——stdout 是块缓冲，崩溃时全丢）。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/stream_semantics.rs` 扩到 4 个测试：
+`writen/readn` 类型分派与字节序、非法模式可捕获（`ref-crash-skip`）、
+外加原有的文件/blob 流语义与 `readblob` 夹取。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
@@ -706,6 +746,7 @@ foreach (c in "\u00e9") …   // 同一条路径，也拿到 -61 / -87
 | 正则的递归/步数上限 | 参考实现没有上限：空匹配量词（`(a*)*`）有死循环风险，嵌套超过 4000 层就 `0xC00000FD`（实测 8000 层崩溃）。本实现给 `MAX_RE_STEPS` + **栈预算**（按局部变量地址差估算，CLI 下 8MB、库默认 384KB），超限按不匹配或可捕获错误处理。现在 4000 层以内与参考一致，8000 层以上参考崩溃而我们正常/报错 |
 | 移位计数越界 | x86 硬件移位只用计数低 6 位（`1 << 64` == `1 << 0`、`1 << -1` == `1 << 63`）。C++ 侧形式上是 UB，但 MSVC 实测就是这个语义，本实现按同一语义（`wrapping_shl/shr`）对齐并把越界计数纳入语料 |
 | `INT64_MIN / -1`、`INT64_MIN % -1` | x86 `idiv` 商溢出触发硬件异常，参考实现 `STATUS_INTEGER_OVERFLOW(0xC0000095)` **崩溃**（用户实际见过那个崩溃框）；本实现回绕成 `INT64_MIN` / `0`。不进差分语料（参考实现活不下来），由 `numeric_semantics.rs` 守门 |
+| `file(路径, <非法模式>)` | 模式串直接交给 `fopen`，非法模式落到 UCRT invalid parameter handler（`__fastfail`）：实测 `""` / `"z"` / `"R"` / `"rbb"` / `"trash"` / `"r\tb"` 全部 `0xC0000409` 崩溃；合法的 `r rb r+ rb+ rt w wb w+ wb+ a ab a+ ab+ w+b` 与 `"r b"` 正常。本实现白名单校验（接受集与实测一致），非法模式给可捕获 `cannot open file` |
 | 宿主栈大小与"Rust 不如 C++"的错觉 | Rust 可执行文件主线程栈默认 1MB（Windows），比 MSVC 版能用的深度小；CLI 已改成在 16MB 栈线程上跑。**注意**：库调用方（FFI/host api）仍在自己的栈上执行，所以正则递归用栈预算保护，不假定有大栈 |
 | 字符串/对象的回收时机 | 参考实现用引用计数**即时**回收；本实现是 `Rc` + 显式 GC，靠"清死条目"把内存拉回同一量级（20 万次拼接 2000MB → 18MB，参考 5.2MB）。`collectgarbage()` 的返回计数因此不同（本实现已经自动清过一部分） |
 | REPL 读到 EOF | 参考实现在 EOF 后死循环（`getchar()` 返回 −1 被当作字符累积）；本实现直接退出 |

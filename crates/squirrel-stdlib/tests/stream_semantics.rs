@@ -104,3 +104,78 @@ fn blob_len_is_trusted_so_readblob_is_not_clamped_to_zero() {
     assert!(r.is_ok(), "blob 流应能正常工作");
     assert_eq!(String::from_utf8_lossy(&out.borrow()), "0,4\n");
 }
+
+/// `writen`/`readn` 的**类型分派**与字节序（↔ sqstdstream.cpp 的 `_stream_writen/readn`）。
+///
+/// 期望值全部用参考实现实测确认（语料侧还有 `tests-corpus/t_blobmap.nut` 的 133 条守门）。
+#[test]
+fn blob_writen_readn_type_dispatch_matches_reference() {
+    let src = r#"
+        function hx(b) {
+            local out = b.len() + ":";
+            for (local i = 0; i < b.len(); i++) out += format("%02x", b[i]);
+            return out;
+        }
+        // 小端：258 = 0x0102 → 'i' 写 02 01 00 00
+        local b = blob(0); b.writen(258, 'i'); print(hx(b) + "\n");
+        local c = blob(0); c.writen(258, 's'); print(hx(c) + "\n");
+        local d = blob(0); d.writen(258, 'c'); print(hx(d) + "\n");
+        local e = blob(0); e.writen(-1, 'i'); print(hx(e) + "\n");
+        // 读回
+        local f = blob(0); f.writen(258, 'i'); f.writen(1.5, 'f'); f.writen(-3, 's');
+        print(f.len() + "\n");
+        f.seek(0);
+        print(f.readn('i') + "," + f.readn('f') + "," + f.readn('s') + "\n");
+        print(f.tell() + "/" + f.eos() + "\n");
+        // 截断：'c' 只写 1 字节、's' 只写 2 字节
+        local g = blob(0); g.writen(70000, 's'); print(hx(g) + "\n");
+        // 交换
+        local s2 = blob(0); s2.writen(258, 'i'); s2.swap2(); print(hx(s2) + "\n");
+        local s4 = blob(0); s4.writen(258, 'i'); s4.swap4(); print(hx(s4) + "\n");
+        // 错误路径
+        try { local x = blob(0); x.writen(1, 'z'); print("no\n"); } catch (err) { print("E:" + err + "\n"); }
+        try { local x = blob(2); x.readn('l'); print("no\n"); } catch (err) { print("E:" + err + "\n"); }
+        try { local x = blob(0); x.readblob(1); print("no\n"); } catch (err) { print("E:" + err + "\n"); }
+    "#;
+    let (out, _err) = run_capture(src);
+    assert_eq!(
+        out,
+        "4:02010000\n2:0201\n1:02\n4:ffffffff\n10\n258,1.5,-3\n10/1\n2:7011\n\
+         4:01020000\n4:00000102\nE:invalid format\nE:io error\nE:no data left to read\n"
+    );
+}
+
+/// 非法文件模式：**参考实现直接崩溃**（UCRT invalid parameter handler → 0xC0000409），
+/// 本实现必须给可捕获错误而不是跟着崩。合法模式集合是按参考实现实测的"接受集"定的。
+/// ref-crash-skip（给 tmp-c2/check_rs_scripts.py 用）
+#[test]
+fn invalid_file_modes_are_catchable_errors() {
+    let dir = std::env::temp_dir().join("sqrust_mode_test.bin");
+    let p = dir.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        r#"
+        function try_mode(m) {{
+            try {{ local f = file("{p}", m); f.close(); return m + ":ok"; }}
+            catch (e) {{ return m + ":E"; }}
+        }}
+        print(try_mode("w") + "\n");
+        print(try_mode("wb") + "\n");
+        print(try_mode("a") + "\n");
+        print(try_mode("w+b") + "\n");
+        print(try_mode("r") + "\n");
+        print(try_mode("rb") + "\n");
+        print(try_mode("") + "\n");
+        print(try_mode("z") + "\n");
+        print(try_mode("zz") + "\n");
+        print(try_mode("R") + "\n");
+        print(try_mode("RB") + "\n");
+        print(try_mode("rbb") + "\n");
+        print(try_mode("trash") + "\n");
+    "#
+    );
+    let (out, _err) = run_capture(&src);
+    assert_eq!(
+        out,
+        "w:ok\nwb:ok\na:ok\nw+b:ok\nr:ok\nrb:ok\n:E\nz:E\nzz:E\nR:E\nRB:E\nrbb:E\ntrash:E\n"
+    );
+}
