@@ -14,6 +14,8 @@
   cnut          .cnut 字节一致 + 双向交叉执行（C++ 编译的给 Rust 跑，反之亦然）
   lint          语料自检（文件能编译、不残留副作用文件等）
   health        语料"假绿"体检：用例是否真的执行到了（详见 tools/corpus_health.py）
+  writes        语料里的"写文件"用例是否都配了删除（漏删会污染工作区，详见
+                tools/audit_corpus_writes.py）
   audit-*       全局函数表 / 委托表 / 根表插入顺序与参考实现逐项对照
   cargo test    单元 + 集成 + 健壮性 + 字节码互通 + 各语义矩阵
 """
@@ -32,6 +34,7 @@ STEPS = [
     ("cnut", [PY, "tools/cnut_matrix.py", "tests-corpus"]),
     ("lint", [PY, "tools/lint_corpus.py"]),
     ("health", [PY, "tools/corpus_health.py", "--terse"]),
+    ("writes", [PY, "tools/audit_corpus_writes.py"]),
     ("audit-globals", [PY, "tools/audit_globals.py"]),
     ("audit-delegates", [PY, "tools/audit_delegates.py"]),
     ("audit-regorder", [PY, "tools/audit_regorder.py"]),

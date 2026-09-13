@@ -61,7 +61,14 @@ t("file_line", function() {
     remove("robust_surface2.txt");
     return n;
 });
-t("file_typeof", function() { return typeof file("robust_surface3.txt", "wb+").close(); });
+// 注意：这条会真的创建 robust_surface3.txt，所以必须自己删掉 —— 语料在仓库根目录跑，
+// 漏删就会把垃圾留在工作区（曾经把 robust_surface3.txt 提交进仓库一次）。
+// remove 对不存在的文件会抛错，所以用 try 包住，保证这条用例的输出与原来一致。
+t("file_typeof", function() {
+    local r = typeof file("robust_surface3.txt", "wb+").close();
+    try { remove("robust_surface3.txt"); } catch (e) {}
+    return r;
+});
 t("file_stdout_type", function() { return typeof stdout + typeof stderr + typeof stdin; });
 t("file_len", function() {
     local f = file("robust_surface4.txt", "wb+");

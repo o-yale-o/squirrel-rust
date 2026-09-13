@@ -23,4 +23,6 @@ show("badarg2", function() { return writeclosuretofile("tmp_x.cnut", 1); });
 show("badpath", function() { return writeclosuretofile("no_such_dir/x.cnut", f); });
 remove("tmp_closure_io.cnut");
 remove("tmp_closure_io2.cnut");
+// badarg2 会先把文件建出来再报错，所以也要清掉（remove 对不存在的文件会抛错，用 try 包住）
+try { remove("tmp_x.cnut"); } catch (e) {}
 print("done\n");

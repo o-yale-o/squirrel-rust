@@ -102,7 +102,13 @@ t("file_seek_modes", function() {
     f.close(); remove("robust_text3.txt");
     return c;
 });
-t("file_double_close", function() { local f = file("robust_text4.txt", "wb+"); f.close(); f.close(); return "ok"; });
+// 同样：这条会创建 robust_text4.txt，跑完自己删（remove 对不存在的文件会抛错，用 try 包住）
+t("file_double_close", function() {
+    local f = file("robust_text4.txt", "wb+");
+    f.close(); f.close();
+    try { remove("robust_text4.txt"); } catch (e) {}
+    return "ok";
+});
 
 // 其它未测语义
 t("attributes_inherit", function() {
