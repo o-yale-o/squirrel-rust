@@ -178,6 +178,8 @@ def main():
                 'try {{ c = clone o; }} catch (e) {{ err = "" + e; }} '
                 'local extra = (err == null) ? (" copy[" + obs(c) + "]") : (" cloneErr=" + err); '
                 'return "orig[" + obs(o) + "]" + extra; }});' % (prefix, sname, sexpr))
+    # 收尾：矩阵会反复重建同一个临时文件，跑完必须删掉（曾经把它提交进仓库过一次）
+    lines.append('remove("streammap_tmp.bin");')
     lines.append('print("STREAMMAP-DONE\\n");')
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")

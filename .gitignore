@@ -6,3 +6,8 @@ build-ref
 out.cnut
 tmp-c2/
 __pycache__/
+# 语料脚本运行时在仓库根目录留下的临时文件（正常都会自己删掉，这里兜底；
+# streammap_tmp.bin 曾经因为没清理被提交进仓库一次）
+diff_test_rw.txt
+diff_test_seekneg.txt
+streammap_tmp.bin

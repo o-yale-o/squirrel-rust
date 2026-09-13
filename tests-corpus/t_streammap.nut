@@ -1198,4 +1198,5 @@ t("ff_posend_clone", function() {{ local o = fz_at(4); local c = null; local err
 t("ff_seekfail_clone", function() {{ local o = fz_seekfail(); local c = null; local err = null; try {{ c = clone o; }} catch (e) {{ err = "" + e; }} local extra = (err == null) ? (" copy[" + obs(c) + "]") : (" cloneErr=" + err); return "orig[" + obs(o) + "]" + extra; }});
 t("ff_resized_up_clone", function() {{ local o = fz_resized_up(); local c = null; local err = null; try {{ c = clone o; }} catch (e) {{ err = "" + e; }} local extra = (err == null) ? (" copy[" + obs(c) + "]") : (" cloneErr=" + err); return "orig[" + obs(o) + "]" + extra; }});
 t("ff_resized_down_clone", function() {{ local o = fz_resized_down(); local c = null; local err = null; try {{ c = clone o; }} catch (e) {{ err = "" + e; }} local extra = (err == null) ? (" copy[" + obs(c) + "]") : (" cloneErr=" + err); return "orig[" + obs(o) + "]" + extra; }});
+remove("streammap_tmp.bin");
 print("STREAMMAP-DONE\n");
