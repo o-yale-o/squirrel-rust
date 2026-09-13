@@ -169,13 +169,18 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 而**两边报同一个编译错误时完全一致 → 假绿**。我新写的 5 个广度语料里有 4 个其实根本没编译通过
 （`{ b <- 2 }`、`local base`、`class X {} return` 同行、`const` 在函数内、`x &= 1`、
 `f.rawcall()`、`-8 >>> 1`、裸枚举名……全是 Squirrel 不接受、两边报同样错误的写法），
-于是"PASS"了一整轮却什么都没测到。现在：
+于是"PASS"了一整轮却什么都没测到。类似地**脚本中途以未捕获错误结束**（两边一样地早停）
+也会假绿：原语料里的 `t_edge1.nut`（`65.tochar()` 词法成浮点）与 `t_lambda.nut`
+（具名参数块用错）都只跑了几行，而我生成的错误对拍语料 429 行只跑到 25 行。
 
-- `diff_test.py` 对 `Error [ ...` 开头的输出判 **SUSPECT 失败**（可白名单）；
-- `tools/lint_corpus.py` 扫语法陷阱 + 逐个试编译；
-- `opcode_coverage.rs` 顺带把"编译失败的文件"列出来。
+现在有三重守卫（都已生效，并且各自当场抓到了问题）：
 
-修好语法后立刻暴露了两个被掩盖的真问题（都已修）：
+- `diff_test.py` 对 `Error [ ...` 开头的输出判 **SUSPECT 失败**；
+- `diff_test.py` 对**未捕获错误导致提前结束**判 **SUSPECT 失败**（带白名单：测错误打印的用例）；
+- `tools/lint_corpus.py` 扫语法陷阱 + 逐个试编译；`opcode_coverage.rs` 列出编译失败的语料。
+
+修好语法后立刻暴露的问题（全部已修）：
+
 1. **`o.setdelegate(o)` 让 Rust 侧 panic**（`RefCell already mutably borrowed`，rc=101）——
    环检测的 `this_identity` 用了内部结构体地址、与遍历时的 `Rc::as_ptr` 不一致，且 `borrow()`
    撞上调用方持有的 `borrow_mut`。改为身份统一用 `Rc::as_ptr` + 遍历用 `try_borrow`
@@ -184,6 +189,15 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 3. **含 NUL 字符串的打印**：C++ 的 `_printfunc(v,"%s",str)` 在第一个 NUL 处截断
    （`print((0).tochar())` 整行不输出），Rust 侧原来把 NUL 也写出去 → 现在 `print/error/printf`
    都按 `%s` 语义截断。
+4. **`rawset` 语义不完整**（自动错误对拍语料抓到）：实例/数组失败时参考用
+   `Raise_IdxError(key)` 报 `the index 'X' does not exist`，而端口只返回 `SQ_ERROR` 不设消息
+   （脚本 catch 到的是 **null**）；另外缺 `null key` 检查、缺数组分支、class 分支不该看返回值。
+5. **`tointeger(base)` 进制**：参考支持 0（自动识别）/2..36，端口只认 10/16；
+   `"z".tointeger(36)`、`"1".tointeger(0)` 都对不上 → 已按 CRT `strtol` 语义重写。
+6. **`clock` / `split` 注册参数**（全局注册审计抓到）：`clock` 应为 nparams=0、`split` 应为 -3。
+7. **`-0.0` 打印**：MSVC `%g` 输出 `-0`，端口丢符号 → 已修。
+8. **具名参数块**的语义确认：`{ key = value }` 是 SET 到**调用返回值**上（配合返回实例/表的调用），
+   例如 `C() { a = 1, b = 2 }`；写成 `print(kw(1) { b = 2 })` 两边都报错，原语料写法有误。
 
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
@@ -199,6 +213,8 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 | `castf2i` 高位字节 | 参考实现把 `f32` 的 4 字节当 `i64` 读（顺带读相邻栈内存，UB）；本实现只取确定的低 32 位（`f.to_bits()`），低 32 位与参考一致 |
 | 超深嵌套 / 深嵌套值 | 参考实现分别会 `STATUS_STACK_OVERFLOW`；本实现给出可捕获错误或迭代释放（见上节） |
 | 不可 seek 流的 `eos()/tell()/len()` | 实测（`tools/eos_diff.py`）：参考实现走 CRT `ftell`/`fseek`，在管道上 `fseek(SEEK_END)` 失败会破坏流（其后 `readn` 报 `io error`），`stdout.eos()` 返回 `null`、`stdin.eos()` 视剩余数据而 `null`/抛错。本实现返回正常值，不复刻该平台副作用 |
+| `split(<非串>, <非串>)` | 参考实现不检查 `sq_getstring` 的返回值，`str` 未初始化即被 `while(*end)` 解引用 → 写/读非法地址崩溃（Windows 崩溃框）。本实现报 `parameter 1 has an invalid type ...`。因此该形态已从自动生成的错误对拍语料里排除 |
+| `tointeger(base)` 非法进制 | 参考实现把它透给 CRT `strtol`：base=1 / 负数 / >36 是未定义行为，实测 `STATUS_STACK_BUFFER_OVERRUN` 崩溃。本实现报 `cannot convert the string`。合法进制（0=自动识别、2..36、16 带 `0x`）已逐一对齐（`tools/toint_probe.py`） |
 
 > 注：`}` 出现在字符串里仍会减少花括号计数（参考实现的怪癖），本实现按原样复刻——因此
 > 这类会话会让参考实现读到 EOF 后卡死，无法作为差分会话用例。

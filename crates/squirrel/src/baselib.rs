@@ -49,26 +49,45 @@ fn str2num(s: &[u8], base: SQInteger) -> Option<Value> {
             Some(r) => (true, r),
             None => (false, t.strip_prefix('+').unwrap_or(t)),
         };
-        // ↔ strtol(base=16)：跳过可选的 0x/0X 前缀
-        let digits = if base == 16 {
-            digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits)
+        // ↔ scstrtoll(s,&end,base) 的进制语义：
+        //   base 0 → 自动识别（0x/0X 十六进制、前导 0 八进制、否则十进制）
+        //   base 2..36 → 数字 0-9a-zA-Z，值必须 < base；base 16 另外接受 0x 前缀
+        //   base 1 / 负数 / >36 → CRT 未定义行为（参考实现实测**崩溃**），这里报转换失败
+        if base != 0 && !(2..=36).contains(&base) {
+            return None;
+        }
+        let (radix, digits) = if base == 0 {
+            if let Some(r) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+                (16, r)
+            } else if digits.len() > 1 && digits.starts_with('0') {
+                (8, &digits[1..])
+            } else {
+                (10, digits)
+            }
+        } else if base == 16 {
+            (
+                16,
+                digits
+                    .strip_prefix("0x")
+                    .or_else(|| digits.strip_prefix("0X"))
+                    .unwrap_or(digits),
+            )
         } else {
-            digits
+            (base, digits)
         };
         let mut r: SQInteger = 0;
         let mut any = false;
         for c in digits.bytes() {
             let v = match c {
                 b'0'..=b'9' => (c - b'0') as SQInteger,
-                b'a'..=b'f' | b'A'..=b'F' if base > 10 => {
-                    (c.to_ascii_lowercase() - b'a' + 10) as SQInteger
-                }
+                b'a'..=b'z' => (c - b'a' + 10) as SQInteger,
+                b'A'..=b'Z' => (c - b'A' + 10) as SQInteger,
                 _ => break, // ↔ strtol：遇非法字符停止（前缀语义，非失败）
             };
-            if v >= base {
+            if v >= radix {
                 break;
             }
-            r = r.wrapping_mul(base).wrapping_add(v);
+            r = r.wrapping_mul(radix).wrapping_add(v);
             any = true;
         }
         if !any {
@@ -787,36 +806,55 @@ fn raw_get(_v: &mut VmData, self_: &Value, key: &Value) -> Option<Value> {
     }
 }
 
+/// ↔ sq_rawset：table/class 直接 NewSlot；instance/array 失败时用 key 报
+/// "the index 'X' does not exist"；空 key 报 "null key"；其它类型报
+/// "rawset works only on array/table/class and instance"。
 fn container_rawset(v: &mut VmData) -> NativeResult {
     let self_ = v.get_up(-3);
     let key = v.get_up(-2);
     let val = v.get_up(-1);
+    if key.is_null() {
+        v.pop_n(2);
+        return throw_error(v, "null key");
+    }
     match &self_ {
         Value::Table(t) => {
             t.borrow_mut().new_slot(&key, &val);
-            // sq_rawset：弹 key/val，保留 self 在栈顶
             v.pop_n(2);
             1
         }
         Value::Class(c) => {
-            let ok = c.borrow_mut().new_slot(&v.ss, &key, &val, false);
+            // ↔ _class(self)->NewSlot(ss,key,val,false)：返回值被忽略，总是成功
+            c.borrow_mut().new_slot(&v.ss, &key, &val, false);
             v.pop_n(2);
-            if ok {
-                1
-            } else {
-                SQ_ERROR
-            }
+            1
         }
         Value::Instance(i) => {
-            let ok = i.borrow_mut().set(&key, &val);
-            v.pop_n(2);
-            if ok {
+            if i.borrow_mut().set(&key, &val) {
+                v.pop_n(2);
                 1
             } else {
+                let _: Result<Value, Value> = v.raise_idx_error(&key);
                 SQ_ERROR
             }
         }
-        _ => SQ_ERROR,
+        Value::Array(a) => {
+            let ok = match &key {
+                Value::Integer(_) | Value::Float(_) => a.borrow_mut().set(key.as_integer(), &val),
+                _ => false,
+            };
+            if ok {
+                v.pop_n(2);
+                1
+            } else {
+                let _: Result<Value, Value> = v.raise_idx_error(&key);
+                SQ_ERROR
+            }
+        }
+        _ => {
+            v.pop_n(2);
+            throw_error(v, "rawset works only on array/table/class and instance")
+        }
     }
 }
 

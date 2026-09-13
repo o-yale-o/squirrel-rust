@@ -40,6 +40,16 @@ def load_failed(out):
 # 允许「故意加载失败」的用例（目前没有）
 EXPECT_LOAD_FAILURE = set()
 
+# 允许「脚本中途以未捕获错误结束」的用例（它们就是测错误打印的）
+EXPECT_UNCAUGHT = {
+    "t_bit.nut", "t_blob.nut", "t_deep.nut",
+    "t_errdump1.nut", "t_errdump2.nut", "t_errdump3.nut",
+    # 线程 call() 参数不匹配时，错误处理器会按参考实现打印一次调用栈（两边一致）
+    "t_errmsg2.nut",
+    # 故意用 loadfile(path, true) 触发编译错误打印
+    "t_loadfile_bom.nut",
+}
+
 
 def main(paths, check_stderr=True):
     npass = nfail = 0
@@ -54,6 +64,12 @@ def main(paths, check_stderr=True):
             same = False
             print("SUSPECT %s：脚本本身编译/加载失败（未测到语义）" % name)
             print("  output: %r" % norm(out_r)[:200])
+        if same and norm(err_r).strip() and name not in EXPECT_UNCAUGHT:
+            # 未捕获错误会让脚本**中途停止**，后面的断言根本没跑 —— 这种「两边一样地早停」
+            # 曾经骗过差分测试（新语料 429 行只跑到 25 行仍报 PASS）
+            same = False
+            print("SUSPECT %s：脚本以未捕获错误提前结束（后面的用例没跑到）" % name)
+            print("  stderr: %r" % norm(err_r)[:200])
         if same:
             npass += 1
             print("PASS %s" % name)

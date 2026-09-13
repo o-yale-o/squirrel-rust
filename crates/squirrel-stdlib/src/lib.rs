@@ -228,7 +228,7 @@ pub fn register_systemlib(vm: &mut VmData) {
             .unwrap_or(0.0);
         v.push(Value::Float(t as SQFloat));
         1
-    }), 1, None);
+    }), 0, None); // ↔ _DECL_FUNC(clock,0,NULL)：不做参数个数检查
 
     reg_global(&ss, &root, "time", Rc::new(|v: &mut VmData| {
         let t = std::time::SystemTime::now()
@@ -615,7 +615,7 @@ pub fn register_stringlib(vm: &mut VmData) {
     reg_global(&ss, &root, "strip", Rc::new(|v| string_strip_impl(v, Trim::Both)), 2, Some(".s"));
     reg_global(&ss, &root, "lstrip", Rc::new(|v| string_strip_impl(v, Trim::Left)), 2, Some(".s"));
     reg_global(&ss, &root, "rstrip", Rc::new(|v| string_strip_impl(v, Trim::Right)), 2, Some(".s"));
-    reg_global(&ss, &root, "split", Rc::new(string_split), -2, Some(".ssb"));
+    reg_global(&ss, &root, "split", Rc::new(string_split), -3, Some(".ssb"));
     reg_global(&ss, &root, "escape", Rc::new(string_escape), 2, Some(".s"));
     reg_global(&ss, &root, "startswith", Rc::new(string_startswith), 3, Some(".ss"));
     reg_global(&ss, &root, "endswith", Rc::new(string_endswith), 3, Some(".ss"));

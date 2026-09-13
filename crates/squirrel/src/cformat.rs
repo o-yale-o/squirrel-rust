@@ -32,7 +32,12 @@ pub fn format_g_prec(value: f64, prec: usize) -> String {
         return if value < 0.0 { "-inf" } else { "inf" }.to_string();
     }
     if value == 0.0 {
-        return "0".to_string();
+        // ↔ MSVC printf("%g", -0.0) → "-0"（负零要保留符号）
+        return if value.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
     }
     let p = if prec == 0 { 1 } else { prec };
 
