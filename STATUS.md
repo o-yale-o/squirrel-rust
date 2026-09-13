@@ -9,22 +9,23 @@
 | 验证项 | 复现命令 | 实测结果 |
 |---|---|---|
 | 官方 samples 差分（stdout + stderr + 退出码） | `python tools/diff_test.py` | **17/17 一致** |
-| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **53/53 一致** |
+| 边界语料差分 | `python tools/diff_test.py tests-corpus` | **54/54 一致** |
+| 类/实例语义矩阵（168 条自动 + 81 条语义） | 同上 | **逐行一致** |
 | 委托方法 × 参数形态矩阵（2723 条自动 + 147 条语义） | 同上 | **逐行一致** |
 | 根表插入/迭代顺序 | `python tools/diff_test.py tests-corpus`（`t_roottable.nut`） | **逐行一致**（注册顺序已逐库对齐） |
 | 运算符 × 类型矩阵（3181 条断言） | `python tools/diff_test.py tests-corpus` | **逐行一致** |
 | metamethod 全矩阵（343 个用例 × 18 个 metamethod） | 同上 | **逐行一致** |
 | `format`/`printf` 格式串矩阵（1305 行） | 同上 | **逐行一致** |
 | REPL 交互会话差分 | `python tools/repl_diff.py` | **5/5 一致** |
-| `.cnut` 字节级一致 | `python tools/cnut_matrix.py` | samples **17/17**、语料 **51/51**（少数文件会被标成 `PAD-ONLY`：只差参考实现的未初始化填充，见第四节） |
-| `.cnut` 双向互通 | `python tools/cnut_matrix.py tests-corpus` | **51/51 一致**（含参考实现编译的字节码在本实现上执行） |
+| `.cnut` 字节级一致 | `python tools/cnut_matrix.py` | samples **17/17**、语料 **54/54**（少数文件会被标成 `PAD-ONLY`：只差参考实现的未初始化填充，见第四节） |
+| `.cnut` 双向互通 | `python tools/cnut_matrix.py tests-corpus` | **54/54 一致**（含参考实现编译的字节码在本实现上执行） |
 | 指令覆盖 | `cargo test --test opcode_coverage` | **61/61 条指令被语料覆盖** |
 | 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` + `python tools/minimal_diff.py` | **5/5 通过**；`minimal_diff.py` 把官方 `etc/minimal.c` 真编出来跑，stdout/退出码与本实现**逐字节一致**（`Called foo(), i=1, f=2.5, s='teststring'`） |
 | 流语义（file/blob 的 tell/len/eos/flush） | `python tools/line_diff.py tools/probes/stream_semantics.nut` | **逐行一致**（`cargo test --test stream_semantics` 守门） |
 | stdin / 管道语义 | `python tools/stdin_eof.py` | 文件重定向 **5/5 一致**；管道上 `tell()/eos()` 对齐，残留见第四节 |
 | 委托表成员 | `python tools/audit_delegates.py` | **10 张表 88 个成员全一致** |
 | 全局注册（nparamscheck + 掩码） | `python tools/audit_globals.py` | **62/62 全一致** |
-| 单元 + 集成 + 健壮性测试 | `cargo test` | **72/72 通过** |
+| 单元 + 集成 + 健壮性测试 | `cargo test` | **75/75 通过** |
 | 全局环境覆盖 | `getroottable()` 快照对比 | root 表 **77 个名字逐字一致** |
 | 原生错误消息文本 | 自动生成的错误对拍语料（331 处调用） | **逐行一致** |
 | CLI 保真 | `-v` / `-h` / 编译错误消息 / `-o` 必须前置的怪癖 / 退出码 | 与原版一致 |
@@ -355,10 +356,62 @@ ERROR: AddressSanitizer: heap-buffer-overflow READ of size 4
 以 `<NAME>-DONE` 结尾，若 stdout 里有这个标记就说明脚本跑完了；此时 stderr 可能是「错误被脚本
 catch 住、错误处理器仍打印」的那类情况（两边逐字一致才算过），不该误判为提前结束。
 
+## 三·补6、第六轮：类/实例语义矩阵 + 一次真实的内存爆炸
+
+### 语料
+
+`tools/gen_oopmatrix.py` → `tests-corpus/t_oopmatrix.nut`：168 条自动（5 个类夹具 ×
+6 种接收者 × 28 条访问路径：读字段/读静态/读缺失/属性/调方法/调静态方法/缺失调用/
+typeof/rawget/rawin/in/getclass/getbase/getattributes/delete/赋值/newslot/加字段/
+tostring/len/weakref/成员数/类共享）+ 81 条语义（默认字段值是否共享、构造器默认参数与
+varargs、`base.constructor()`、三层继承与 `base` 链、`instanceof` 链、成员锁定、
+attributes、`this`/`base` 在方法/lambda 里、类作为值、实例 clone 等）。
+
+### 内存爆炸：真实事故、根因与修复
+
+**触发**：无界的**非尾递归**。最小复现是三行脚本，不需要大输入、不需要畸形数据：
+
+```nut
+class C11 { constructor() { local x = C11(); } }   // 或
+function f(n) { local x = f(n + 1); return x; }    // 漏了 base case
+```
+
+**现象**：宿主内存 7GB → 22GB → 32GB 后被系统杀掉。
+
+**为什么**：参考实现的 `SQVM::EnterFrame` 只做 `_stack.resize(newtop + …)`，
+**没有任何上限**；本实现原来逐字照搬。参考实现同样会涨（实测 10 秒 191MB 且在涨），
+本实现涨得更快（同 10 秒 601MB）。
+
+**修复**（`config.rs` + `vm.rs`）：
+
+| 措施 | 说明 |
+|---|---|
+| `MAX_STACK_SLOTS = 1M` / `MAX_CALL_FRAMES = 200k` | 超过就报**可捕获**的 `stack overflow`；正常深递归只需几千帧，实测构造器无限递归峰值 601MB → **32–51MB** |
+| `STACK_RESERVED_SLOTS/FRAMES`（错误处理器/调试钩子余量） | 栈满时错误处理器自己也要压帧；没有余量就会出现「报了 stack overflow 却什么都不打印」（参考实现因为无上限所以能打印） |
+| 未捕获时仍打印错误 + 调用栈 | 与参考实现一致（只是我们的调用栈最多 20 万帧，参考实现到不了那么深就先 OOM 了） |
+
+这是**有意偏离参考实现**的一处，已记入第四节：宁可报可捕获错误，也不让脚本拖死宿主。
+
+### 测试方法学（这轮又抓出两个假绿/假故障）
+
+1. **`diff_test.py` 把「两边都超时」当 PASS**：原来的 `t_deep.nut` 是
+   `function rec(n) { return rec(n + 1); }` —— **尾调用**会复用帧，两边都是死循环，
+   于是这条用例长期假绿。现在**任一侧超时一律 FAIL**，且 `t_deep.nut` 重写成有界版本
+   （深度 2000 的非尾递归 + 20000 次尾递归 + 深帧里抛错被 catch，末尾 `DEEP-DONE`）。
+2. **不可复现的语料**：`D3() <=> D3()`（两个不同实例）走的是 `ObjCmp` 的裸指针序，
+   参考实现自己换个进程就可能给出 `-1` 或 `1`（cnut 交叉执行抓到 `-1` vs `1`）。
+   已改成同一实例自比（`_rawval` 相等 → 0），并在生成器里写明原因。
+3. **`tools/mem_probe.py` 自己的管道死锁 bug**：它原来只在进程结束后才读 stdout，
+   子进程输出写满管道缓冲就阻塞在 write 上，看起来像"脚本死循环"——我为此追了
+   一小时的"神秘卡死"（ddmin 缩到"删掉任意一条就不卡"这种自相矛盾的结论）。
+   现在用独立线程并发读干管道。**教训**：测量工具本身也要先自证。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
 |---|---|
+| **失控递归的内存上限** | 参考实现的 `EnterFrame` 无上限，非尾递归的无限递归会把宿主吃到 OOM（实测 32GB 被系统杀）；本实现封顶（1M 槽 / 20 万帧）并报可捕获的 `stack overflow`。**这是有意偏离**：宁可报可捕获错误，也不让脚本拖死宿主 |
+| 两个不同类型/同类型对象之间的 `<=>` | 参考实现按裸指针序（`_userpointer(o1) < _userpointer(o2)`），跨进程/跨字节码不可复现（cnut 交叉执行实测同一脚本 `-1` vs `1`）。本实现按自身身份地址，同样只保证"同一次运行内一致"。语料里因此只比较**同一个对象** |
 | `blob.resize(<负数>)` / `blob.readblob(<负数>)` | 参考实现不检查负数：前者 `realloc(负长度)`，后者 `sq_getscratchpad(-1)` + `fread(buf,1,(size_t)-1)`，实测都访问违例（0xC0000005）。本实现报可捕获错误，语料按形态排除 |
 | `thread.getstackinfos(<负数 level>)` | `sq_stackinfos` 用 `cssize > level` 判界，负 level 恒真 → 越界读空调用栈（ASan 实测 `sqdebug.cpp:35` heap-buffer-overflow），偶发整进程崩溃。本实现返回 null，语料按形态排除 |
 | 不可 seek 流上 `len()`/`eos()`/`readblob` | 参考实现的 `EOS()` 是 `Tell()==Len()`，而 `Len()` 靠 `fseek(SEEK_END)`：管道上这次调用**失败**，之后 `ftell` 给出的是 CRT 内部状态（实测同一进程里 `readblob(4)` 之前 Len()≥4、之后 Len()=0；5000 字节管道上又变成 904=5000−4096）。更糟的是失败的 `fseek` 会**丢弃已缓冲的输入**：8 字节管道上读完 2 字节后剩下的 6 字节直接消失，于是 `readn` 报 io error。本实现给出确定性行为（`tell()`=已消费字节数、不可 seek 时 `len()`=0），不复刻这个数据丢失 |

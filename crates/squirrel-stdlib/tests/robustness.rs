@@ -5,6 +5,9 @@
 //! unreachable!/越界索引。这个文件是那条约定的守卫：新增原生函数或语法特性后，
 //! 若引入可被脚本触发的 panic，下面的用例会直接失败。
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use squirrel::api::Vm;
 
 /// 跑一段源码（不带标准库）；允许编译/运行失败，但不允许 panic。
@@ -364,6 +367,36 @@ fn deep_values_are_released_without_stack_overflow() {
         print("deep-values-released\n");
         "#
     );
+}
+
+/// 失控递归必须报**可捕获的** stack overflow，而不是把宿主内存吃光。
+///
+/// 参考实现的 `EnterFrame` 只做 `_stack.resize`，没有上限：非尾递归的无限递归会一直
+/// 涨到进程被杀（实测一条 3 行脚本把宿主吃到 32GB）。本实现给 VM 栈封顶
+/// （`MAX_STACK_SLOTS` / `MAX_CALL_FRAMES`），并给错误处理器留余量，
+/// 保证「报得出、抓得住、内存有界」。
+#[test]
+fn runaway_recursion_is_catchable_and_bounded() {
+    let vm = Vm::new(1024);
+    let out: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let o = out.clone();
+        vm.set_print_funcs(
+            Some(Rc::new(move |_v, b: &[u8]| o.borrow_mut().extend_from_slice(b))),
+            None,
+        );
+    }
+    squirrel_stdlib::register_all(&mut vm.data_mut());
+    squirrel_stdlib::set_error_handlers(&vm);
+    let _ = vm.run_buffer(
+        b"function f(n) { local x = f(n + 1); return x; }\n\
+          try { f(0); } catch (e) { print(\"caught:\" + e + \"\\n\"); }\n\
+          print(\"after\\n\");",
+        b"recursion.nut",
+    );
+    let s = String::from_utf8_lossy(&out.borrow()).into_owned();
+    assert!(s.contains("caught:stack overflow"), "应报可捕获的 stack overflow，实际：{s:?}");
+    assert!(s.contains("after"), "捕获后脚本应继续执行，实际：{s:?}");
 }
 
 #[test]

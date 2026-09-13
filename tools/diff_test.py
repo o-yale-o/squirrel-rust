@@ -58,10 +58,16 @@ def main(paths, check_stderr=True):
     for path in paths:
         out_r, err_r, rc_r = run_one(REF, path)
         out_u, err_u, rc_u = run_one(RUST, path)
+        name = os.path.basename(path)
+        # 超时必须判失败：两边都超时会产出完全相同的 `<TIMEOUT>`，
+        # 当成 PASS 会让「死循环语料」长期假绿（t_deep.nut 原本是尾调用死循环）。
+        if out_r == b"<TIMEOUT>" or out_u == b"<TIMEOUT>" or rc_r == -999 or rc_u == -999:
+            nfail += 1
+            print("FAIL %s：脚本超时（语料必须能在超时时间内跑完）" % name)
+            continue
         same = norm(out_r) == norm(out_u) and rc_r == rc_u
         if check_stderr:
             same = same and norm(err_r) == norm(err_u)
-        name = os.path.basename(path)
         if same and load_failed(norm(out_r)) and name not in EXPECT_LOAD_FAILURE:
             same = False
             print("SUSPECT %s：脚本本身编译/加载失败（未测到语义）" % name)

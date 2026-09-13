@@ -85,6 +85,8 @@ pub struct VmData {
     pub foreignptr: SQUserPointer,
     pub nnativecalls: SQInteger,
     pub nmetamethodscall: SQInteger,
+    /// >0 时给错误处理器/调试钩子额外留栈余量（见 enter_frame）
+    pub reserve_stack_headroom: SQInteger,
     pub releasehook: Option<crate::userdata::ReleaseHook>,
     pub suspended: bool,
     pub suspended_root: bool,
@@ -153,6 +155,7 @@ impl VmData {
             foreignptr: 0,
             nnativecalls: 0,
             nmetamethodscall: 0,
+            reserve_stack_headroom: 0,
             releasehook: None,
             suspended: false,
             suspended_root: false,
@@ -752,6 +755,24 @@ impl VmData {
         if newtop + MIN_STACK_OVERHEAD > self.stack.len() as SQInteger {
             if self.nmetamethodscall > 0 {
                 self.raise_error_str("stack overflow, cannot resize stack while in a metamethod");
+                throw!(self)
+            }
+            // 参考实现这里**没有上限**：`_stack.resize` 会一直涨，非尾递归的无限递归
+            // 把宿主内存吃光（实测 32GB 后进程被杀）。按健壮性约定封顶并报可捕获错误：
+            // 上限 = MAX_STACK_SLOTS 槽 / MAX_CALL_FRAMES 帧，远超正常脚本的用量
+            // （正常深递归只需几千帧），超限时脚本能自己 catch。
+            let (slot_cap, frame_cap) = if self.reserve_stack_headroom > 0 {
+                (
+                    MAX_STACK_SLOTS + STACK_RESERVED_SLOTS,
+                    MAX_CALL_FRAMES + STACK_RESERVED_FRAMES,
+                )
+            } else {
+                (MAX_STACK_SLOTS, MAX_CALL_FRAMES)
+            };
+            if newtop + MIN_STACK_OVERHEAD > slot_cap
+                || self.callsstack.len() as SQInteger >= frame_cap
+            {
+                self.raise_error_str("stack overflow");
                 throw!(self)
             }
             self.stack
@@ -1632,13 +1653,19 @@ impl VmData {
             let eh = self.errorhandler.clone();
             self.push(self.roottable.clone());
             self.push(error.clone());
-            let _ = self.call_value(&eh, 2, self.top - 2, false);
+            // ↔ 参考实现没有栈上限，错误处理器总能跑；我们封了顶，就给处理器留余量，
+            // 否则「栈溢出」这个错误本身会因为压不进帧而什么都打印不出来
+            self.reserve_stack_headroom += 1;
+            let r = self.call_value(&eh, 2, self.top - 2, false);
+            self.reserve_stack_headroom -= 1;
+            let _ = r;
             self.pop_n(2);
         }
     }
 
     /// ↔ SQVM::CallDebugHook
     pub fn call_debug_hook(&mut self, t: SQInteger, forcedline: SQInteger) {
+        self.reserve_stack_headroom += 1;
         self.debughook = false;
         let (srcname, fname, line) = {
             let ci = self.last_callinfo();
@@ -2129,6 +2156,16 @@ fn execute_inner(
             },
             Err(currerror) => {
                 // ---------------- exception_trap ----------------
+                if std::env::var_os("SQ_DEBUG_TRAP").is_some() {
+                    eprintln!(
+                        "TRAP: err={:?} traps={} raiseerror={} notify={} cssize={}",
+                        String::from_utf8_lossy(currerror.as_bytes()),
+                        traps,
+                        raiseerror,
+                        vm.ss.notifyallexceptions.get(),
+                        vm.callsstack.len()
+                    );
+                }
                 vm.lasterror = currerror.clone();
                 let last_top = vm.top;
                 if vm.ss.notifyallexceptions.get() || (traps == 0 && raiseerror) {

@@ -11,8 +11,8 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 | 验证项 | 结果 |
 |---|---|
 | 官方 samples/ 全部 17 个脚本差分 | **17/17 一致** |
-| 自建边界语料 **53** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **53/53 一致** |
-| 自动生成的组合矩阵：运算符 × 类型（3181 条）、metamethod（343 条）、格式串（1305 条）、委托方法（2870 条）、根表顺序 | **逐行一致** |
+| 自建边界语料 **54** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **54/54 一致** |
+| 自动生成的组合矩阵：运算符 × 类型（3181 条）、metamethod（343 条）、格式串（1305 条）、委托方法（2870 条）、类/实例（249 条）、根表顺序 | **逐行一致** |
 | REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
 | `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **51/51 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
 | `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **51/51 通过** |
@@ -45,6 +45,7 @@ python tools/audit_globals.py                   # 全局注册（名字/参数�
 python tools/audit_delegates.py                 # 11 张默认委托表成员
 python tools/audit_regorder.py                  # 根表**插入顺序**（迭代顺序由它决定）
 python tools/lint_corpus.py                     # 语料语法陷阱 + 逐个试编译
+python tools/mem_probe.py x.nut --limit-mb 400  # 带内存/时间上限跑（防失控；逐条排查加 --bisect）
 ```
 
 三张矩阵语料由脚本生成，改语料请改生成器（`tools/gen_opmatrix.py`、
@@ -134,6 +135,11 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 
 ## 已知限制
 
+- **失控递归**：参考实现的 `EnterFrame` 没有栈上限，非尾递归的无限递归会一直涨到进程被
+  系统杀掉（实测一条 3 行脚本把宿主吃到 32GB）。本实现封顶（1M 槽 / 20 万帧）并报
+  **可捕获的** `stack overflow`，错误处理器另有固定余量保证「报得出、抓得住」；
+- **两个不同对象之间的 `<=>`**：参考实现按裸指针序比较，跨进程/跨字节码不可复现
+  （同一脚本 `-1` 与 `1` 都出现过），语料只比较同一个对象；
 - **不可 seek 流（stdin/stdout/stderr 走管道时）的 `eos()/tell()/len()`**：参考实现基于 CRT 的
   `ftell`/`fseek`，在管道上 `fseek(SEEK_END)` 会失败并**丢弃已缓冲的输入**
   （8 字节管道读完 2 字节后剩的 6 字节直接消失，其后 `readn` 报 `io error`），
@@ -160,7 +166,7 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 
 | 测试 | 覆盖 |
 |---|---|
-| `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用（含 `format` 的宽度/精度/标志/`INT64_MIN` 边界）、畸形 `.cnut`、畸形正则、深递归、深嵌套值释放、超深嵌套编译 |
+| `crates/squirrel-stdlib/tests/robustness.rs` | 退化源码、脚本每个前缀/后缀、对抗性原生调用（含 `format` 的宽度/精度/标志/`INT64_MIN` 边界）、畸形 `.cnut`、畸形正则、深递归、**失控递归（必须可捕获且有界，不许吃光宿主内存）**、深嵌套值释放、超深嵌套编译 |
 | `crates/squirrel-stdlib/tests/bytecode_interop.rs` | 直接执行**参考实现编译出来的** `.cnut`；夹具被改成越界 outer 索引时必须报可捕获错误（参考实现会访问违例崩溃） |
 | `crates/squirrel-stdlib/tests/stream_semantics.rs` | file/blob 的 `tell/len/eos/flush` 与参考实现逐字一致（`eos()` 真为 `1`、假为 `null`；`writen` 的参数顺序是 `(值, 格式)`） |
 | `crates/squirrel/tests/deep_release.rs` | 释放循环嵌套深度 ≤ 3（10 万层数组/表/闭包/生成器/线程，含 1MB 栈线程） |

@@ -84,6 +84,20 @@ pub const SQ_SUSPEND_FLAG: SQInteger = -666;
 pub const SQ_TAILCALL_FLAG: SQInteger = -777;
 pub const DONT_FALL_BACK: SQInteger = 666;
 
+/// VM 栈/调用帧的硬上限（**本实现特有的健壮性约束**，参考实现没有上限）。
+///
+/// 参考实现的 `EnterFrame` 只做 `_stack.resize(newtop + …)`，非尾递归的无限递归会一直
+/// 增长直到进程内存耗尽（实测脚本把宿主吃到 32GB 后被系统杀掉）。这里封顶，
+/// 超限时报可捕获的 `stack overflow`——脚本能自己 catch，宿主不会被拖死。
+/// 上限远超正常用量：正常深递归只需几千帧，1M 槽约等于十几万帧。
+pub const MAX_STACK_SLOTS: SQInteger = 1 << 20; // 1M 槽
+pub const MAX_CALL_FRAMES: SQInteger = 200_000; // 20 万帧
+
+/// 给「错误处理器 / 调试钩子」留的额外余量：它们是栈满时唯一还必须在跑的调用，
+/// 没有余量就会出现「报了 stack overflow 但什么都打印不出来」
+pub const STACK_RESERVED_FRAMES: SQInteger = 64;
+pub const STACK_RESERVED_SLOTS: SQInteger = 16 * 1024;
+
 pub const SQ_BYTECODE_STREAM_TAG: u16 = 0xFAFA;
 
 /// C++ `(SQInteger)someFloat` 在 MSVC 下的语义（cvttss2si：越界/NaN → i64 最小值）。
