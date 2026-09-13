@@ -881,6 +881,57 @@ C.getattributes(null)                            // → {z=9}
 `crates/squirrel-stdlib/tests/suspend_semantics.rs`（2 个测试：穿透 native/元方法的
 错误文本与事后状态；主 VM 挂起的返回值与 `suspended` 标志）。
 
+## 三·补17、第十七轮（P1-9）：多线程 × GC —— 抓到一个 panic 与一个静默误回收
+
+`tools/gen_gcx.py` → `tests-corpus/t_gcx.nut`：**16 条**，两侧完全一致。
+
+### 缺陷 1：线程里 `collectgarbage()` 直接 panic
+
+```
+thread '<unnamed>' panicked at crates\squirrel\src\state.rs:455:37:
+RefCell already mutably borrowed
+```
+
+GC 标记根集合时要 `borrow()` **宿 VM**（线程的调用方），而宿 VM 此刻正在执行
+`thread_call`——它的 `RefCell` 被那层 `&mut VmData` 持有着。参考实现没这个问题：
+它是裸指针直接读 `_root_vm->_stack`。
+
+**修法**：`thread_call` / `thread_wakeup` / `thread_wakeupthrow` 在进入线程前，
+把**调用方的根快照**（`mark_roots()` 的结果）放进线程 VM 的
+`VmData::outer_roots`，退出时清掉；GC 遇到"宿 VM 不是当前 VM"就用快照。
+`run_mark` 里对 `Value::Thread` 一律 `try_borrow`：真撞上正在执行的 VM 就跳过
+（它的对象已由快照覆盖），**绝不 panic**。
+
+### 缺陷 2：改成快照之后，当前 VM 自己的根漏了
+
+第二版实现只加了快照，结果线程里 `collectgarbage()` 把**线程自己栈上**的对象
+当成垃圾回收掉（`keep.v` → `the index 'v' does not exist`）。
+
+参考实现的做法（`SQSharedState::RunMark`）是**只从 `_root_vm` 出发**，
+靠"线程对象会递归标记自己的栈"覆盖其它 VM —— 也就是当前 VM 的根是**间接**
+被标上的。我们的快照路径丢掉了这层间接性，所以必须显式补上：
+
+```
+根集合 = 共享表/引用表 + 当前 VM 自己的 mark_roots() + [宿 VM 的快照]
+```
+
+补上后 18 条探针全部与参考实现一致。
+
+### 顺带确认的语义（两侧一致）
+
+| 形态 | 结果 |
+|---|---|
+| 挂起线程持有对象 → 主线程 `collectgarbage()` | 对象**存活**（线程栈是根） |
+| 线程里 `collectgarbage()` | 线程自己栈上的对象存活、宿 VM 的对象存活、不可达对象被回收 |
+| 挂起的生成器持有对象 | 存活 |
+| 跨线程 outer（含调用方已出作用域） | 按可达性回收（`alive` / `collected` 各得其所） |
+| 5 个线程各自持有对象 | 全部存活 |
+| 线程对象本身（未被引用） | 被回收 |
+
+### 固化
+
+`crates/squirrel-stdlib/tests/gc_thread_semantics.rs`（1 个测试，10 条断言）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |

@@ -89,6 +89,12 @@ pub struct VmData {
     pub reserve_stack_headroom: SQInteger,
     /// 打开的 outer 对应的共享单元：栈槽索引 → 单元（↔ `_valptr` 指向的槽）
     pub open_cells: Vec<(usize, std::rc::Rc<std::cell::RefCell<Value>>)>,
+    /// 进入本 VM 执行前，**调用方 VM** 的根快照（`mark_roots()` 的结果）。
+    ///
+    /// 为什么需要：线程由另一个 VM 调起时，那个宿 VM 的 `RefCell` 被外层执行路径
+    /// 可变借用着，GC 想标记它就会 panic（线程里 `collectgarbage()` 实测踩过）。
+    /// 调用方在进入前把根快照放这里，GC 用快照代替"去 borrow 宿 VM"。
+    pub outer_roots: std::cell::RefCell<Vec<Value>>,
     pub releasehook: Option<crate::userdata::ReleaseHook>,
     pub suspended: bool,
     pub suspended_root: bool,
@@ -159,6 +165,7 @@ impl VmData {
             nmetamethodscall: 0,
             reserve_stack_headroom: 0,
             open_cells: Vec::new(),
+            outer_roots: std::cell::RefCell::new(Vec::new()),
             releasehook: None,
             suspended: false,
             suspended_root: false,

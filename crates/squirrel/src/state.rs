@@ -450,29 +450,34 @@ impl SharedState {
                     }
                 }
                 Value::Thread(_) => {
-                    // 其他 VM（当前 VM 已快照，不会出现在工作表中）
+                    // 其他 VM。**正在执行中的 VM borrow 不到**：它的 RefCell 被外层
+                    // 执行路径（`thread_call` 里的 `&mut VmData`）持有着，直接 `borrow()`
+                    // 会 panic（`RefCell already mutably borrowed`，线程里
+                    // `collectgarbage()` 就踩过）。这时它在根集合里由调用方快照
+                    // （`VmData::outer_roots`）代表，这里跳过即可。
                     if let Value::Thread(rc) = &v {
-                        let vm = rc.borrow();
-                        if !vm.lasterror.is_null() {
-                            work.push(vm.lasterror.clone());
-                        }
-                        if !vm.errorhandler.is_null() {
-                            work.push(vm.errorhandler.clone());
-                        }
-                        if !vm.debughook_closure.is_null() {
-                            work.push(vm.debughook_closure.clone());
-                        }
-                        if !vm.roottable.is_null() {
-                            work.push(vm.roottable.clone());
-                        }
-                        if !vm.temp_reg.is_null() {
-                            work.push(vm.temp_reg.clone());
-                        }
-                        for x in vm.stack.iter() {
-                            work.push(x.clone());
-                        }
-                        for ci in vm.callsstack.iter() {
-                            work.push(ci.closure.clone());
+                        if let Ok(vm) = rc.try_borrow() {
+                            if !vm.lasterror.is_null() {
+                                work.push(vm.lasterror.clone());
+                            }
+                            if !vm.errorhandler.is_null() {
+                                work.push(vm.errorhandler.clone());
+                            }
+                            if !vm.debughook_closure.is_null() {
+                                work.push(vm.debughook_closure.clone());
+                            }
+                            if !vm.roottable.is_null() {
+                                work.push(vm.roottable.clone());
+                            }
+                            if !vm.temp_reg.is_null() {
+                                work.push(vm.temp_reg.clone());
+                            }
+                            for x in vm.stack.iter() {
+                                work.push(x.clone());
+                            }
+                            for ci in vm.callsstack.iter() {
+                                work.push(ci.closure.clone());
+                            }
                         }
                     }
                 }
@@ -513,11 +518,18 @@ impl SharedState {
             (Value::Thread(rc), Some(cur)) => Rc::ptr_eq(rc, &cur),
             _ => false,
         };
-        if !root_vm.is_null() {
-            if is_current {
-                roots.extend(current.mark_roots());
-            } else {
+        // 当前 VM 自己的根**始终**要加：它是一种"被调起的 VM"（线程），
+        // 其栈上的对象只能由它自己报出来（参考实现靠"线程对象递归标记自己的栈"，
+        // 我们 borrow 不到正在执行的宿 VM，所以分两步：自己的根 + 宿 VM 的快照）。
+        roots.extend(current.mark_roots());
+        if !root_vm.is_null() && !is_current {
+            // 宿 VM 正在执行（其 RefCell 被外层执行路径持有）→ 不能 borrow 它，
+            // 用进入本 VM 时留下的根快照；快照是传递的（上一层快照也在里面）
+            let snap = current.outer_roots.borrow();
+            if snap.is_empty() {
                 roots.push(root_vm);
+            } else {
+                roots.extend(snap.iter().cloned());
             }
         }
         let marked = self.run_mark(roots);
@@ -556,11 +568,18 @@ impl SharedState {
             (Value::Thread(rc), Some(cur)) => Rc::ptr_eq(rc, &cur),
             _ => false,
         };
-        if !root_vm.is_null() {
-            if is_current {
-                roots.extend(current.mark_roots());
-            } else {
+        // 当前 VM 自己的根**始终**要加：它是一种"被调起的 VM"（线程），
+        // 其栈上的对象只能由它自己报出来（参考实现靠"线程对象递归标记自己的栈"，
+        // 我们 borrow 不到正在执行的宿 VM，所以分两步：自己的根 + 宿 VM 的快照）。
+        roots.extend(current.mark_roots());
+        if !root_vm.is_null() && !is_current {
+            // 宿 VM 正在执行（其 RefCell 被外层执行路径持有）→ 不能 borrow 它，
+            // 用进入本 VM 时留下的根快照；快照是传递的（上一层快照也在里面）
+            let snap = current.outer_roots.borrow();
+            if snap.is_empty() {
                 roots.push(root_vm);
+            } else {
+                roots.extend(snap.iter().cloned());
             }
         }
         let marked = self.run_mark(roots);
@@ -610,6 +629,10 @@ impl VmData {
         }
         roots.extend(self.stack.iter().cloned());
         roots.extend(self.callsstack.iter().map(|ci| ci.closure.clone()));
+        // 进入本 VM 时留下的「调用方根快照」（见 `outer_roots`）：嵌套线程里
+        // collectgarbage 时，宿 VM 正被外层执行路径可变借用、borrow 不到，
+        // 只能靠这份快照把它的可达对象标上。
+        roots.extend(self.outer_roots.borrow().iter().cloned());
         roots
     }
 }

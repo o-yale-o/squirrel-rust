@@ -1980,7 +1980,12 @@ fn thread_call(v: &mut VmData) -> NativeResult {
         let mut out = Value::Null;
         let ok = {
             let mut tv = t.borrow_mut();
-            match crate::vm::execute(&mut tv, &closure, nparams, base, &mut out, true, crate::vm::ExecutionType::Call) {
+            // 进入线程前把**调用方**的根快照放进线程 VM：线程里跑 collectgarbage 时，
+            // 调用方 VM 的 RefCell 被我们这层执行路径持有、borrow 不到（以前直接 panic）
+            *tv.outer_roots.borrow_mut() = caller_roots(v);
+            let r = crate::vm::execute(&mut tv, &closure, nparams, base, &mut out, true, crate::vm::ExecutionType::Call);
+            tv.outer_roots.borrow_mut().clear();
+            match r {
                 Ok(()) => true,
                 Err(_) => false,
             }
@@ -2026,6 +2031,11 @@ fn thread_call(v: &mut VmData) -> NativeResult {
     }
 }
 
+/// 取调用方 VM 的根快照（给被调起的线程 VM 用，见 `VmData::outer_roots`）。
+fn caller_roots(v: &mut VmData) -> Vec<Value> {
+    v.mark_roots()
+}
+
 fn thread_wakeup(v: &mut VmData) -> NativeResult {
     let o = v.stack_get(1);
     if let Value::Thread(t) = &o {
@@ -2044,7 +2054,10 @@ fn thread_wakeup(v: &mut VmData) -> NativeResult {
         let mut out = Value::Null;
         let ok = {
             let mut tv = t.borrow_mut();
-            wakeup_vm(&mut tv, wakeupret, true, true, false, &mut out)
+            *tv.outer_roots.borrow_mut() = caller_roots(v);
+            let r = wakeup_vm(&mut tv, wakeupret, true, true, false, &mut out);
+            tv.outer_roots.borrow_mut().clear();
+            r
         };
         if ok {
             // ↔ sq_wakeupvm(retval=true)：结果压回线程栈顶，thread_wakeup 取走
@@ -2092,7 +2105,10 @@ fn thread_wakeupthrow(v: &mut VmData) -> NativeResult {
             let e = tv.get_up(-1);
             tv.raise_error_obj(e);
             tv.pop();
-            wakeup_vm(&mut tv, false, true, true, true, &mut out)
+            *tv.outer_roots.borrow_mut() = caller_roots(v);
+            let r = wakeup_vm(&mut tv, false, true, true, true, &mut out);
+            tv.outer_roots.borrow_mut().clear();
+            r
         };
         if ok {
             t.borrow_mut().push(out.clone());
