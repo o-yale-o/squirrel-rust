@@ -753,22 +753,15 @@ impl SqlLexer {
     }
 }
 
-/// ↔ scstrtod：Rust 的 parse 不接受 "1." / "1.e5" 等形式，先规范化。
+/// ↔ scstrtod：**取能构成一个浮点数的最长前缀**，而不是"整体 parse 失败就给 0"。
+///
+/// 词法器把 `'.'`/`'e'`/数字**全都收进同一个 token**（↔ 参考实现的 `ReadNumber`
+/// 循环条件就是 `'.' || isdigit || isexponent`），所以 `1.2.3` 会作为一个浮点
+/// token 走到这里，而 CRT 的 `strtod("1.2.3")` 停在第二个小数点 → **1.2**；
+/// `1..2` → **1**。原来整体 `parse::<f64>()` 失败退化成 0.0，于是
+/// `print(1.2.3)` 参考给 `1.2`、我们给 `0`（`tests-corpus/t_litmap.nut` 抓到的）。
 fn strtod_compat(bytes: &[u8]) -> f64 {
-    let mut s: Vec<u8> = bytes.to_vec();
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'.' && (i + 1 == s.len() || s[i + 1] == b'e' || s[i + 1] == b'E') {
-            s.insert(i + 1, b'0');
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    std::str::from_utf8(&s)
-        .ok()
-        .and_then(|t| t.parse::<f64>().ok())
-        .unwrap_or(0.0)
+    crate::baselib::parse_dec_float(bytes).unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -888,6 +881,26 @@ mod tests {
             } else {
                 assert!((lx.fvalue - ef).abs() < 1e-6, "float #{}: {}", i, lx.fvalue);
             }
+        }
+    }
+
+    /// 多个小数点/指数混在一起时，**整个串仍是一个浮点 token**，值取 `strtod` 的
+    /// 最长合法前缀（↔ `ReadNumber` 的循环条件含 `'.'`，而取值走 `scstrtod`）。
+    /// 原来是整体 `parse::<f64>()` 失败退化成 0.0 —— `print(1.2.3)` 参考给 `1.2`。
+    #[test]
+    fn number_with_extra_dots() {
+        for (src, want) in [
+            ("1.2.3", 1.2f64),
+            ("1..2", 1.0),
+            ("1.2e3.4", 1200.0),
+            ("1.2.3e4", 1.2),
+            ("5.e3..", 5000.0),
+        ] {
+            let mut lx = lexer_over(src);
+            assert_eq!(lx.lex().unwrap(), TK_FLOAT, "{}", src);
+            assert_eq!(lx.fvalue, want as SQFloat, "{}", src);
+            // 剩下的部分不该再产生数字 token
+            assert_ne!(lx.lex().unwrap(), TK_FLOAT, "{}: 尾巴", src);
         }
     }
 

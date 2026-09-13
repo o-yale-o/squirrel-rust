@@ -120,6 +120,8 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `abs()` 只吃整数 | `abs(-7.9)`→`7`（先截断再绝对值，返回 **integer**）；浮点版是 `fabs`。`floor`/`ceil` 返回的也是 **float** 而不是 int |
 | 数学函数定义域外**不报错** | `sqrt(-1)`/`log(-1)`/`asin(2)`/`pow(-1,0.5)` → NaN（打印成 MSVC 的 `-nan(ind)`）、`log(0)`→`-inf`、`exp(f32::MAX)`→`inf` |
 | `pow(±NaN, 奇整数)` 返回**正** NaN | 参考实现走 `(SQFloat)pow((double),(double))`，CRT 的"奇次幂"分支会清掉符号位，而 x86 上 `0.0/0.0` 是**负** NaN —— 所以 `pow(0.0/0.0,-1.0)` 是 `nan` 而不是 `-nan(ind)`；偶数/非整数指数（含 `NaN`、`inf`）则**保留**输入 NaN 的符号。判定只能看文本渲染：与 NaN 的比较恒为 false，`1.0/NAN < 0` 那类写法两边都会"一致"却什么都没测到。语料 `t_mathmap.nut` 的 `sgn_pow_*` 钉住（`atan2` 的 NaN/inf 传播两边本来就一致） |
+| 数值字面量与 `"…".tointeger()` 是**两条不同的路径** | 同一个数字，写法不同结果就不同：`99999999999999999999999999` 作为**字面量**走词法器 `LexInteger`（**回绕** → `-2537764290115403777`），作为**字符串**走 `str2num`/`_strtoi64`（**按符号饱和** → `INT64_MAX`）。十六进制字面量走 `LexHexadecimal`（同样回绕，且超过 **16 位**直接报 `too many digits for an Hex number`），`0xffffffffffffffff` 是 **-1**；八进制没有 `0b`/`0o` 前缀（`0b101` 是 `0` 后面跟标识符）。**`1.2.3` 是一个合法的浮点 token**（`ReadNumber` 会把第二个 `.` 也吃掉，取值走 `strtod` → `1.2`；`1..2` → `1`）。语料 `t_litmap.nut` 把 889 条形态钉住 |
+| `.5` 不是字面量 | 小数点开头在词法阶段进不了数字分支（`ReadNumber` 只在首位是数字时进入）→ 报 `expression expected`；`0.5` 才是合法写法 |
 | `format` 的数字走 **f32** | `format("%.17g", 2147483647)` 是 `2147483648`（整数被转成 `SQFloat`）——想精确打印整数就别套 `%g` |
 | `assert` 的数字 0 是**假** | 判假用 `SQVM::IsFalse`：`null`/`false`/**`0`**/**`0.0`** 为假，而 `""`/`[]`/`{}`/`function(){}`/`blob(0)` 都是**真**（`assert("")` 通过） |
 | `assert(cond, msg)` 的消息会先 `tostring` | `assert(false, 123)` 的错误文本是 `123`；`sq_tostring` 对容器给的是 `(table : 0x…)`，**不调 `_tostring`** |

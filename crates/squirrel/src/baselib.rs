@@ -312,8 +312,10 @@ fn parse_c_strtod(t: &str) -> Option<f64> {
     parse_dec_float(rest).map(|v| if neg { -v } else { v })
 }
 
-/// 十进制浮点的字面形态：`[digits][.digits][e[+|-]digits]`，至少要有一个数字
-fn parse_dec_float(b: &[u8]) -> Option<f64> {
+/// 十进制浮点的字面形态：`[digits][.digits][e[+|-]digits]`，至少要有一个数字。
+/// **只消费合法前缀**（`"1.2.3"` → 1.2），这正是 CRT `strtod` 的行为，
+/// 所以词法器（`lexer::strtod_compat`）也复用它。
+pub(crate) fn parse_dec_float(b: &[u8]) -> Option<f64> {
     let mut normalized = String::new();
     let mut i = 0;
     let mut any = false;
