@@ -103,6 +103,7 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | 序列化默认参数 | 往返**会丢**默认值，但**只丢"被直接序列化的那个闭包自己"的**：`writeclosuretofile(P, function(a, b = 100) {...})` 读回后 `g(1)` 里 `b` 是 `null`；而闭包**内部**嵌套函数的默认值（`f(1)` → `b=100`）、它**返回出去**的内部闭包（`inner=77`）、以及 varargs（`vargv.len()`）都完好 |
 | `writeclosuretofile` 的**检查顺序**与残留文件 | 顺序是"掩码 → 开文件 → 序列化"：① 第 3 参过不了 `.sc` 掩码（传整数）→ 参数类型错，**不会建文件**；② 过了掩码**先 `fopen(...,"wb+")`**：路径不可写 → `cannot open the file`（**哪怕第 3 参是 native closure、后面还会类型不符**）；③ 路径可写则文件**立刻建出来**，之后无论序列化失败（自由变量）还是 native closure 不匹配，那个 **0 字节文件都会留在磁盘上**。写脚本时别用 `writeclosuretofile` 的返回值判断"文件有没有生成"，要自己检查 |
 | 文件句柄的**共享模式**（Windows） | 参考实现的 `fopen` 用 `_SH_DENYNO`（`FILE_SHARE_READ/WRITE`，**不含** `FILE_SHARE_DELETE`）：**句柄还开着时 `remove()` 会失败**（`remove() failed`，文件留在磁盘上） | **已对齐**（P14）：显式 `share_mode(FILE_SHARE_READ \| FILE_SHARE_WRITE)`；前提是后端随实例死亡释放（同一轮修掉了注册表只增不减的问题）。语料 `t_file.nut` 的 `share_remove_*` 钉住 |
+| `file.seek()` 的偏移是 **32 位**的 | `sqstd_fseek` 里是 `fseek(file,(long)offset,…)`，Windows 上 `long` 只有 32 位 → 偏移**先截成 int32**：`seek(4294967301)` 其实 `fseek(…,5)`、`seek(INT64_MAX)` 低 32 位是 `-1` → CRT 失败返回 `-1`、`seek(INT64_MIN)` → `0`、`seek(2147483648)` → `-1`。**`blob.seek()` 不截断**（不走 CRT，两种情况下都返回 `-1`/正常值）。写脚本时别用超过 2 GiB 的偏移；语料 `t_file.nut` 的 `trunc_*` 10 条钉住 | **已对齐**（P15-2）：`offset as i32 as SQInteger`；`blob` 路径不截断 |
 | **尾调用会提前释放当前帧的局部** | `return f(x);` 复用当前帧，但帧里的局部（如打开的文件）**保留到外层帧弹出**才释放 | 我们目前更早释放 —— `local a = file(p,"wb+"); return try_remove(p);` 里我们能删掉文件（句柄已关），参考实现报 `remove() failed`；改成 `local r = try_remove(p); return r;`（非尾调用）两边就一致。已记为 `TODO.md` P14 子问题 2，语料刻意回避这一格 |
 | 未捕获错误的退出码 | 是 0（`retval` 不被错误覆盖）；CLI 加载失败才是 −2 |
 | tail call | `return inner()` 会**复用当前帧**，出错时调用栈里看不到这一层 |
@@ -118,6 +119,7 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `abs()` 是 **32 位**的 | 参考实现写的是 `abs((int)n)`：先截成 int32 再取绝对值 —— `abs(2147483648)`→`-2147483648`、`abs(-2147483649)`→`2147483647`、`abs(INT64_MAX)`→`1`、`abs(INT64_MIN)`→`0`、`abs(-3000000000)`→`1294967296` |
 | `abs()` 只吃整数 | `abs(-7.9)`→`7`（先截断再绝对值，返回 **integer**）；浮点版是 `fabs`。`floor`/`ceil` 返回的也是 **float** 而不是 int |
 | 数学函数定义域外**不报错** | `sqrt(-1)`/`log(-1)`/`asin(2)`/`pow(-1,0.5)` → NaN（打印成 MSVC 的 `-nan(ind)`）、`log(0)`→`-inf`、`exp(f32::MAX)`→`inf` |
+| `pow(±NaN, 奇整数)` 返回**正** NaN | 参考实现走 `(SQFloat)pow((double),(double))`，CRT 的"奇次幂"分支会清掉符号位，而 x86 上 `0.0/0.0` 是**负** NaN —— 所以 `pow(0.0/0.0,-1.0)` 是 `nan` 而不是 `-nan(ind)`；偶数/非整数指数（含 `NaN`、`inf`）则**保留**输入 NaN 的符号。判定只能看文本渲染：与 NaN 的比较恒为 false，`1.0/NAN < 0` 那类写法两边都会"一致"却什么都没测到。语料 `t_mathmap.nut` 的 `sgn_pow_*` 钉住（`atan2` 的 NaN/inf 传播两边本来就一致） |
 | `format` 的数字走 **f32** | `format("%.17g", 2147483647)` 是 `2147483648`（整数被转成 `SQFloat`）——想精确打印整数就别套 `%g` |
 | `assert` 的数字 0 是**假** | 判假用 `SQVM::IsFalse`：`null`/`false`/**`0`**/**`0.0`** 为假，而 `""`/`[]`/`{}`/`function(){}`/`blob(0)` 都是**真**（`assert("")` 通过） |
 | `assert(cond, msg)` 的消息会先 `tostring` | `assert(false, 123)` 的错误文本是 `123`；`sq_tostring` 对容器给的是 `(table : 0x…)`，**不调 `_tostring`** |

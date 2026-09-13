@@ -17,7 +17,11 @@
 //! 4. **定义域边界不报错**：`sqrt(-1)`→NaN、`log(0)`→`-inf`、`log(-1)`→NaN、
 //!    `asin(2)`→NaN、`exp(f32::MAX)`→inf、`pow(0,-1)`→inf、`pow(-1,0.5)`→NaN。
 //!    NaN 的文本是 MSVC 的 `-nan(ind)`，我们逐字复刻。
-//! 5. `PI` 是 `(float)M_PI`，**`RAND_MAX` 是 32767**（MSVC 的 CRT 就是这么定义的，
+//! 5. **NaN 的符号**：`pow(±NaN, 奇整数)` 返回**正** NaN，其余指数保留输入 NaN 的
+//!    符号（x86 上 `0.0/0.0` 是负 NaN，所以平时看到的是 `-nan(ind)`）。纯 f32 的
+//!    `powf` 不清符号，是 fuzzer seed=2554 抓到的真实分叉 —— 见
+//!    `pow_nan_sign_follows_crt_odd_integer_rule`。`atan2` 的 NaN/inf 传播则天然一致。
+//! 6. `PI` 是 `(float)M_PI`，**`RAND_MAX` 是 32767**（MSVC 的 CRT 就是这么定义的，
 //!    不是 2147483647）；`rand()` 的**值**跨实现不可比（CRT 序列另有
 //!    `t_math.nut` 钉住），这里只钉类型与 `srand` 的返回值 `null`。
 //!
@@ -197,6 +201,96 @@ t("none", function() { return abs(); });
         "str!parameter 1 has an invalid type 'string' ; expected: 'integer|float'"
     );
     assert_eq!(line(&out, "none"), "none!wrong number of parameters");
+}
+
+/// `pow` 的 **NaN 符号规则**：指数是奇整数时清掉底数 NaN 的符号，其余保留输入符号。
+///
+/// 参考实现是 `(SQFloat)pow((double)a, (double)b)`，MSVC 的 `pow` 走"奇次幂保留符号"
+/// 分支时会**清掉符号位**；而纯 f32 的 `powf` 不这么做。x86 上 `0.0 / 0.0` 是**负** NaN，
+/// 所以这一格平时表现为 `pow(0.0/0.0, -1.0)` 应当是 `nan` 而不是 `-nan(ind)`
+/// （由 fuzzer seed=2554 抓到）。
+///
+/// 边界：f32 能表示的最大奇整数是 `2^24-1 = 16777215`（`16777217` 会被舍入到 `2^24`，
+/// 是偶数）。判定只能看**文本渲染** —— 与 NaN 的比较恒为 false，`1.0 / NAN < 0`
+/// 之类的写法在两侧都会"一致"却什么都没测到。
+#[test]
+fn pow_nan_sign_follows_crt_odd_integer_rule() {
+    let out = run_lines(
+        r#"
+local NEG_NAN = (0.0 / 0.0);
+local POS_NAN = -(0.0 / 0.0);
+t("neg_text", function() { return NEG_NAN; });
+t("pos_text", function() { return POS_NAN; });
+t("n_p0", function() { return pow(NEG_NAN, 0.0); });
+t("n_n0", function() { return pow(NEG_NAN, -0.0); });
+t("n_p1", function() { return pow(NEG_NAN, 1.0); });
+t("n_n1", function() { return pow(NEG_NAN, -1.0); });
+t("n_p3", function() { return pow(NEG_NAN, 3.0); });
+t("n_n3", function() { return pow(NEG_NAN, -3.0); });
+t("n_p2", function() { return pow(NEG_NAN, 2.0); });
+t("n_n2", function() { return pow(NEG_NAN, -2.0); });
+t("n_p10", function() { return pow(NEG_NAN, 10.0); });
+t("n_half", function() { return pow(NEG_NAN, 0.5); });
+t("n_nhalf", function() { return pow(NEG_NAN, -0.5); });
+t("n_one5", function() { return pow(NEG_NAN, 1.5); });
+t("n_odd24", function() { return pow(NEG_NAN, 16777215.0); });
+t("n_pow24", function() { return pow(NEG_NAN, 16777216.0); });
+t("n_over24", function() { return pow(NEG_NAN, 16777217.0); });
+t("n_e17", function() { return pow(NEG_NAN, 1e17); });
+t("n_big", function() { return pow(NEG_NAN, 1e30); });
+t("n_nbig", function() { return pow(NEG_NAN, -1e30); });
+t("n_inf", function() { return pow(NEG_NAN, 1.0 / 0.0); });
+t("n_ninf", function() { return pow(NEG_NAN, -1.0 / 0.0); });
+t("n_nan", function() { return pow(NEG_NAN, NEG_NAN); });
+t("n_i2", function() { return pow(NEG_NAN, 2); });
+t("n_i3", function() { return pow(NEG_NAN, 3); });
+t("p_p1", function() { return pow(POS_NAN, 1.0); });
+t("p_n1", function() { return pow(POS_NAN, -1.0); });
+t("p_p2", function() { return pow(POS_NAN, 2.0); });
+t("p_half", function() { return pow(POS_NAN, 0.5); });
+t("p_big", function() { return pow(POS_NAN, 1e30); });
+t("p_inf", function() { return pow(POS_NAN, 1.0 / 0.0); });
+t("p_nan", function() { return pow(POS_NAN, NEG_NAN); });
+t("b_p2_nan", function() { return pow(2.0, NEG_NAN); });
+t("b_n2_nan", function() { return pow(-2.0, NEG_NAN); });
+t("b_p2_posnan", function() { return pow(2.0, POS_NAN); });
+t("b_p0_nan", function() { return pow(0.0, NEG_NAN); });
+t("at2_pnan_p1", function() { return atan2(POS_NAN, 1.0); });
+t("at2_nnan_p1", function() { return atan2(NEG_NAN, 1.0); });
+t("at2_pinf_ninf", function() { return atan2(1.0 / 0.0, -1.0 / 0.0); });
+t("at2_n0_n0", function() { return atan2(-0.0, -0.0); });
+"#,
+    );
+    assert_eq!(line(&out, "neg_text"), "neg_text=-nan(ind)|float");
+    assert_eq!(line(&out, "pos_text"), "pos_text=nan|float");
+    // 指数 0 / -0 → 1（与符号无关）
+    assert_eq!(line(&out, "n_p0"), "n_p0=1|float");
+    assert_eq!(line(&out, "n_n0"), "n_n0=1|float");
+    // 奇整数指数 → 符号被清掉，返回**正** NaN
+    for tag in ["n_p1", "n_n1", "n_p3", "n_n3", "n_odd24", "n_i3"] {
+        assert_eq!(line(&out, tag), format!("{tag}=nan|float"), "奇整数指数应清掉符号");
+    }
+    // 其余情况保留输入 NaN 的符号
+    for tag in [
+        "n_p2", "n_n2", "n_p10", "n_half", "n_nhalf", "n_one5", "n_pow24", "n_over24",
+        "n_e17", "n_big", "n_nbig", "n_inf", "n_ninf", "n_nan", "n_i2",
+    ] {
+        assert_eq!(line(&out, tag), format!("{tag}=-nan(ind)|float"), "非奇整数指数应保留符号");
+    }
+    // 正 NaN 底数：任何指数下都是正 NaN（"保留输入符号"的另一半）
+    for tag in ["p_p1", "p_n1", "p_p2", "p_half", "p_big", "p_inf", "p_nan"] {
+        assert_eq!(line(&out, tag), format!("{tag}=nan|float"), "正 NaN 底数应保持正号");
+    }
+    // 底数不是 NaN 时，NaN 指数按定义域错处理（符号同样是负）
+    assert_eq!(line(&out, "b_p2_nan"), "b_p2_nan=-nan(ind)|float");
+    assert_eq!(line(&out, "b_n2_nan"), "b_n2_nan=-nan(ind)|float");
+    assert_eq!(line(&out, "b_p2_posnan"), "b_p2_posnan=nan|float");
+    assert_eq!(line(&out, "b_p0_nan"), "b_p0_nan=-nan(ind)|float");
+    // atan2 的 NaN/inf 传播（参考实现走 double，我们用 f32::atan2，此处两者一致）
+    assert_eq!(line(&out, "at2_pnan_p1"), "at2_pnan_p1=nan|float");
+    assert_eq!(line(&out, "at2_nnan_p1"), "at2_nnan_p1=-nan(ind)|float");
+    assert_eq!(line(&out, "at2_pinf_ninf"), "at2_pinf_ninf=2.3561944961547852|float");
+    assert_eq!(line(&out, "at2_n0_n0"), "at2_n0_n0=-3.1415927410125732|float");
 }
 
 /// `PI` / `RAND_MAX` 的精确值，以及整数参数经 `.n` 掩码被接受

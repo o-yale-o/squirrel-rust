@@ -7,6 +7,13 @@
 //!
 //! C++ 用 sq_setinstanceup 把 SQStream* 挂在实例上；Rust 侧数据存线程本地
 //! 注册表，实例字段 `__sid`（实习字符串键）保存注册表索引。
+//!
+//! **生命周期**：注册表对后端持强引用，所以"注册表就是句柄的生命周期"这件事必须
+//! 由实例来终结 —— 实例上另挂一个 userdata 成员 `__be`，它的 release hook 在实例
+//! 析构时清掉对应槽位（`bind_backend_inst`）。没有这一步，每个创建过的后端都会被
+//! 永久持有（文件句柄一直开到进程结束）；参考实现是引用计数归零即释放。
+//! `__sid`/`__be` 都必须在 `make_file_class`/`make_blob_class` 里 `new_slot` 声明，
+//! 否则 `Instance::set` 会静默丢弃（踩过：钩子提前触发 → `the stream is invalid`）。
 
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -412,6 +419,12 @@ impl StreamBackend for FileBackend {
         self.handle.is_some() || self.std_disk_size.is_some()
     }
     fn seek(&mut self, offset: SQInteger, origin: SQInteger) -> SQInteger {
+        // ↔ sqstd_fseek：`fseek((FILE*)file, (long)offset, ...)` —— Windows 的 `long` 是
+        // **32 位**，所以偏移先被截断再交给 CRT。实测（探针 probe_trunc）：
+        //   INT64_MIN → 0（seek 到 0，返回 0）；2^32+5 → 5；2^31 → -2^31（负数 → 失败 -1）；
+        //   INT64_MAX → -1（失败）；-4294967291 → 5。
+        // blob 走我们自己的 SQBlob::Seek（i64 运算、不截断），实测两侧本来就一致，别一起改。
+        let offset = offset as i32 as SQInteger;
         if let Some(h) = &self.handle {
             let pos = match origin {
                 // CRT 的 fseek(f, 负数, SEEK_SET) 会失败（实测参考实现返回 -1）；
@@ -478,15 +491,6 @@ pub fn backend_of(v: &VmData, idx: SQInteger) -> Option<BackendRef> {
         return BACKENDS.with(|reg| reg.borrow().get(id as usize).and_then(|x| x.clone()));
     }
     None
-}
-
-/// 在实例（栈槽 1）上设置 __sid 字段
-fn set_instance_sid(v: &VmData, sid: SQInteger) {
-    let self_ = v.stack_get(1);
-    let sid_key = v.ss.intern(b"__sid");
-    if let Value::Instance(inst) = &self_ {
-        inst.borrow_mut().set(&sid_key, &Value::Integer(sid));
-    }
 }
 
 /// 释放注册表的某个槽位（只在确实还是同一个后端时才清，避免跨线程 sid 碰撞误清）。

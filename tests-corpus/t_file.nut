@@ -1,3 +1,24 @@
+// ---- file.seek 的偏移截断（↔ sqstd_fseek 的 `(long)offset`，Windows 上 long = 32 位）----
+// 超大偏移先被截成 i32 再交给 CRT：INT64_MIN→0（seek 到 0、返回 0）、2^32+5→5、
+// 2^31→-2^31（负数 → 失败 -1）、INT64_MAX→-1。blob 走自己的 SQBlob::Seek（i64、不截断），
+// 所以下面两条 blob 的期望与 file 不同 —— 别"顺手统一"。
+// 注意：这一段必须放在文件**最前面** —— 后面有 `local blob = blob(4);` 会遮蔽全局 blob。
+local tf = file("diff_test_trunc.bin", "wb+");
+tf.writen(0x11, 'b');
+print("trunc_i64min=" + tf.seek(-9223372036854775808, 'b') + ":" + tf.tell() + "\n");
+print("trunc_i64max=" + tf.seek(9223372036854775807, 'b') + ":" + tf.tell() + "\n");
+print("trunc_2p32=" + tf.seek(4294967296, 'b') + ":" + tf.tell() + "\n");
+print("trunc_2p32p5=" + tf.seek(4294967301, 'b') + ":" + tf.tell() + "\n");
+print("trunc_2p31=" + tf.seek(2147483648, 'b') + ":" + tf.tell() + "\n");
+print("trunc_neg=" + tf.seek(-4294967291, 'b') + ":" + tf.tell() + "\n");
+print("trunc_cur=" + tf.seek(-9223372036854775808, 'c') + ":" + tf.tell() + "\n");
+tf.close();
+local tb = blob(4);
+tb.writen(0x11, 'b');
+print("trunc_blob_i64min=" + tb.seek(-9223372036854775808, 'b') + ":" + tb.tell() + "\n");
+print("trunc_blob_2p32=" + tb.seek(4294967296, 'b') + ":" + tb.tell() + "\n");
+remove("diff_test_trunc.bin");
+
 local f = file("diff_test_data.bin", "wb+");
 f.writen(0x4142, 'w');
 f.writen(-100000, 'i');

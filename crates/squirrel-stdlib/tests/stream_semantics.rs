@@ -306,7 +306,44 @@ fn open_handle_blocks_remove_like_crt_fopen() {
     let _ = std::fs::remove_file(&dir);
 }
 ///
-/// 后端随实例死亡而释放（↔ 参考实现"引用计数归零即释放"）。
+/// `file.seek` 的偏移会被**截断成 32 位**（↔ `sqstd_fseek` 的 `fseek(file, (long)offset, ...)`，
+/// Windows 上 `long` 是 32 位）；blob 走自己的 `SQBlob::Seek`（i64、不截断），两者不同。
+///
+/// 实测参考实现（探针 `tmp-c2/probe_trunc.nut`）：`INT64_MIN`→0（seek 到 0 且返回 0）、
+/// `2^32+5`→5、`2^31`→-2^31（负数 → 失败 -1）、`INT64_MAX`→-1、`-4294967291`→5。
+/// 这是模糊测试变异出 `seek(INT64_MIN, 'b')` 时发现的差异。
+#[test]
+fn file_seek_truncates_offset_to_32_bits() {
+    let dir = std::env::temp_dir().join("sqrust_trunc.bin");
+    let _ = std::fs::remove_file(&dir);
+    let p = dir.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        r#"
+        local tf = file("{p}", "wb+");
+        tf.writen(0x11, 'b');
+        print("i64min=" + tf.seek(-9223372036854775808, 'b') + ":" + tf.tell() + "\n");
+        print("i64max=" + tf.seek(9223372036854775807, 'b') + ":" + tf.tell() + "\n");
+        print("2p32=" + tf.seek(4294967296, 'b') + ":" + tf.tell() + "\n");
+        print("2p32p5=" + tf.seek(4294967301, 'b') + ":" + tf.tell() + "\n");
+        print("2p31=" + tf.seek(2147483648, 'b') + ":" + tf.tell() + "\n");
+        print("neg=" + tf.seek(-4294967291, 'b') + ":" + tf.tell() + "\n");
+        print("cur=" + tf.seek(-9223372036854775808, 'c') + ":" + tf.tell() + "\n");
+        tf.close();
+        local tb = blob(4);
+        tb.writen(0x11, 'b');
+        print("blob_i64min=" + tb.seek(-9223372036854775808, 'b') + ":" + tb.tell() + "\n");
+        print("blob_2p32=" + tb.seek(4294967296, 'b') + ":" + tb.tell() + "\n");
+    "#
+    );
+    let (out, _err) = run_capture(&src);
+    assert_eq!(
+        out,
+        // i64max 被截成 -1 → 失败，位置停在上一句的 0
+        "i64min=0:0\ni64max=-1:0\n2p32=0:0\n2p32p5=0:5\n2p31=-1:5\nneg=0:5\ncur=0:5\n\
+         blob_i64min=-1:1\nblob_2p32=-1:1\n"
+    );
+    let _ = std::fs::remove_file(&dir);
+}
 ///
 /// 背景（TODO.md P14）：`BACKENDS` 注册表原来只增不减 —— 每个创建过的 file/blob/stream
 /// 后端都被永久持有，没显式 `close()` 的文件句柄会一直开到进程结束（无界增长）。

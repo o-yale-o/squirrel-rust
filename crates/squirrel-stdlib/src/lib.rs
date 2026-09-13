@@ -116,7 +116,19 @@ pub fn register_mathlib(vm: &mut VmData) {
     m2!("pow", "nn", |v: &mut VmData| {
         let y = v.stack_get(2).as_float();
         let x = v.stack_get(3).as_float();
-        v.push(Value::Float(y.powf(x)));
+        let mut r = y.powf(x);
+        // ↔ CRT pow：底数是 NaN 且**指数是奇整数**时返回的是**正** NaN（CRT 走"奇次幂保留
+        // 符号"的分支，把符号清掉了）；其余情况保留输入 NaN 的符号 —— x86 上 0.0/0.0 是负
+        // NaN，所以我们平时看到的都是 -nan(ind)。实测（探针 probe_pownan/probe_pownan2）：
+        //   pow(NaN,-1)=nan  pow(NaN,-3)=nan  pow(NaN,1)=nan  pow(NaN,3)=nan
+        //   pow(NaN,-2)=-nan(ind)  pow(NaN,-0.5)=-nan(ind)  pow(NaN,-1.5)=-nan(ind)
+        //   pow(NaN,NaN)=-nan(ind)  pow(2,NaN)=-nan(ind)
+        // f32 能表示的最大奇整数是 2^24-1 = 16777215（超过 2^24 的浮点整数一律是偶数），
+        // 以它为界既精确又不必担心 i64 饱和；`inf`/`NaN` 的 `fract()` 是 NaN，天然被排除。
+        if y.is_nan() && x.fract() == 0.0 && x.abs() <= 16_777_215.0 && (x as i64) & 1 == 1 {
+            r = f32::NAN;
+        }
+        v.push(Value::Float(r));
         1
     });
     m1!("floor", "n", |v: &mut VmData| {
