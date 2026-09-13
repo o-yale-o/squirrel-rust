@@ -17,7 +17,7 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 | REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
 | `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **69/69 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
 | `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **69/69 通过** |
-| 宿主 API：用参考实现的静态库编 C 探针做同序对拍（member handle / `getfunctioninfo` / `setfreevariable` / userdata…） | 报告逐项一致（`tmp-c2/hostapi/`） |
+| 宿主 API：用参考实现的静态库编 C 探针做同序对拍（member handle / `getfunctioninfo` / `setfreevariable` / userdata…） | 报告逐项一致（`tools/hostapi/`） |
 | `cargo test`（单元 + 集成 + 健壮性 + 字节码互通 + 各语义矩阵） | **113/113 通过** |
 
 > 「字节级一致」这条要小心理解：参考实现保存闭包的 outer 值时写 8 字节、字段只有 4 字节，

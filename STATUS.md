@@ -973,7 +973,7 @@ wrong argument type, expected 'function' got 'function'
 
 脚本层看不见 member handle / `getfunctioninfo` 这些接口，所以这轮把**参考实现的静态库**
 （`tmp-c2/lib/squirrel.lib` + `sqstdlib.lib`）用 MSVC 编了一个 C 探针
-`tmp-c2/hostapi/ref_host.c`（`build_ref_host.bat`），按固定顺序跑一遍并打印规范化报告
+`tools/hostapi/ref_host.c`（`build_ref_host.bat`），按固定顺序跑一遍并打印规范化报告
 （`ref_host.txt`）；Rust 侧的断言与那份报告逐项对应。
 
 探针也顺手把**真实签名**暴露了出来（我最初按印象写的几个都是错的）：

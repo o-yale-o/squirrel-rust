@@ -3,7 +3,7 @@
 //! foreignptr、引用计数、resurrect）。
 //!
 //! 语义全部按 `squirrel/sqapi.cpp` 对齐（本轮把参考实现的静态库编成 C 探针实测过
-//! 关键几处，见 `tmp-c2/hostapi/ref_host.c` 与 `ref_host.txt`）：
+//! 关键几处，见 `tools/hostapi/ref_host.c` 与 `ref_host.txt`）：
 //!
 //! * `sq_getmemberhandle(v, idx, &h)`：**只接受类**（`_GETSAFE_OBJ(..., OT_CLASS)`），
 //!   从类上取成员表项；**成功时会把键从栈上弹掉**；失败报 `wrong index`。

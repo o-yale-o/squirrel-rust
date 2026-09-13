@@ -1,8 +1,8 @@
 //! 宿主 API 扩展回归（P2）：member handle、`getfunctioninfo`、`setfreevariable`。
 //!
-//! 期望值来自**参考实现**：用一个 C 探针（`tmp-c2/hostapi/ref_host.c`，编译成
+//! 期望值来自**参考实现**：用一个 C 探针（`tools/hostapi/ref_host.c`，编译成
 //! `ref_host.exe` 链接参考实现的静态库）跑同样的操作，报告存在
-//! `tmp-c2/hostapi/ref_host.txt`。这里的断言与那份报告逐项对应。
+//! `tools/hostapi/ref_host.txt`。这里的断言与那份报告逐项对应。
 //!
 //! 从参考实现实测确认的几条"容易搞错"的语义：
 //!
