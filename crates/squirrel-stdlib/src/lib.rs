@@ -1012,8 +1012,22 @@ fn string_strip_impl(v: &mut VmData, t: Trim) -> SQInteger {
     let b = s.as_bytes();
     let is_ws = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
     let (start, end) = match t {
-        Trim::Left => (b.iter().position(|c| !is_ws(c)).unwrap_or(b.len()), b.len()),
+        // ↔ _string_lstrip：`sq_pushstring(v, start, -1)` —— 负长度让 API 去 strlen(start)，
+        // 于是结果在**第一个嵌入 NUL 处截断**。这不是 UB（串本身合法），是参考实现
+        // 用 C 字符串处理 SQString 的确定行为，保真优先照做。
+        Trim::Left => {
+            let start = b.iter().position(|c| !is_ws(c)).unwrap_or(b.len());
+            let stop = b[start..]
+                .iter()
+                .position(|&c| c == 0)
+                .map(|x| start + x)
+                .unwrap_or(b.len());
+            (start, stop)
+        }
+        // ↔ _string_rstrip：`__strip_r` 按显式长度从尾部扫，不吃 NUL 截断
         Trim::Right => (0, b.iter().rposition(|c| !is_ws(c)).map(|x| x + 1).unwrap_or(0)),
+        // ↔ _string_strip：`__strip_l` + `__strip_r(str, len)` 后按 `end - start` 推送；
+        // `end < start` 只可能出现在"整串都是空白"（此时没有 NUL），退化为空串
         Trim::Both => (
             b.iter().position(|c| !is_ws(c)).unwrap_or(b.len()),
             b.iter().rposition(|c| !is_ws(c)).map(|x| x + 1).unwrap_or(0),
@@ -1040,7 +1054,9 @@ fn string_split(v: &mut VmData) -> SQInteger {
     let arr = squirrel::array::SQArray::create(&v.ss, 0);
     let mut start = 0usize;
     let mut end = 0usize;
-    while end < src.len() {
+    // ↔ `while(*end != '\0')`：参考实现按 C 字符串扫描，**遇到嵌入 NUL 就停**，
+    // 尾段也用这个停下来的 end（于是 NUL 之后的内容整段丢掉）。确定的语义，照做。
+    while end < src.len() && src[end] != 0 {
         let cur = src[end];
         if seps.contains(&cur) {
             if !skipempty || end != start {

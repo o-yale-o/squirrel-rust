@@ -25,6 +25,12 @@ function s(tag, f) {
     try { print(tag + "=" + show(f()) + "\n"); }
     catch (e) { print(tag + "!" + e + "\n"); }
 }
+// 打印在嵌入 NUL 处会截断（两个引擎一致），所以含 NUL 的用例改用字节长度观测
+function lens(a) {
+    local s = "" + a.len() + ":";
+    for (local i = 0; i < a.len(); i++) { if (i > 0) s += ","; s += ("" + a[i]).len(); }
+    return s;
+}
 // 具名函数只能声明（function name() {}），不能当表达式赋值给 local
 function named_probe() {}
 
@@ -2898,4 +2904,86 @@ s("m_re_classes", function() { local r = regexp("[a-z]+"); return r.search("123a
 s("m_re_anchors", function() { local r = regexp("^ab"); return r.search("xab"); });
 s("m_re_alt", function() { local r = regexp("cat|dog"); return r.search("hotdog"); });
 s("m_re_quant", function() { local r = regexp("a{2,3}"); return r.search("aaaa"); });
+s("m_s_sw_basic", function() { return "" + startswith("hello", "he"); });
+s("m_s_sw_full", function() { return "" + startswith("hello", "hello"); });
+s("m_s_sw_longer", function() { return "" + startswith("hello", "helloo"); });
+s("m_s_sw_empty_pat", function() { return "" + startswith("hello", ""); });
+s("m_s_sw_both_empty", function() { return "" + startswith("", ""); });
+s("m_s_sw_empty_self", function() { return "" + startswith("", "a"); });
+s("m_s_sw_case", function() { return "" + startswith("Hello", "he"); });
+s("m_s_sw_nul_pat", function() { return "" + startswith("a\x00b", "a\x00"); });
+s("m_s_sw_nul_full", function() { return "" + startswith("a\x00b", "a\x00b"); });
+s("m_s_sw_nul_longer", function() { return "" + startswith("a\x00b", "a\x00bc"); });
+s("m_s_sw_nul_plain", function() { return "" + startswith("a\x00b", "a"); });
+s("m_s_sw_arity1", function() { return "" + startswith("abc"); });
+s("m_s_sw_arity3", function() { return "" + startswith("abc", "a", 1); });
+s("m_s_sw_type", function() { return "" + startswith("abc", 1); });
+s("m_s_ew_basic", function() { return "" + endswith("hello", "lo"); });
+s("m_s_ew_full", function() { return "" + endswith("hello", "hello"); });
+s("m_s_ew_longer", function() { return "" + endswith("hello", "ohello"); });
+s("m_s_ew_empty_pat", function() { return "" + endswith("hello", ""); });
+s("m_s_ew_both_empty", function() { return "" + endswith("", ""); });
+s("m_s_ew_case", function() { return "" + endswith("Hello", "LO"); });
+s("m_s_ew_nul_pat", function() { return "" + endswith("a\x00b", "\x00b"); });
+s("m_s_ew_nul_plain", function() { return "" + endswith("a\x00b", "b"); });
+s("m_s_ew_arity1", function() { return "" + endswith("abc"); });
+s("m_s_strip_basic", function() { return strip("  a  "); });
+s("m_s_strip_tabs", function() { return strip("\t\na\r "); });
+s("m_s_strip_vert", function() { return strip("\x0b\x0c a \x0b"); });
+s("m_s_strip_all_ws", function() { return strip("   "); });
+s("m_s_strip_all_ws_len", function() { return strip("   ").len(); });
+s("m_s_strip_none", function() { return strip("abc"); });
+s("m_s_strip_empty", function() { return strip(""); });
+s("m_s_lstrip_basic", function() { return lstrip("  a  "); });
+s("m_s_lstrip_all_ws", function() { return lstrip("   "); });
+s("m_s_lstrip_nul_inner", function() { return lstrip(" a\x00b"); });
+s("m_s_lstrip_nul_inner_len", function() { return lstrip(" a\x00b").len(); });
+s("m_s_rstrip_basic", function() { return rstrip("  a  "); });
+s("m_s_rstrip_all_ws", function() { return rstrip("   "); });
+s("m_s_rstrip_nul_inner", function() { return rstrip("a\x00b "); });
+s("m_s_rstrip_nul_inner_len", function() { return rstrip("a\x00b ").len(); });
+s("m_s_strip_nul_lead", function() { return strip(" \x00a"); });
+s("m_s_strip_nul_lead_len", function() { return strip(" \x00a").len(); });
+s("m_s_strip_nul_trail", function() { return strip("a\x00  "); });
+s("m_s_strip_nul_trail_len", function() { return strip("a\x00  ").len(); });
+s("m_s_strip_nul_mid_len", function() { return strip("  a\x00b  ").len(); });
+s("m_s_strip_arity1", function() { return strip("abc", 1); });
+s("m_s_strip_type", function() { return strip(1); });
+s("m_s_esc_empty", function() { return escape(""); });
+s("m_s_esc_plain", function() { return escape("abc"); });
+s("m_s_esc_tab", function() { return escape("a\tb"); });
+s("m_s_esc_controls", function() { return escape("\a\b\v\f\r"); });
+s("m_s_esc_backslash", function() { return escape("a\\b"); });
+s("m_s_esc_dquote", function() { return escape("a\"b"); });
+s("m_s_esc_squote", function() { return escape("a\'b"); });
+s("m_s_esc_nul", function() { return escape("a\x00b"); });
+s("m_s_esc_nul_len", function() { return escape("a\x00b").len(); });
+s("m_s_esc_del", function() { return escape("\x7f"); });
+s("m_s_esc_ctrl_low", function() { return escape("\x01\x1f"); });
+s("m_s_esc_mixed", function() { return escape("a\t\\\"z"); });
+s("m_s_esc_newline_in", function() { return escape("l1\nl2"); });
+s("m_s_esc_space", function() { return escape("a b"); });
+s("m_s_esc_arity0", function() { return escape(); });
+s("m_s_split_basic", function() { return split("a,b,c", ","); });
+s("m_s_split_seps_multi", function() { return split("a,b;c", ",;"); });
+s("m_s_split_noskip", function() { return split("a,,b", ","); });
+s("m_s_split_skipempty", function() { return split("a,,b", ",", true); });
+s("m_s_split_skipempty_false", function() { return split("a,,b", ",", false); });
+s("m_s_split_trailing", function() { return split("a,", ","); });
+s("m_s_split_leading", function() { return split(",a", ","); });
+s("m_s_split_self_empty", function() { return split("", ","); });
+s("m_s_split_only_sep", function() { return split(",", ","); });
+s("m_s_split_empty_seps", function() { return split("a", ""); });
+s("m_s_split_nul", function() { return split("a\x00,b", ","); });
+s("m_s_split_nul_only", function() { return split("\x00", ","); });
+s("m_s_split_nul_skipempty", function() { return split("a\x00,b", ",", true); });
+s("m_s_split_nul_before_sep", function() { return split("a\x00", ","); });
+s("m_s_split_sep_is_nul", function() { return split("a\x00b", "\x00"); });
+s("m_s_split_nul_lens", function() { return lens(split("a\x00,b", ",")); });
+s("m_s_split_nul_only_lens", function() { return lens(split("\x00", ",")); });
+s("m_s_split_nul_skipempty_lens", function() { return lens(split("a\x00,b", ",", true)); });
+s("m_s_split_nul_before_sep_lens", function() { return lens(split("a\x00", ",")); });
+s("m_s_split_sep_is_nul_lens", function() { return lens(split("a\x00b", "\x00")); });
+s("m_s_split_arity1", function() { return split("a"); });
+s("m_s_split_type", function() { return split("a", 1); });
 print("DELMATRIX-DONE\n");

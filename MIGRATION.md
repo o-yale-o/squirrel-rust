@@ -102,6 +102,14 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | 序列化默认参数 | 往返**会丢**默认值（`g(1)` 里缺省参数变 `null`） |
 | 未捕获错误的退出码 | 是 0（`retval` 不被错误覆盖）；CLI 加载失败才是 −2 |
 | tail call | `return inner()` 会**复用当前帧**，出错时调用栈里看不到这一层 |
+| string 库是**全局函数**，不是字符串方法 | `strip/lstrip/rstrip/split/escape/startswith/endswith/format/printf` 都要写成 `startswith("abc","a")`；`"abc".startswith("a")` 报 `the index 'startswith' does not exist` |
+| `startswith`/`endswith` 严格 3 参数 | 没有 start 偏移；少传/多传都是 `wrong number of parameters` |
+| `startswith`/`endswith` 空模式 | 恒为 `true`（`memcmp(...,0)==0`），包括 `startswith("", "")` |
+| `split` 按 **C 字符串**扫描 | 遇到**嵌入 NUL 就停**，其后整段丢掉：`split("a\x00,b", ",")` 是 `["a"]`，不是 `["a\x00","b"]`；分隔串里含 NUL 时同样先停在 NUL |
+| `lstrip` 结果在**嵌入 NUL 处截断** | 它用 `sq_pushstring(v,start,-1)`（负长度 → `strlen`）：`lstrip(" a\x00b")` 是 `"a"`（长度 1） |
+| `rstrip`/`strip`/`escape`/`startswith` 不受 NUL 影响 | 这些走**显式长度**：`rstrip("a\x00b ")` 长度 3、`strip("  a\x00b  ")` 长度 3、`escape("a\x00b")` 是 4 个字符 `a\0b` |
+| `escape` 不吃具名转义 `\t\n\r` | `scisprint` 为假 → 走 `\xNN`：`escape("a\tb")` 是 `a\x09b`（`\0` 是唯一例外，转成两个字符 `\0`） |
+| `print` 在**嵌入 NUL 处截断** | 两边一致（截断后连换行一起丢，下一行会接到同一行上）——所以语料里含 NUL 的用例改成打印各元素**字节长度**来观测 |
 
 ## 5. 迁移检查清单
 
@@ -113,8 +121,14 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 6. **嵌入宿主（C/C++）**？——本实现目前**没有 C ABI**（141 个 `sq_*` 未导出）；Rust 宿主的 API 见
    `crates/squirrel/src/hostapi.rs` 与 `crates/squirrel-stdlib/tests/host_api*.rs`。
    是否需要 C ABI 仍在等确认（`TODO.md` 的 P0）。
+7. **字符串处理里有没有嵌入 NUL**（二进制数据塞进 string）？——`split`/`lstrip` 在两边都是
+   "到 NUL 为止"，别指望拿到 NUL 之后的内容；要处理二进制请用 `blob`。
 
 ## 6. 完整清单
 
 本文是**面向迁移**的摘要。逐条实测数据、ASan 输出、涉及的源文件行号都在
 [`STATUS.md`](STATUS.md) 第四节的表里（约 26 条），每条都注明了"参考实现为什么是 UB"。
+
+string 库全局函数那一族（第 4 节最后 8 行）的守门位置：
+`crates/squirrel-stdlib/tests/string_semantics.rs`（3 个测试）+ 语料
+`tests-corpus/t_delmatrix.nut` 的 `m_s_*` 段（229 条语义用例，两侧逐字节一致）。

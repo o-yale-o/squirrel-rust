@@ -13,10 +13,28 @@
 > | P2 | 宿主 API 补齐（member handle / `getfunctioninfo` / `setfreevariable` + 公开面） | ✅ 三·补19，顺带修一个 panic 与一个"release hook 从不触发" |
 > | P3 | 健壮性加固（dump 限深 / `--mem-limit` / `--max-ops` / 压缩器嵌套上限可调） | ✅ 三·补20，全部实测有效 |
 > | P4 | 文档（README 对齐实测 + 迁移指南 `MIGRATION.md`） | ✅ 本节之后 |
+> | P5 | string 库全局函数语义（**新发现的一整族未覆盖面**） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **69/69**、samples **17/17**、编译错误对拍 **60/60**、
-> `.cnut` **69/69**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **113/113**、lint 0。
+> `.cnut` **69/69**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **120/120**、lint 0。
+
+### P5 完成情况（string 库全局函数语义）
+
+发现方式：补"字符串方法语义矩阵"时先 grep 语料，`startswith/endswith/strip/lstrip/rstrip/escape`
+**出现 0 次**。查参考实现后确认原因：它们**不是字符串的成员方法**，而是 string 库的
+**全局函数**（`startswith(str, cmp)`）；`"abc".startswith("a")` 在两个引擎里都是
+`the index 'startswith' does not exist`。按委托表逐个成员生成的矩阵因此**结构性地碰不到这一族**
+（`gen_delmatrix.py` 解析的是 `_string_default_delegate_funcz`）。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P5-1 | `gen_delmatrix.py` 新增 `m_s_*` 语义段 **229 条**（全局调用语法） | 两侧逐字节一致 |
+| P5-2 | **修 `split`**：参考实现 `while(*end != '\0')` 按 C 字符串扫描，遇嵌入 NUL 就停、其后整段丢掉 | 原来给 `["a\x00","b"]`，现在给 `["a"]` ✓ |
+| P5-3 | **修 `lstrip`**：参考实现 `sq_pushstring(v,start,-1)` 负长度走 `strlen`，结果在第一个 NUL 处截断 | 原来给 `"a\x00b"`(3)，现在给 `"a"`(1) ✓ |
+| P5-4 | 确认 `rstrip`/`strip`/`escape`/`startswith`/`endswith` 走**显式长度**，不受 NUL 影响 | 加测试钉住，防止以后"顺手统一"改错 |
+| P5-5 | 守门测试 `crates/squirrel-stdlib/tests/string_semantics.rs`（3 个） | `cargo test` 117 → 120 |
+| P5-6 | 迁移指南补 8 条"两边一致怪癖"（含 `print` 在 NUL 处截断 → 语料改用字节长度观测） | `MIGRATION.md` 第 4 节 |
 
 ### P2 完成情况
 
