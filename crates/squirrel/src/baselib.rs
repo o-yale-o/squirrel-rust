@@ -1455,6 +1455,27 @@ fn map_array(v: &mut VmData, dest: &ArrayRef, src: &Value) -> Result<(), ()> {
         }
         _ => 4,
     };
+    // ↔ __map_array 的**调用目标**：参考实现每轮只压 `2 + (nArgs>=3) + (nArgs>=4)`
+    // 个值，而调用走的是 `sq_call(v, nArgs, …)` → `GetUp(-(nArgs+1))`。闭包自己
+    // 躺在 `T-pushed-1`，所以只有 **nArgs == pushed** 时调用的才是闭包：
+    //   * nArgs == 1（闭包 0 参）→ 目标是刚压进去的 `src`，报 `attempt to call 'array'`
+    //   * nArgs >= 5（闭包 4 参及以上）→ 目标是闭包**下面**那个槽，而在
+    //     array_map/array_apply 的帧里那正好是 `this`（同一个数组）→ 同样的错误
+    // 也就是说参考实现的 map/apply **只支持 1~3 个形参**的回调（形参个数含 this）。
+    // 实测 `tmp-c2/probe_cb3.nut`：0/4/5 参回调在参考实现上都是
+    // `attempt to call 'array'`，我们原来会"成功地"乱读一个栈槽。
+    // 注意：空数组不会进循环，因此**不报错**（与参考一致）。
+    let pushed = if nargs >= 4 {
+        4
+    } else if nargs == 3 {
+        3
+    } else {
+        2
+    };
+    if size > 0 && nargs != pushed {
+        v.raise_error_str("attempt to call 'array'");
+        return Err(());
+    }
     for n in 0..size {
         let temp = match src {
             Value::Array(a) => a.borrow().get(n).unwrap_or(Value::Null),
@@ -1626,12 +1647,28 @@ fn hsort(v: &mut VmData, arr: &Value, use_cmp: bool) -> bool {
                 v.push(y.clone());
                 match v.call_value(c, 3, v.top - 3, false) {
                     Ok(r) => {
-                        if !matches!(r, Value::Integer(_)) {
-                            v.top = top;
-                            v.raise_error_str("numeric value expected as return value of the compare function");
-                            return Err(());
-                        }
-                        let ret = r.as_integer();
+                        // ↔ sq_getinteger(v,-1,&ret)：`sq_isnumeric` 掩码里**包含 float**
+                        // （值走 `tointeger(o)` = `(SQInteger)` 截断），bool 另有单独分支给 0/1。
+                        // 只收 Integer 是错的：`a.sort(function(x,y){ return x - y; })`
+                        // 在浮点数组上返回的就是 **float**，参考实现照样排序。
+                        let ret = match r {
+                            Value::Integer(i) => i,
+                            Value::Float(f) => crate::config::c_f32_to_i64(f),
+                            Value::Bool(b) => {
+                                if b {
+                                    1
+                                } else {
+                                    0
+                                }
+                            }
+                            _ => {
+                                v.top = top;
+                                v.raise_error_str(
+                                    "numeric value expected as return value of the compare function",
+                                );
+                                return Err(());
+                            }
+                        };
                         v.top = top;
                         Ok(ret)
                     }
