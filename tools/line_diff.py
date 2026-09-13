@@ -56,8 +56,14 @@ def main(argv):
         return 2
     rc = 0
     for path in args:
-        out_r, err_r, rc_r = run(REF, [path])
-        out_u, err_u, rc_u = run(RUST, [path])
+        try:
+            out_r, err_r, rc_r = run(REF, [path])
+        except Exception as e:  # 超时/启动失败：参考实现自身的 UB 输入会这样
+            out_r, err_r, rc_r = ("<REF-FAILED: %s>" % e).encode(), b"", -999
+        try:
+            out_u, err_u, rc_u = run(RUST, [path])
+        except Exception as e:
+            out_u, err_u, rc_u = ("<RUST-FAILED: %s>" % e).encode(), b"", -999
         lr, lu = lines(out_r), lines(out_u)
         print("== %s  rc %d vs %d  stdout %d vs %d 行" % (os.path.basename(path), rc_r, rc_u, len(lr), len(lu)))
         if check_stderr:

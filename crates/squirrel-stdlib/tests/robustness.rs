@@ -399,6 +399,56 @@ fn runaway_recursion_is_catchable_and_bounded() {
     assert!(s.contains("after"), "捕获后脚本应继续执行，实际：{s:?}");
 }
 
+/// 各条"能递归"的路径都要有界：互递归、`_call` 元方法、深栈上取调用栈信息。
+#[test]
+fn every_recursion_path_is_bounded() {
+    let vm = Vm::new(1024);
+    let out: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let o = out.clone();
+        vm.set_print_funcs(
+            Some(Rc::new(move |_v, b: &[u8]| o.borrow_mut().extend_from_slice(b))),
+            None,
+        );
+    }
+    squirrel_stdlib::register_all(&mut vm.data_mut());
+    let _ = vm.run_buffer(
+        br#"
+        function t(tag, f) {
+            try { print(tag + "=" + f() + "\n"); }
+            catch (e) { print(tag + "!" + e + "\n"); }
+        }
+        t("mutual", function() {
+            local f, g;
+            f = function(n) { local x = g(n + 1); return x; };
+            g = function(n) { local x = f(n + 1); return x; };
+            return f(0);
+        });
+        t("mt_call", function() {
+            local tb = {};
+            tb.setdelegate({ _call = function(...) { return tb(); } });
+            return tb();
+        });
+        t("deep_stackinfo", function() {
+            local f;
+            f = function(n) {
+                if (n <= 0) return typeof getstackinfos(3);
+                local x = f(n - 1);
+                return x;
+            };
+            return f(2000);
+        });
+        print("done\n");
+        "#,
+        b"paths.nut",
+    );
+    let s = String::from_utf8_lossy(&out.borrow()).into_owned();
+    assert!(s.contains("mutual!"), "互递归必须报可捕获错误：{s:?}");
+    assert!(s.contains("mt_call!"), "元方法递归必须报可捕获错误：{s:?}");
+    assert!(s.contains("deep_stackinfo=table"), "深栈取信息应正常：{s:?}");
+    assert!(s.contains("done"), "全部用例跑完：{s:?}");
+}
+
 #[test]
 fn excessive_nesting_reports_an_error_instead_of_aborting() {
     // 超深嵌套必须变成可捕获的编译错误，而不是宿主栈溢出 abort
