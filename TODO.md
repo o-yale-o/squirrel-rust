@@ -27,6 +27,7 @@
 > | P16 | 字符串 → 数字（`tointeger`/`tofloat` 的解析路径） | ✅ 见下 |
 > | P17 | 数值字面量（词法器路径，与 `tointeger` **不是**同一条路） | ✅ 见下 |
 > | P18 | 容器回调乱来（比较器返回值 / 回调形参个数 / 回调抛异常） | ✅ 见下 |
+> | P19 | 索引值边界 + 容器分配上限（健壮性缺口） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -138,6 +139,20 @@ file/blob/stream 后端都被永久持有**：没显式 `close()` 的实例活�
 | P18-3 | 回调实参形状（验证型，已进迁移文档） | `map`/`apply` 给 **(值, 下标, 数组)**、`filter` 给 **(下标, 值)**（顺序相反）、`reduce` 给 `(累加值, 当前值)`，`this` 都是容器；**实参个数由闭包声明的形参个数决定**（含 `this`）。另外 `array.find(x)` 是"找**值**返回下标"、根本不调回调；`table.map` 返回 **array**；`table.keys(cb)` 的回调参数个数永远对不上 |
 | P18-4 | 新语料 + 守门测试 | `tools/gen_cbmatrix.py` → `tests-corpus/t_cbmap.nut`（111 条：比较器返回值 21 种 + 浮点数组/稳定性/形参个数/`this`；`map`/`apply`/`filter`/`reduce`/`find` × 形参 0~5；回调抛异常 9 条；非函数回调 6 条）。守门测试 `crates/squirrel-stdlib/tests/callback_semantics.rs`（3 个）。**观测纪律**：一律 `dump()` 打印内容，绝不直接 print 容器 —— 指针文本两侧本来就不同，一次性脚本里已经因此踩过一次假绿 |
 | P18-5 | 不测的（参考实现自身 UB） | 比较器返回 **NaN / ±inf**：`(SQInteger)((SQFloat)o)` 是 UB（本机上两侧**碰巧**都给 INT64_MIN → `inconsistent compare function`，但那是巧合）；排序过程中增删数组元素（`_sort_compare` 的检查发生在 `sq_call` 之后，指针可能已失效）。两者都不进语料 |
+
+#### P19 完成情况（索引值边界 + 容器分配上限）
+
+**起因**：扫"方法 × **值**形状"这一族（`t_delmatrix` 只测过实参**类型**，双参数组合、
+INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本身**两侧一致**（验证型，
+118 条探针逐字节一致）；但顺着"还能传什么值"往下探，挖出了**我们自己的健壮性缺口**。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P19-1 | **超大一次分配不受限**（**本实现的 bug**，已修） | `array(9223372036854775807)` / `array(1).resize(0x7FFFFFFF)` → Rust Vec 容量溢出 **panic**（参考实现同样输入是 `0xC0000005` 崩溃）；`resize(2147483647)`/`resize(4294967296)` → 分配十几 GB **挂死**（参考实现把 Windows 错误报告挂到整机死锁，用户还得点掉弹窗）。修法：`config.rs` 新增 `MAX_CONTAINER_BYTES`（2 GiB）+ `container_fits()`，接到 `base_array`/`array_resize`/`blob` 构造与 `resize`/`readblob`/blob `write` 增长路径 —— 超限一律**可捕获**的 `container too big`，合法尺寸（`array(100000,7)`）不受影响 |
+| P19-2 | `blob(4).readblob(-1)` | 参考实现把负尺寸转无符号后巨型分配**挂死**（逐条隔离实测）；本实现夹 0 → `no data left to read`。归入有意偏离 |
+| P19-3 | 索引值语义（验证型） | `slice` 负数/夹取/start>end→空、`find` 偏移夹取、`insert` 允许 `idx==len`、`remove` 不允许、`resize` 负值错误、浮点截断 —— 两侧本来一致；blob 的 seek 越界/写入增长（`seek(4)`+写→len 5）也一致 |
+| P19-4 | 新语料 + 守门测试 | `tools/gen_idxmatrix.py` → `tests-corpus/t_idxmap.nut`（**128 条**：slice 双参 18 组 ×2 + 单参极值 ×2 + find 偏移 13 + insert/remove ×2 + resize 安全值 ×2 + 下标极值 + blob seek/增长/readblob）。`robustness.rs` 加 `container_allocations_are_bounded_and_catchable`（9 条超限必须 `container too big`、3 条负值保持原语义、3 条合法尺寸照常，且测试必须**秒回**——守卫在分配前拒绝） |
+| P19-5 | 探针纪律的再确认 | 参考实现跑危险值会**整机挂死**（WER 弹窗阻塞）——必须逐条隔离 + 每条带超时（`Start-Process` + `WaitForExit`），绝不能整文件跑。这轮已经被弹窗坑过一次 |
 
 **新增守门（本轮）**：`tools/check_generators.py`（已接进 check_all 成第 9 步）—— 跑一遍全部
 `tools/gen_*.py`，比对内容哈希，抓"生成物被手改 / 生成器忘记重新生成"。第一次跑就抓到

@@ -142,6 +142,11 @@ impl StreamBackend for BlobBackend {
         let start = self.ptr as usize;
         let end = start + data.len();
         if end > self.buf.len() {
+            // ↔ 守卫：seek 到超大偏移再写一字节也会把缓冲撑到几十 GB（参考实现
+            // 在这里直接把系统拖死）；超限就**短写**（返回 0），不 panic、不挂死
+            if !squirrel::config::container_fits(end as SQInteger, 1) {
+                return 0;
+            }
             self.buf.resize(end, 0);
         }
         self.buf[start..end].copy_from_slice(data);
@@ -662,6 +667,11 @@ fn stream_readblob(v: &mut VmData) -> SQInteger {
     if size < 0 {
         size = 0;
     }
+    // ↔ 守卫：不可 seek 的流（管道）上 len 不可信，size 不会被夹住，
+    // readblob(几十亿) 会先分配同尺寸缓冲 —— 参考实现在这里把系统拖死
+    if !squirrel::config::container_fits(size, 1) {
+        return stream_err(v, "container too big");
+    }
     let mut data = vec![0u8; size as usize];
     let res = self_.borrow_mut().read(&mut data);
     if res <= 0 {
@@ -852,6 +862,11 @@ fn blob_constructor(v: &mut VmData) -> SQInteger {
     if size < 0 {
         return stream_err(v, "cannot create blob with negative size");
     }
+    // ↔ 参考实现无守卫：blob(几 GB) 分配几十 GB 把系统拖死（属其自身 UB），
+    // 这里按健壮性承诺给可捕获错误
+    if !squirrel::config::container_fits(size, 1) {
+        return stream_err(v, "container too big");
+    }
     let backend: BackendRef = Rc::new(RefCell::new(BlobBackend::new(size)));
     bind_backend_this(v, backend);
     0
@@ -864,6 +879,9 @@ fn blob_resize(v: &mut VmData) -> SQInteger {
         None => return stream_err(v, "invalid type tag"),
     };
     let size = v.stack_get(2).as_integer();
+    if !squirrel::config::container_fits(size, 1) {
+        return stream_err(v, "container too big");
+    }
     if !self_.borrow_mut().resize(size) {
         return stream_err(v, "resize failed");
     }

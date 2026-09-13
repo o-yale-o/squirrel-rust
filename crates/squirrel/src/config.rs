@@ -100,6 +100,28 @@ pub const STACK_RESERVED_SLOTS: SQInteger = 16 * 1024;
 
 pub const SQ_BYTECODE_STREAM_TAG: u16 = 0xFAFA;
 
+/// 单个容器（array / blob）**一次分配**的字节上限（2 GiB）。
+///
+/// 参考实现没有任何守卫，脚本里一个数字就能把宿主带走：
+/// `array(9223372036854775807)` / `array(1).resize(0x7FFFFFFF)` → 直接
+/// `0xC0000005` 崩溃（Rust 侧对应 Vec 的容量溢出 **panic**），
+/// `resize(4294967296)` → 分配几十 GB 把系统拖到 Windows 错误报告挂死。
+/// 这里按健壮性承诺封顶：超限报**可捕获**的 `container too big`，不 panic、不挂死。
+/// 正常用量不受影响（2 GiB ≈ 1 亿多个 16 字节的 Value）；要更紧的进程级上限
+/// 用 CLI 的 `--mem-limit`。
+pub const MAX_CONTAINER_BYTES: usize = 1 << 31;
+
+/// 元素数 × 单元素大小是否在 `MAX_CONTAINER_BYTES` 内（溢出也算超限）
+pub fn container_fits(len: SQInteger, elem_size: usize) -> bool {
+    if len < 0 {
+        return false;
+    }
+    match (len as usize).checked_mul(elem_size) {
+        Some(bytes) => bytes <= MAX_CONTAINER_BYTES,
+        None => false,
+    }
+}
+
 /// C++ `(SQInteger)someFloat` 在 MSVC 下的语义（cvttss2si：越界/NaN → i64 最小值）。
 /// 原版大量依赖此转换（HashObj、tointeger 等），必须逐位对齐。
 pub fn c_f32_to_i64(f: f32) -> SQInteger {

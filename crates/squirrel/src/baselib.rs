@@ -656,6 +656,10 @@ fn base_suspend(v: &mut VmData) -> NativeResult {
 
 fn base_array(v: &mut VmData) -> NativeResult {
     let size = v.stack_get(2);
+    // ↔ 参考实现无守卫：array(INT64_MAX) 直接 0xC0000005（我们这里给可捕获错误）
+    if !crate::config::container_fits(size.as_integer(), std::mem::size_of::<Value>()) {
+        return throw_error(v, "container too big");
+    }
     let a = if v.top - v.stackbase > 2 {
         let fill = v.stack_get(3);
         let arr = SQArray::create(&v.ss, 0);
@@ -1372,6 +1376,10 @@ fn array_resize(v: &mut VmData) -> NativeResult {
         let sz = nsize.as_integer();
         if sz < 0 {
             return throw_error(v, "resizing to negative length");
+        }
+        // ↔ 参考实现无守卫：resize(0x7FFFFFFF) 会分配几十 GB 挂死 / INT64_MAX 崩溃
+        if !crate::config::container_fits(sz, std::mem::size_of::<Value>()) {
+            return throw_error(v, "container too big");
         }
         let fill = if v.top - v.stackbase > 2 {
             v.stack_get(3)

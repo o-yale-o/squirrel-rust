@@ -523,3 +523,74 @@ fn deep_and_hostile_execution_does_not_panic() {
         "#
     );
 }
+
+/// 容器**一次分配**的尺寸上限：超限必须是**可捕获错误**，不 panic、不挂死。
+///
+/// 参考实现在这些输入上自己就会死（实测，`tmp-c2/rz2_*.nut`）：
+/// `array(9223372036854775807)` / `resize(0x7FFFFFFF)` → `0xC0000005` 崩溃，
+/// `resize(4294967296)` → 分配几十 GB，Windows 错误报告把整台机器挂住；
+/// `blob(4).readblob(-1)` → 负尺寸转无符号后巨型分配，同样挂死。
+/// 本实现按健壮性承诺给可捕获的 `container too big`（`config.rs` 的
+/// `MAX_CONTAINER_BYTES` = 2 GiB），负尺寸维持原有的负值错误/夹 0 语义。
+/// 注意本测试必须**快速**结束（守卫在分配之前就拒绝），否则就是守卫失效。
+#[test]
+fn container_allocations_are_bounded_and_catchable() {
+    let src = r#"
+function t(tag, f) {
+    try { local v = f(); print(tag + "=ok:" + (typeof v == "array" || typeof v == "instance" ? v.len() : "" + v) + "\n"); }
+    catch (e) { print(tag + "!caught:" + e + "\n"); }
+}
+t("arr_max",     function() { return array(9223372036854775807); });
+t("arr_2p31",    function() { return array(2147483647); });
+t("arr_4g_fill", function() { return array(4294967296, 1); });
+t("rs_max",      function() { local a = array(1); a.resize(9223372036854775807); return a; });
+t("rs_2p31",     function() { local a = array(1); a.resize(2147483647); return a; });
+t("rs_4g",       function() { local a = array(1); a.resize(4294967296); return a; });
+t("blob_max",    function() { return blob(9223372036854775807); });
+t("blob_4g",     function() { return blob(4294967296); });
+t("brz_4g",      function() { local b = blob(4); b.resize(4294967296); return b; });
+// negative sizes keep their existing semantics (not container too big)
+t("arr_neg",     function() { return array(-1); });
+t("rs_neg",      function() { local a = array(1); a.resize(-1); return a; });
+t("blob_neg",    function() { return blob(-5); });
+// legal sizes are unaffected
+t("arr_100k",    function() { return array(100000, 7); });
+t("rs_1k",       function() { local a = array(2, 1); a.resize(1000, 9); return a; });
+t("blob_100k",   function() { return blob(100000); });
+print("BOUND-DONE\n");
+"#;
+    let vm = Vm::new(1024);
+    let out: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let o = out.clone();
+        vm.set_print_funcs(Some(Rc::new(move |_v, b: &[u8]| {
+            o.borrow_mut().extend_from_slice(b)
+        })), None);
+    }
+    squirrel_stdlib::register_all(&mut vm.data_mut());
+    let rc = vm.run_buffer(src.as_bytes(), b"bound.nut");
+    assert!(rc.is_ok(), "脚本不该失败: {:?}", rc.err());
+    let o = String::from_utf8_lossy(&out.borrow()).into_owned();
+    assert!(o.ends_with("BOUND-DONE\n"), "没跑到末尾：\n{o}");
+    for tag in [
+        "arr_max", "arr_2p31", "arr_4g_fill", "rs_max", "rs_2p31", "rs_4g",
+        "blob_max", "blob_4g", "brz_4g",
+    ] {
+        let l = o
+            .lines()
+            .find(|l| l.starts_with(&format!("{tag}!")))
+            .unwrap_or_else(|| panic!("{tag} 应该是可捕获错误：\n{o}"));
+        assert!(l.contains("container too big"), "{tag} 错误类型不对：{l}");
+    }
+    // 负尺寸仍是原有语义
+    assert!(o.lines().any(|l| l.starts_with("arr_neg!caught")), "array(-1) 应报错\n{o}");
+    assert!(o.lines().any(|l| l.starts_with("rs_neg!caught:resizing to negative length")), "{o}");
+    assert!(o.lines().any(|l| l.starts_with("blob_neg!caught:cannot create blob with negative size")), "{o}");
+    // 合法尺寸照常工作
+    for tag in ["arr_100k", "rs_1k", "blob_100k"] {
+        assert!(
+            o.lines().any(|l| l.starts_with(&format!("{tag}=ok:"))),
+            "{tag} 应当成功：\n{o}"
+        );
+    }
+}
