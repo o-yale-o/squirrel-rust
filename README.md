@@ -35,9 +35,18 @@ cargo test                     # 单元 + 集成测试
 
 差分测试（需要先构建参考二进制，见下）：
 
+**一条命令跑完全部验证**（差分 + 审计 + 语料体检 + `cargo test`，任一项失败退出码非 0）：
+
+```bash
+python tools/check_all.py            # 全部（含 cargo test）
+python tools/check_all.py --quick    # 跳过 cargo test，约 1 分钟
+```
+
+单独跑各项：
+
 ```bash
 python tools/diff_test.py                       # 官方 samples
-python tools/diff_test.py tests-corpus          # 边界语料 + 三张生成矩阵
+python tools/diff_test.py tests-corpus          # 边界语料 + 生成矩阵
 python tools/diff_test.py --no-stderr ...       # 只比 stdout（旧行为）
 python tools/line_diff.py tests-corpus/t_opmx.nut   # 大语料按行定位差异
 python tools/repl_diff.py                       # REPL 会话（tests-repl/*.txt）
@@ -48,6 +57,10 @@ python tools/audit_globals.py                   # 全局注册（名字/参数�
 python tools/audit_delegates.py                 # 11 张默认委托表成员
 python tools/audit_regorder.py                  # 根表**插入顺序**（迭代顺序由它决定）
 python tools/lint_corpus.py                     # 语料语法陷阱 + 逐个试编译
+python tools/corpus_health.py                   # 语料"假绿"体检（用例是否真的执行到了）
+python tools/global_coverage.py                 # 哪些已注册全局函数在语料里零覆盖
+python tools/fuzz_diff.py --seeds 200           # 随机差分模糊测试（结构化生成）
+python tools/fuzz_diff.py --mutate --seeds 400  # 随机差分模糊测试（对语料做变异）
 python tools/mem_probe.py x.nut --limit-mb 400  # 带内存/时间上限跑（防失控；逐条排查加 --bisect）
 ```
 

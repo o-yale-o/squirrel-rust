@@ -32,6 +32,8 @@ RUST = os.path.join(ROOT, "target", "release", "sq.exe")
 REF = os.path.join(ROOT, "build-ref", "bin", "Release", "sq_static.exe")
 WORK = os.path.join(ROOT, "tmp-c2", "fuzz")
 CORPUS = os.path.join(ROOT, "tests-corpus")
+TIMEOUT = 20          # 单个脚本的墙钟上限（超时 = 死循环，单独归类；语料里最慢的约 1s）
+TIMEOUT_RC = -999     # 哨兵退出码
 
 # 参考实现会在若干输入上崩溃（已知 UB）：必须抑制模态崩溃框，否则批量跑会卡住
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -377,7 +379,14 @@ def mutate_program(seed):
 
 
 def run(exe, path):
-    p = subprocess.run([exe, path], capture_output=True, cwd=ROOT, timeout=60)
+    """跑一个脚本；超时按"死循环"处理（变异会把有界循环改成死循环，实测踩到过）。
+
+    超时必须是**可分类的结果**而不是异常：否则整轮扫描会直接崩在中间。
+    """
+    try:
+        p = subprocess.run([exe, path], capture_output=True, cwd=ROOT, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return TIMEOUT_RC, "", "timeout"
     out = p.stdout.decode("utf8", "replace").replace("\r", "")
     err = p.stderr.decode("utf8", "replace").replace("\r", "")
     return p.returncode, out, err
@@ -398,6 +407,10 @@ def compare(src, tag, require_done=True):
         f.write(src)
     rc_r, out_r, err_r = run(RUST, path)
     rc_f, out_f, err_f = run(REF, path)
+    if rc_r == TIMEOUT_RC or rc_f == TIMEOUT_RC:
+        # 变异把有界循环改成了死循环是常事；两侧任一超时就跳过（不算差异）
+        side = ("rust" if rc_r == TIMEOUT_RC else "") + ("+ref" if rc_f == TIMEOUT_RC else "")
+        return "timeout", "%s 超过 %ds" % (side.strip("+") or "?", TIMEOUT)
     if require_done:
         ok_r = rc_r == 0 and "FUZZ-DONE" in out_r
         ok_f = rc_f == 0 and "FUZZ-DONE" in out_f
@@ -489,7 +502,7 @@ def main():
 
     seeds = [args.seed] if args.seed is not None else list(range(1, args.seeds + 1))
     stat = {"ok": 0, "diff": 0, "ref-ub": 0, "rust-fail": 0, "both-fail": 0,
-            "known-dev": 0}
+            "known-dev": 0, "timeout": 0}
     fails = []
     badgen = []
     for s in seeds:
@@ -522,6 +535,8 @@ def main():
                 print("ref-ub seed=%d %s\n        崩在: %s" % (s, detail, line[:150]))
         elif kind == "known-dev":
             print("known-dev seed=%d %s from=%s" % (s, detail, origin))
+        elif kind == "timeout":
+            print("timeout seed=%d %s from=%s" % (s, detail, origin))
         elif kind == "rust-fail":
             path = os.path.join(WORK, "rustfail_%d.nut" % s)
             shutil.copy(os.path.join(WORK, "case_%s.nut" % tag), path)
@@ -541,7 +556,7 @@ def main():
                 pass
 
     print("\n== 结果 ==")
-    for k in ("ok", "diff", "ref-ub", "rust-fail", "both-fail", "known-dev"):
+    for k in ("ok", "diff", "ref-ub", "rust-fail", "both-fail", "known-dev", "timeout"):
         print("  %-10s %d" % (k, stat[k]))
     if fails:
         print("\n需要人工看的（真实差异/我方失败）：")

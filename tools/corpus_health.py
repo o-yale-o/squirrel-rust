@@ -76,11 +76,13 @@ def main():
             print("%-26s %6d %6d %5.0f%%  %s%s" % (name, len(cases), len(errs),
                                                    100 * ratio, top_s, flag))
     print()
+    # 汇总行保持 ASCII + 数字，方便 tools/check_all.py 提取摘要
+    print("scanned %d files, %d suspicious" % (len(files), len(suspicious)))
     if suspicious:
         print("有疑点的文件：%s" % suspicious)
-    else:
-        print("没有“全部用例集中报同一个错”的文件")
-    return 1 if suspicious else 0
+        return 1
+    print("没有“全部用例集中报同一个错”的文件")
+    return 0
 
 
 if __name__ == "__main__":
