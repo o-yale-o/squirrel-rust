@@ -374,7 +374,9 @@ fn real_main() {
             continue;
         }
         if args[arg].starts_with('-') {
-            let flag = args[arg].chars().nth(1).unwrap_or(' ');
+            // ↔ argv[arg][1]：单独一个 "-" 时参考实现读到的是字符串结尾的 NUL，
+            // 于是打出 "unknown prameter '-<NUL>'"（CLI 矩阵抓到的，原来给的是空格）
+            let flag = args[arg].chars().nth(1).unwrap_or('\0');
             match flag {
                 'd' => vm.ss.debuginfo.set(true),
                 'c' => compiles_only = true,
@@ -397,7 +399,8 @@ fn real_main() {
                     print_version_infos();
                     println!("unknown prameter '-{}'", flag);
                     print_usage();
-                    std::process::exit(1);
+                    // ↔ sq.c: `*retval = -1; return _ERROR;`（retval 是返回值 → 进程退出码 -1）
+                    std::process::exit(-1);
                 }
             }
             arg += 1;
@@ -419,17 +422,26 @@ fn real_main() {
                     let top = v.top;
                     let clo = v.get_at(top - 1);
                     if let Value::Closure(c) = &clo {
-                        match squirrel::serialization::write_closure(&mut v, c) {
-                            Ok(bytes) => {
-                                if std::fs::write(&outfile, bytes).is_err() {
-                                    eprintln!("cannot write {}", outfile);
-                                    std::process::exit(1);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error [{}]", e);
-                                std::process::exit(1);
-                            }
+                        // ↔ sqstd_writeclosuretofile：先 fopen("wb+") 再写；任何失败都只把
+                        // 错误放进 lasterror，由外层统一打 `Error [%s]`（**stdout**）并 retval = -2。
+                        // 原来这里是 eprintln 到 stderr + exit(1)，与参考实现三处都不同
+                        // （流、文本、退出码），CLI 矩阵抓到的。
+                        let failed = match squirrel::serialization::write_closure(&mut v, c) {
+                            Ok(bytes) => std::fs::File::create(&outfile)
+                                .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes))
+                                .is_err(),
+                            Err(_) => true,
+                        };
+                        if failed {
+                            let err = v.lasterror.clone();
+                            let msg = String::from_utf8_lossy(err.as_bytes()).into_owned();
+                            let msg = if msg.is_empty() {
+                                "cannot open the file".to_string()
+                            } else {
+                                msg
+                            };
+                            println!("Error [{}]", msg);
+                            std::process::exit(-2);
                         }
                     }
                     std::process::exit(0);

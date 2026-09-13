@@ -21,12 +21,46 @@
 > | P10 | 验证入口入库 + 语料卫生（写文件审计）+ 模糊测试放大到 1000 | ✅ 见下 |
 > | P11 | 线程/生成器「状态 × API」矩阵（162 条）+ 把一处**安全偏离**测清楚 | ✅ 见下 |
 > | P12 | 序列化「值形状」矩阵（67 条）+ 把"默认参数会丢"的范围测准 | ✅ 见下 |
+> | P13 | 命令行/宿主行为矩阵（34 条）+ 3 处 CLI 差异修复 | ✅ 见下 |
+> | P14 | 文件句柄共享模式对齐 + 发现后端注册表只增不减（**待修**） | ⚠️ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
-> `.cnut` **74/74**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **138/138**、lint 0。
+> `.cnut` **74/74**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **139/139**、lint 0。
 >
 > **一条命令跑完**：`python tools/check_all.py`（11 项，任一项失败退出码非 0；`--quick` 跳过 cargo test）。
+
+### P14（部分完成）：文件句柄共享模式 + 后端注册表只增不减
+
+**已修**（`tools/cli_matrix.py` 之外的模糊测试线发现）：参考实现的 `fopen` 用 `_SH_DENYNO`
+（`FILE_SHARE_READ|WRITE`，**不含** `FILE_SHARE_DELETE`）→ 句柄开着时 `remove()` **失败**；
+Rust 的 `std::fs::File` 默认三种共享齐全（开着也能删）→ 我们曾在同一场景删成功。
+已在 `stream.rs` 显式 `share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)` 对齐，
+探针 a/b/c/d 四种组合全部一致，并进语料（`t_file.nut` 的 `share_remove_*`）。
+
+**发现但未修（后续项）**：`stream.rs` 的 `BACKENDS`（thread-local
+`Vec<Option<BackendRef>>`）**只增不减** —— `register_backend` 只 push，没有任何地方把槽位置
+`None`。于是**每个创建过的 file/blob/stream 后端都被永久持有**：没显式 `close()` 的实例
+会活到进程结束，文件句柄一直开着 → 与参考实现（引用计数归零/帧弹出/GC 时释放）不同，
+表现为"参考实现 `remove()` 成功、我们失败"（同名 local 重复声明、`m = null` 之后都会这样）。
+这是**无界增长**，属健壮性项。
+
+**这条还挡住了一个已验证的对齐**：参考实现的 `fopen` 用 `_SH_DENYNO`（不含
+`FILE_SHARE_DELETE`），"句柄开着时 `remove()` 失败"；Rust 的 `std::fs::File` 默认三种共享
+齐全（开着也能删）。本轮试过显式 `share_mode(FILE_SHARE_READ|WRITE)` —— 探针对齐了（a/b/c/d
+四种组合全一致），但**语料立刻红**：`t_streammap.nut` 建了上千个 file 实例从不 GC，
+一旦去掉 share-delete，它收尾的 `remove` 就失败（`remove() failed`）。所以已回退，
+等注册表改造一起做。
+
+修法思路（任选）：
+1. **推荐**：注册表存 `Weak`，实例侧再持一个强引用 —— 例如把 `BackendRef` 放进实例的一个
+   userdata 成员（release hook 里 drop 掉，注册表槽位自然变死；现在实例已经有一个
+   `__sid` 可见成员，多一个同类成员不改变"参考实现本来就没有它"这个事实）；
+   这样"不可达即释放"与参考实现一致，share-delete 也可以随后对齐；
+2. GC 时做一次"注册表压实"：遍历存活实例收集 `__sid` 集合，把其它槽位置 `None`
+   （实现小，但"到下次 GC 才释放"仍与参考实现不同，上面那个语料用例依然会红）。
+
+
 >
 > **覆盖面扫描工具**：`tools/global_coverage.py` —— 把 62 个已注册全局函数逐个对照语料
 > 调用次数，直接列出"零覆盖/低覆盖"。P7 的 5 个项就是它扫出来的（当时只有这 5 个是 0 次）。

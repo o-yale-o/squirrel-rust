@@ -10,6 +10,7 @@
 各项的含义：
   corpus        tests-corpus/ 下全部语料，两侧比 stdout+stderr+退出码（归一化 CRLF 与指针）
   samples       官方 samples/ 17 个脚本
+  cli           命令行/宿主行为（34 条：参数解析、退出码、-c 产物字节、REPL、坏参数）
   compile-err   非法源码的编译错误文本对拍（60 条）
   cnut          .cnut 字节一致 + 双向交叉执行（C++ 编译的给 Rust 跑，反之亦然）
   lint          语料自检（文件能编译、不残留副作用文件等）
@@ -32,6 +33,7 @@ PY = sys.executable
 STEPS = [
     ("corpus", [PY, "tools/diff_test.py", "tests-corpus"]),
     ("samples", [PY, "tools/diff_test.py"]),
+    ("cli", [PY, "tools/cli_matrix.py"]),
     ("compile-err", [PY, "tools/errmsg_matrix.py"]),
     ("cnut", [PY, "tools/cnut_matrix.py", "tests-corpus"]),
     ("lint", [PY, "tools/lint_corpus.py"]),

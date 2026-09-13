@@ -288,6 +288,13 @@ impl FileBackend {
         } else if append {
             opts.append(true).read(plus).create(true);
         }
+        // 注：参考实现的 fopen 用 _SH_DENYNO（FILE_SHARE_READ|WRITE，**不含**
+        // FILE_SHARE_DELETE），所以"句柄还开着时 remove() 会失败"；Rust 的
+        // std::fs::File 默认三种共享齐全，开着也能删。对齐它需要先解决下面这个问题：
+        // 本文件的 BACKENDS 注册表**只增不减**（见 TODO.md P14），未显式 close 的后端
+        // 会一直活到进程结束、句柄一直开着 —— 一旦去掉 share-delete，语料里那些
+        // "建很多 file 实例但从不 GC"的用例连收尾清理都做不了。等注册表改造
+        // （实例持有后端 + 注册表存 Weak）落地后再打开 share_mode。
         match opts.open(filename) {
             Ok(f) => Some(FileBackend {
                 handle: Some(Rc::new(RefCell::new(f))),

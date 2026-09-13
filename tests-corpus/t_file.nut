@@ -27,3 +27,10 @@ print("blob[0]=" + rb[0] + " blob[3]=" + rb[3] + "\n");
 print("eos=" + (f.eos() != null) + "\n");
 f.close();
 remove("diff_test_data.bin");
+
+// ---- 文件句柄共享模式：暂时**不对齐**（见 TODO.md P14）----
+// 参考实现的 fopen 用 _SH_DENYNO（不含 FILE_SHARE_DELETE）：句柄开着时 remove() 失败。
+// 我们这边 Rust 的 std::fs::File 默认三种共享齐全（开着也能删）。要忠实对齐，得先修
+// 后端注册表只增不减的问题（未显式 close 的后端会一直活到进程结束）—— 否则语料里
+// "建很多实例但从不 GC"的用例连收尾清理都做不了。这条偏离已记进 MIGRATION.md。
+print("share_note=deferred\n");

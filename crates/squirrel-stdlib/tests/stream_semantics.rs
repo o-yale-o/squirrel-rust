@@ -265,3 +265,29 @@ fn file_seek_negative_absolute_offset_fails() {
     );
     let _ = std::fs::remove_file(&dir);
 }
+
+/// 文件句柄开着时 `remove()` 的行为：**暂时不对齐参考实现**（见 TODO.md P14）。
+///
+/// 参考实现的 `fopen` 用 `_SH_DENYNO`（`FILE_SHARE_READ|WRITE`，不含 `FILE_SHARE_DELETE`），
+/// 句柄开着时 `remove()` 会报 `remove() failed`；Rust 的 `std::fs::File` 默认三种共享齐全，
+/// 开着也能删。要忠实对齐得先修后端注册表"只增不减"（未显式 close 的后端活到进程结束）——
+/// 否则语料里"建很多实例但从不 GC"的用例连收尾清理都做不了。
+/// 这个测试固定**当前**行为，等注册表改造完成后应改成断言 `remove()` 失败。
+#[test]
+fn open_handle_allows_remove_for_now() {
+    let dir = std::env::temp_dir().join("sqrust_share_test.bin");
+    let _ = std::fs::remove_file(&dir);
+    let p = dir.to_string_lossy().replace('\\', "\\\\");
+    let src = format!(
+        r#"
+        function try_remove(p) {{ try {{ remove(p); return "ok"; }} catch (e) {{ return "E:" + e; }} }}
+        local h1 = file("{p}", "wb+");
+        local h2 = file("{p}", "wb+");
+        print("while_open=" + try_remove("{p}") + "\n");
+        h1.close(); h2.close();
+    "#
+    );
+    let (out, _err) = run_capture(&src);
+    assert_eq!(out, "while_open=ok\n", "见 TODO.md P14：对齐参考实现要等注册表改造");
+    let _ = std::fs::remove_file(&dir);
+}
