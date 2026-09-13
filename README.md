@@ -143,6 +143,49 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 - `date` 的 `month`/`wday`/`yday` 沿用 `tm` 约定（0 基），`'u'` 走 gmtime；
 - `print` 按裸字节输出（非 UNICODE 构建），`%s`/`print` 在第一个 NUL 处截断。
 
+## Rust 宿主嵌入（脚本扩展）
+
+宿主是 Rust 程序时，直接用 `squirrel` + `squirrel-stdlib`：
+
+```rust
+use squirrel::api::Vm;
+use squirrel::object::Value;
+use std::rc::Rc;
+
+let vm = Vm::new(1024);
+squirrel_stdlib::register_all(&mut vm.data_mut());   // print/表/字符串/math/io…
+squirrel_stdlib::set_error_handlers(&vm);            // 未捕获错误打印 CALLSTACK/LOCALS
+
+// 脚本 → Rust：注册宿主函数（nparamscheck 含 this；typemask 首位 `.` 是 this）
+vm.register_native("host_log", Rc::new(|v| {
+    println!("{}", String::from_utf8_lossy(v.stack_get(2).as_bytes()));
+    0
+}), 2, Some(".s"));
+
+// 跑脚本
+vm.run_buffer(b"function on_event(e) { host_log(\"got \" + e.amount); return e.amount * 2; }", b"rules.nut")?;
+
+// Rust → 脚本：取全局函数、传参调用、错误是 Result
+let f = vm.get_global("on_event").unwrap();
+let root = vm.data().roottable.clone();          // 先绑定：借用不能跨 call
+let out = vm.call(&f, root, &[Value::Integer(21)], true)?;
+# Ok::<(), String>(())
+```
+
+完整可运行示例（8 段，含宿主对象、双向调用、错误处理、**热重载**、指令预算）：
+
+```bash
+cargo run --example embed -p squirrel-stdlib
+```
+
+嵌入时的三个注意点（示例里都演示了）：
+
+1. `vm.data()` 的借用会活到语句结束 —— 调 `vm.call(…)` 前先把参数/roottable **绑定成局部变量**；
+2. **宿主持有自己状态的借用时不要调进 VM** —— native 里会再借同一个 `RefCell`（panic）；
+   用块把借用限制在需要的范围内；
+3. 脚本里的字符串是**裸字节**（参考实现是非 UNICODE 构建），拿出去时用
+   `String::from_utf8_lossy`，别假设 UTF-8。
+
 ## 从 C++ 版迁移过来
 
 有一类地方是**故意与参考实现不一致**的（参考实现在那些输入上会崩溃 / 内存损坏 /
