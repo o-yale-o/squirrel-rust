@@ -9,3 +9,10 @@ license = "MIT"
 
 [profile.release]
 debug = true
+# A5: the default codegen-units=16 forbids inlining across codegen units, which
+# is costly for an interpreter whose dispatch loop calls small hot helpers
+# (stack access, callinfo, arithmetic) that live right next to it. A single CGU
+# plus fat LTO lets LLVM inline them and keep vm state in registers across
+# opcodes.
+codegen-units = 1
+lto = "fat"

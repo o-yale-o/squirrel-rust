@@ -268,10 +268,12 @@ impl VmData {
         self.top -= 1;
     }
 
+    #[inline(always)]
     pub fn last_callinfo(&self) -> &CallInfo {
         self.callsstack.last().expect("empty callstack")
     }
 
+    #[inline(always)]
     pub fn last_callinfo_mut(&mut self) -> &mut CallInfo {
         self.callsstack.last_mut().expect("empty callstack")
     }
@@ -295,24 +297,31 @@ impl VmData {
         self.start_call(closure, target, args, stackbase, tailcall)
     }
 
+    #[inline(always)]
     fn stk(&self, a: SQInteger) -> Value {
         let i = (self.stackbase + a) as usize;
-        // 被闭包捕获（open outer）的局部变量以共享单元为准：可能被别的线程改过
-        for (slot, cell) in &self.open_cells {
-            if *slot == i {
-                return cell.borrow().clone();
+        // 被闭包捕获（open outer）的局部变量以共享单元为准：可能被别的线程改过。
+        // 绝大多数函数没有 open outer，先做空表快路径（语义不变）。
+        if !self.open_cells.is_empty() {
+            for (slot, cell) in &self.open_cells {
+                if *slot == i {
+                    return cell.borrow().clone();
+                }
             }
         }
         self.stack[i].clone()
     }
 
+    #[inline(always)]
     fn stk_set(&mut self, a: SQInteger, v: Value) {
         let i = (self.stackbase + a) as usize;
         self.ensure_stack(i);
-        for (slot, cell) in &self.open_cells {
-            if *slot == i {
-                *cell.borrow_mut() = v.clone();
-                break;
+        if !self.open_cells.is_empty() {
+            for (slot, cell) in &self.open_cells {
+                if *slot == i {
+                    *cell.borrow_mut() = v.clone();
+                    break;
+                }
             }
         }
         self.stack[i] = v;
