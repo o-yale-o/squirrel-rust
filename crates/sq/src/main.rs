@@ -39,10 +39,10 @@ fn interactive(vm: &squirrel::api::Vm) {
 
     print_version_infos();
 
-    // 注册 quit()
+    // 注册 quit()（↔ sq.c：native 闭包 + 1 个 outer userpointer 指向 done 标志）
+    let done = Rc::new(RefCell::new(false));
     {
         let v = vm.data_mut();
-        let done = Rc::new(RefCell::new(false));
         let done2 = done.clone();
         let quit = move |_: &mut squirrel::vm::VmData| -> SQInteger {
             *done2.borrow_mut() = true;
@@ -50,12 +50,11 @@ fn interactive(vm: &squirrel::api::Vm) {
         };
         let nc = squirrel::closure::SQNativeClosure::create(&vm.ss, Rc::new(quit), 1);
         nc.borrow_mut().nparamscheck = 1;
-        nc.borrow_mut().outervalues[0] = Value::UserPointer(0); // 占位（done 标志经闭包捕获）
+        nc.borrow_mut().outervalues[0] = Value::UserPointer(0); // ↔ sq_pushuserpointer(&done)
         let key = vm.ss.intern(b"quit");
         if let Value::Table(root) = &v.roottable {
             root.borrow_mut().new_slot(&key, &Value::NativeClosure(nc));
         }
-        let _ = done;
     }
 
     let stdin = std::io::stdin();
@@ -185,14 +184,9 @@ fn interactive(vm: &squirrel::api::Vm) {
                 }
                 v.top = oldtop;
             }
-            // quit 检查
-            if let Value::Table(root) = &vm.data().roottable {
-                if let Some(Value::NativeClosure(q)) = root.borrow().get(&vm.ss.intern(b"quit")) {
-                    let quit_flag = q.borrow().outervalues[0].as_integer();
-                    if quit_flag != 0 {
-                        break 'outer;
-                    }
-                }
+            // quit 检查（↔ sq.c 的 while(!done)）
+            if *done.borrow() {
+                break 'outer;
             }
         }
     }

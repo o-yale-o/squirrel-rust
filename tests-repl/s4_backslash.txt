@@ -1,0 +1,6 @@
+local q = 1; \
+print("cont\n");
+print(typeof q);
+print("\n");
+=42
+quit()

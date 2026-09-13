@@ -800,18 +800,21 @@ pub fn set_error_handlers(vm: &squirrel::api::Vm) {
         });
         *vm.ss.compilererrorhandler.borrow_mut() = Some(handler);
     }
-    // 运行时错误钩子（CALLSTACK/LOCALS 输出在 M11 完善格式）
+    // 运行时错误钩子 ↔ _sqstd_aux_printerror
     let mut v = vm.data_mut();
     let f: squirrel::closure::NativeFn = Rc::new(|v: &mut VmData| {
-        let e = v.stack_get(2);
         let ss_ = v.ss.clone();
         let ef_ = ss_.errorfunc.borrow().clone();
         if let Some(ef) = ef_ {
-            let msg = match v.to_string_value(&e) {
-                Ok(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                Err(_) => "unknown".to_string(),
-            };
-            ef(v, &format!("\nAN ERROR HAS OCCURRED [{}]\n", msg));
+            if v.top - v.stackbase >= 2 {
+                // ↔ sq_getstring(v,2)：只有真字符串才内联，其余一律 [unknown]
+                let e = v.stack_get(2);
+                let msg = match &e {
+                    Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
+                    _ => "unknown".to_string(),
+                };
+                ef(v, &format!("\nAN ERROR HAS OCCURRED [{}]\n", msg));
+            }
             print_callstack(v);
         }
         0
@@ -820,55 +823,89 @@ pub fn set_error_handlers(vm: &squirrel::api::Vm) {
     v.errorhandler = Value::NativeClosure(nc);
 }
 
-/// ↔ sqstd_printcallstack（格式逐字对齐 M11 处理）
+/// ↔ sqstd_printcallstack：CALLSTACK（level 从 1 起，跳过本函数自身）
+/// + LOCALS（level 0..9 的 sq_getlocal 循环，按类型打印）
 fn print_callstack(v: &mut VmData) {
     let ss_ = v.ss.clone();
     let ef_ = ss_.errorfunc.borrow().clone();
     if let Some(ef) = ef_ {
         ef(v, "\nCALLSTACK\n");
-        let mut level = 0;
+        let mut level: SQInteger = 1; // 1 is to skip this function that is level 0
         loop {
+            // ↔ sq_stackinfos(v, level, &si)
             let cssize = v.callsstack.len() as SQInteger;
-            if cssize <= level {
+            if !(level >= 0 && cssize > level) {
                 break;
             }
             let idx = (cssize - level - 1) as usize;
             let (fname, src, line) = match &v.callsstack[idx].closure {
                 Value::Closure(c) => {
                     let proto = c.borrow().function.clone();
-                    let line = proto.get_line(v.callsstack[idx].ip as SQInteger);
                     (
-                        match &proto.name {
-                            Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
-                            _ => "unknown".to_string(),
-                        },
-                        match &proto.sourcename {
-                            Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
-                            _ => "unknown".to_string(),
-                        },
-                        line,
+                        string_or(&proto.name, "unknown"),
+                        string_or(&proto.sourcename, "unknown"),
+                        proto.get_line(v.callsstack[idx].ip as SQInteger),
                     )
                 }
                 Value::NativeClosure(nc) => {
                     let n = nc.borrow().name.clone();
-                    (
-                        match &n {
-                            Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
-                            _ => "unknown".to_string(),
-                        },
-                        "NATIVE".to_string(),
-                        -1,
-                    )
+                    (string_or(&n, "unknown"), "NATIVE".to_string(), -1)
                 }
-                _ => continue,
+                _ => ("unknown".to_string(), "unknown".to_string(), 0),
             };
-            ef(v, &format!("*FUNCTION [{}()] source line [{}]\n", fname, line));
-            let _ = src;
+            ef(v, &format!("*FUNCTION [{}()] {} line [{}]\n", fname, src, line));
             level += 1;
-            if level > 10 {
-                break;
+        }
+        ef(v, "\nLOCALS\n");
+        for level in 0..10 {
+            let mut seq: SQInteger = 0;
+            while let Some(name) = squirrel::baselib::get_local_at(v, level, seq) {
+                seq += 1;
+                let line = format_local_line(v, &name);
+                ef(v, &line);
+                v.pop_get(); // ↔ sq_pop(v,1)
             }
         }
+    }
+}
+
+/// ↔ sqstd_printcallstack 的 LOCALS 单项（类型化打印）
+fn format_local_line(v: &VmData, name: &str) -> String {
+    let val = v.top_val();
+    match &val {
+        Value::Null => format!("[{}] NULL\n", name),
+        // ↔ pf("%d", SQInteger)：x64 varargs 下 %d 只取低 32 位
+        Value::Integer(i) => format!("[{}] {}\n", name, (*i) as i32),
+        Value::Float(f) => format!(
+            "[{}] {}\n",
+            name,
+            squirrel::cformat::format_g_prec(*f as f64, 14)
+        ),
+        Value::Bool(b) => format!("[{}] {}\n", name, if *b { "true" } else { "false" }),
+        Value::String(s) => format!("[{}] \"{}\"\n", name, String::from_utf8_lossy(&s.val)),
+        Value::UserPointer(_) => format!("[{}] USERPOINTER\n", name),
+        Value::Table(_) => format!("[{}] TABLE\n", name),
+        Value::Array(_) => format!("[{}] ARRAY\n", name),
+        Value::Closure(_) => format!("[{}] CLOSURE\n", name),
+        Value::NativeClosure(_) => format!("[{}] NATIVECLOSURE\n", name),
+        Value::Generator(_) => format!("[{}] GENERATOR\n", name),
+        Value::Userdata(_) => format!("[{}] USERDATA\n", name),
+        Value::Thread(_) => format!("[{}] THREAD\n", name),
+        Value::Class(_) => format!("[{}] CLASS\n", name),
+        Value::Instance(_) => format!("[{}] INSTANCE\n", name),
+        Value::WeakRef(_) => format!("[{}] WEAKREF\n", name),
+        other => format!(
+            "[{}] {}\n",
+            name,
+            squirrel::object::get_type_name(other).unwrap_or("unknown")
+        ),
+    }
+}
+
+fn string_or(v: &Value, default: &str) -> String {
+    match v {
+        Value::String(s) => String::from_utf8_lossy(&s.val).into_owned(),
+        _ => default.to_string(),
     }
 }
 

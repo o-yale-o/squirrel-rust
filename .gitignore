@@ -3,3 +3,4 @@ build-ref
 *.cnut
 out.cnut
 tmp-c2/
+__pycache__/

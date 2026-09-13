@@ -1,0 +1,6 @@
+local x = {};
+print(x.missing);
+print("alive\n");
+=1+
+print("alive2\n");
+quit()

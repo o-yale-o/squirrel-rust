@@ -1955,6 +1955,16 @@ pub fn execute(
     raiseerror: bool,
     et: ExecutionType,
 ) -> Result<(), Value> {
+    // ↔ SQVM::Call：非闭包的 Call 入口（原生闭包 / 类构造 / 报错）不走 Execute
+    if matches!(et, ExecutionType::Call) && !matches!(closure, Value::Closure(_)) {
+        return match vm.call_value(closure, nargs, stackbase, raiseerror) {
+            Ok(v) => {
+                *outres = v;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+    }
     let vm_rc = vm.self_ref().expect("vm has no self ref");
     if vm.nnativecalls + 1 > MAX_NATIVE_CALLS {
         vm.raise_error_str("Native stack overflow");

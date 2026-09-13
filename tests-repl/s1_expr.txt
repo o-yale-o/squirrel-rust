@@ -1,0 +1,8 @@
+=1+1
+=2.5*2
+="a"+"b"
+=null
+=[1,2]
+=function(a){return a*2}
+print("hi\n");
+quit()
