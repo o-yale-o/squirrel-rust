@@ -14,7 +14,7 @@
 | metamethod 全矩阵（343 个用例 × 18 个 metamethod） | 同上 | **逐行一致** |
 | `format`/`printf` 格式串矩阵（1305 行） | 同上 | **逐行一致** |
 | REPL 交互会话差分 | `python tools/repl_diff.py` | **5/5 一致** |
-| `.cnut` 字节级一致 | `python tools/cnut_matrix.py` | samples **17/17**；语料 **48/51**（3 个只差参考实现的未初始化填充，见第四节） |
+| `.cnut` 字节级一致 | `python tools/cnut_matrix.py` | samples **17/17**、语料 **51/51**（少数文件会被标成 `PAD-ONLY`：只差参考实现的未初始化填充，见第四节） |
 | `.cnut` 双向互通 | `python tools/cnut_matrix.py tests-corpus` | **51/51 一致**（含参考实现编译的字节码在本实现上执行） |
 | 指令覆盖 | `cargo test --test opcode_coverage` | **61/61 条指令被语料覆盖** |
 | 宿主 API 嵌入（验收 #5） | `cargo run --example minimal` + `cargo test --test host_api` | **5/5 通过**，输出与 C++ minimal.c 一致 |
@@ -265,7 +265,7 @@ README 中「sqstdaux 调用栈打印格式逐字复刻」目前不成立。
 
 | 项 | 说明 |
 |---|---|
-| `.cnut` 的 outer 类型字段 | 参考实现用 `sizeof(SQUnsignedInteger)`（8 字节）写一个 4 字节枚举，高 4 字节是**未初始化内存**：同一脚本连编两次字节都不同（实测 `ff245324…` vs `e4e3c42e…`），而 `e4e3c42e…` 恰好等于本实现的输出。因此「字节完全一致」在这 3 个含闭包的语料上不可达；本实现写确定的 0。加载侧已按低 32 位掩码，参考实现产出的字节码能正常执行（51/51 交叉执行一致） |
+| `.cnut` 的 outer 类型字段 | 参考实现用 `sizeof(SQUnsignedInteger)`（8 字节）写一个 4 字节枚举，高 4 字节是**未初始化内存**：同一脚本连编两次字节都不同（实测 `ff245324…` vs `e4e3c42e…`），而 `e4e3c42e…` 恰好等于本实现的输出。因此含闭包的语料会有几个文件字节不同，`tools/cnut_matrix.py` 把这种只差高 4 字节的情况单独标成 `PAD-ONLY`（低 32 位类型仍逐位相同，其余字段全部一致）；本实现写确定的 0。加载侧已按低 32 位掩码，参考实现产出的字节码能正常执行（51/51 交叉执行一致） |
 | 坏字节码里的越界 outer 索引 | 参考实现不检查该索引，夹具 `ref_closures_badouter.cnut` 让 C++ 侧访问违例崩溃（0xC0000005）；本实现报可捕获的 `invalid outer value index`（`crates/squirrel-stdlib/tests/bytecode_interop.rs` 守门） |
 | `format` 规格串恰好 20 字符 | `validate_format` 的 `n-start > MAX_FORMAT_LEN` 差一，随后 `memcpy` 越界写 `fmt[20]`：`format("%" + 20 个 '+' + "d", 1)` 实测 `STATUS_STACK_BUFFER_OVERRUN` 崩溃。本实现从 20 起就报 `format too long`，不复刻 |
 | `escape` 高位字节 | C++ 用 `(char)c` 传给 `%02x`：≥0x80 输出 8 位补码（`\xffffffe9`）。当字符串很短、scratchpad 不够时参考实现会越界写出**不确定内容**（实测 `escape("\xe9")` 输出 `\xffaaaaa\xffffffe9`）。本实现取确定性的补码值，短字符串场景与参考不同 |

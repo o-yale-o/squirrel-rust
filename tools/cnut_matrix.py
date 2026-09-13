@@ -47,6 +47,37 @@ def compile_to(exe, src, out):
     return hashlib.sha256(open(out, "rb").read()).hexdigest()
 
 
+def pad_only(path_a, path_b):
+    """两个 .cnut 是否只差「参考实现写进 outer 类型字段的未初始化高 4 字节」。
+
+    参考实现保存 outer 值时写 `sizeof(SQUnsignedInteger)`（8 字节），字段只有 4 字节，
+    高 4 字节是未初始化内存——所以它自己连编两次都不一样。低 32 位（真实类型）相同
+    就算一致。
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "cnut_fields", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnut_fields.py")
+    )
+    cf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cf)
+    try:
+        a, b = cf.dump(path_a), cf.dump(path_b)
+    except Exception:
+        return False
+    if len(a) != len(b):
+        return False
+    for (ka, ta, va), (kb, tb, vb) in zip(a, b):
+        if ka != kb:
+            return False
+        if (ta, va) == (tb, vb):
+            continue
+        if ka.endswith(".type") and ".outer[" in ka and ta == tb == "usize":
+            if (int(va) & 0xFFFFFFFF) == (int(vb) & 0xFFFFFFFF):
+                continue
+        return False
+    return True
+
+
 def main(argv):
     suppress_crash_dialogs()
     paths = []
@@ -74,6 +105,9 @@ def main(argv):
             continue
         if ha == hb:
             nbyte += 1
+        elif pad_only(a, b):
+            nbyte += 1
+            print("PAD-ONLY %s：只差参考实现写进 outer 类型字段的未初始化高 4 字节" % name)
         else:
             nfail += 1
             print("BYTE-DIFF %s：%s vs %s" % (name, ha[:16], hb[:16]))
