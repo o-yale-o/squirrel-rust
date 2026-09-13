@@ -11,12 +11,14 @@ Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实
 | 验证项 | 结果 |
 |---|---|
 | 官方 samples/ 全部 17 个脚本差分 | **17/17 一致** |
-| 自建边界语料 **54** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM…） | **54/54 一致** |
-| 自动生成的组合矩阵：运算符 × 类型（3181 条）、metamethod（343 条）、格式串（1305 条）、委托方法（2870 条）、类/实例（249 条）、根表顺序 | **逐行一致** |
+| 自建边界语料 **69** 个（浮点/整数溢出/位运算/错误消息与调用栈/GC/委托/metamethod/闭包/生成器/format/math/BOM/弱引用/正则/线程×GC/序列化…） | **69/69 一致** |
+| 自动生成的组合矩阵（合计 **5600+ 条**）：运算符 × 类型（3181）、metamethod（343）、格式串（1305）、委托方法（2870）、类/实例（249）、**数值/运算符边界（4533）**、**正则语义（500）**、**生成器/线程（130）**、**词法/优先级/作用域（203）**、**weakref/GC（63）**、**blob/stream 二进制（133）**、**io/system/date（45）**、**异常机制（81）**、**类属性（40）**、**suspend 穿透（16）**、**多线程×GC（16）**、**序列化往返（25）**、根表顺序 | **逐行/逐字节一致** |
+| 语法/词法非法源码的**编译错误文本**对拍 | **60/60 一致**（`tools/errmsg_matrix.py`） |
 | REPL 交互会话（`=expr`、续行、错误后继续、`quit()`） | **5/5 一致** |
-| `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **51/51 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
-| `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **51/51 通过** |
-| `cargo test`（单元 + 集成 + 健壮性 + 字节码互通） | **72/72 通过** |
+| `.cnut` 字节码：同一脚本双方 `-c` 输出 | samples **17/17**、语料 **69/69 字节级一致**（少数文件只差参考实现自己写入的**未初始化填充**，工具会标成 `PAD-ONLY`，见 STATUS.md 第四节） |
+| `.cnut` 互通：C++ 编译 → Rust 执行（反向亦同） | **69/69 通过** |
+| 宿主 API：用参考实现的静态库编 C 探针做同序对拍（member handle / `getfunctioninfo` / `setfreevariable` / userdata…） | 报告逐项一致（`tmp-c2/hostapi/`） |
+| `cargo test`（单元 + 集成 + 健壮性 + 字节码互通 + 各语义矩阵） | **113/113 通过** |
 
 > 「字节级一致」这条要小心理解：参考实现保存闭包的 outer 值时写 8 字节、字段只有 4 字节，
 > 高 4 字节是未初始化内存，**同一个脚本连编两次输出都不同**。本实现写确定的 0，
@@ -48,8 +50,14 @@ python tools/lint_corpus.py                     # 语料语法陷阱 + 逐个试
 python tools/mem_probe.py x.nut --limit-mb 400  # 带内存/时间上限跑（防失控；逐条排查加 --bisect）
 ```
 
-三张矩阵语料由脚本生成，改语料请改生成器（`tools/gen_opmatrix.py`、
-`tools/gen_metaprobe.py`、`tools/gen_formatmx.py`、`tools/gen_delmatrix.py`）后重新生成。
+python tools/errmsg_matrix.py                   # 语法/词法非法源码的编译错误文本对拍
+python tools/audit_capi.py                      # C 嵌入 API 在本仓库的出现情况（粗筛）
+
+矩阵语料都由脚本生成，改语料请改生成器后重新生成：`tools/gen_opmatrix.py`、
+`gen_metaprobe.py`、`gen_formatmx.py`、`gen_delmatrix.py`、`gen_oopmatrix.py`、
+`gen_nummatrix.py`、`gen_rxmatrix.py`、`gen_genmatrix.py`、`gen_lexmatrix.py`、
+`gen_weakmap.py`、`gen_blobmap.py`、`gen_sysmap.py`、`gen_errmap.py`、
+`gen_attrmap.py`、`gen_suspmap.py`、`gen_gcx.py`、`gen_ser.py`。
 
 参考 C++ 二进制的构建（一次性）：
 
@@ -64,6 +72,8 @@ cmake --build build-ref --config Release --target sq_static
 sq.exe script.nut [args...]       # 执行脚本
 sq.exe -o out.cnut -c script.nut  # 编译为字节码（-o 必须写在脚本路径之前，与原版一致）
 sq.exe -d script.nut              # 生成调试信息
+sq.exe --max-ops 5000000 script.nut   # 指令预算（本实现额外提供；超出报可捕获错误）
+sq.exe --mem-limit 512 script.nut     # 进程内存上限 MB（本实现额外提供；Windows Job Object）
 sq.exe                            # 交互式 REPL（支持 =expr 求值、花括号续行、quit()）
 ```
 
@@ -133,8 +143,20 @@ match vm.run_buffer(b#"print("Hello World!")"#, b"main.nut") {
 - `date` 的 `month`/`wday`/`yday` 沿用 `tm` 约定（0 基），`'u'` 走 gmtime；
 - `print` 按裸字节输出（非 UNICODE 构建），`%s`/`print` 在第一个 NUL 处截断。
 
+## 从 C++ 版迁移过来
+
+有一类地方是**故意与参考实现不一致**的（参考实现在那些输入上会崩溃 / 内存损坏 /
+把宿主吃光，我们给可捕获的错误），逐条带最小复现整理在 [`MIGRATION.md`](MIGRATION.md)；
+另有 15 条"看着像 bug、其实两边一致"的怪癖清单也在那份文档里。
+
 ## 已知限制
 
+- **本实现额外提供的加固**（参考实现没有对应能力，见 STATUS.md 三·补20）：
+  `--max-ops N` 指令预算（尾调用死循环也能封顶）、`--mem-limit N` 进程内存上限
+  （Windows Job Object）、未捕获 `stack overflow` 的调用栈 dump 限深
+  （1000 帧，实测 stderr 12.3MB → 0.07MB）、编译器嵌套上限可调
+  （库默认 200 层／CLI 800 层；实测参考实现 790 层能编、795 层 `0xC00000FD` 崩溃，
+  本实现 790 层同样能编、更深的给可捕获的 `nesting too deep`）；
 - **失控递归**：参考实现的 `EnterFrame` 没有栈上限，非尾递归的无限递归会一直涨到进程被
   系统杀掉（实测一条 3 行脚本把宿主吃到 32GB）。本实现封顶（1M 槽 / 20 万帧）并报
   **可捕获的** `stack overflow`，错误处理器另有固定余量保证「报得出、抓得住」；
