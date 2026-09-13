@@ -608,6 +608,39 @@ x86 的 `idiv` 在商溢出时触发**硬件异常**，参考实现直接
 现已改为把「脚本目录 / 上级 tools / 自身 tools」都加进路径，并且**导入失败会打印警告**
 而不是静默跳过；`tmp-c2/check_suppress.py` 可一键验证当前 error mode 是否含 `0x2`。
 
+## 三·补10、第十轮（P1-2）：weakref / GC 回收语义矩阵
+
+`tools/gen_weakmap.py` → `tests-corpus/t_weakmap.nut`：**63 条**用例
+（两轮探针 `tmp-c2/weakprobe.nut` + `weakprobe2.nut` 的并集，逐字节一致）。
+
+### 这一轮**没有发现差异**
+
+值得说明的是：本实现是 `Rc` + GC 链（链里存 `Weak`），参考实现是手写引用计数 + 环回收，
+两边在"对象到底什么时候死"上居然完全一致 —— 包括下面这些容易想当然的点：
+
+| 形态 | 两侧一致的结果 | 说明 |
+|---|---|---|
+| `{ local o = mk(); w = o.weakref(); }` 之后 `w.ref()` | `table`（还活着） | 栈上的残留槽仍指着它（C++ 的 `_stack` 未清空，本实现同样） |
+| 同上，再 `collectgarbage()` | `null` | GC 之后就不再是根 |
+| 自环 `t.self <- t.weakref()`（**弱**自环） | `null` | 弱引用不保活 |
+| `collectgarbage()` 的**返回值** | 单环 → `1`、双环 → `2`、普通垃圾 → `0` | 返回值就是回收个数，逐一对齐 |
+| 强引用进数组 | 对象活着 | 容器保活、弱引用不保活 |
+| 字符串弱引用 | `w.ref() == v` | 字符串实习 → 同一个对象 |
+| 线程/生成器/类/实例/blob/regexp 弱引用 | 全部可用 | |
+
+### 顺带确认的两条"参考实现自己也怪"的接口事实（两侧一致，照抄）
+
+* `(5).weakref()` **能**建出 weakref（`typeof` 是 `weakref`），但它的 `ref()` 报
+  `the index 'ref' does not exist`（整数弱引用没挂 weakref 委托表）；
+* `(null).weakref()` 直接报 `the index 'weakref' does not exist`；
+* 脚本侧**没有** `getweakrefval` 这个全局（那是 C API `sq_getweakrefval`），
+  只有 `w.ref()`。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/weakref_semantics.rs`（2 个测试：各类型弱引用；
+弱引用不保活 + GC 计数），期望值先经参考实现实测确认。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
