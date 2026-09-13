@@ -192,24 +192,18 @@ fn interactive(vm: &squirrel::api::Vm) {
     }
 }
 
-/// ↔ sqstd_loadfile（暂不支持 .cnut/UCS2/UTF-8-BOM 嗅探：按普通字节流编译）
-fn load_file(vm: &squirrel::api::Vm, path: &str) -> Result<Value, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot open {}", e))?;
-    let mut src = Vec::new();
-    file.read_to_end(&mut src).map_err(|e| format!("cannot read {}", e))?;
-    // ↔ 嗅探：0xFAFA → .cnut 字节码；否则按源码编译
-    if src.len() >= 2 && src[0] == 0xFA && src[1] == 0xFA {
-        let mut v = vm.data_mut();
-        match squirrel::serialization::read_closure(&mut v, &src) {
-            Ok(clo) => {
-                v.push(clo.clone());
-                Ok(clo)
-            }
-            Err(e) => Err(format!("{}", e)),
-        }
-    } else {
-        vm.compile_buffer(&src, path.as_bytes(), true)
-            .map_err(|_| "compile error".to_string())
+/// ↔ sqstd_loadfile（嗅探 .cnut / UTF-8 BOM / UCS2）→ 编译 → 返回栈顶闭包。
+/// Err(Some(msg)) = 可打印的 lasterror（C++ sq_getstring 成功）；
+/// Err(None) = lasterror 不是字符串（C++ 侧什么都打印不出来）。
+fn load_file(vm: &squirrel::api::Vm, path: &str) -> Result<Value, Option<String>> {
+    let mut v = vm.data_mut();
+    let top = v.top;
+    match squirrel_stdlib::sqstd_load_file(&mut v, path, true) {
+        Ok(()) => Ok(v.get_at(top)),
+        Err(()) => match &v.lasterror {
+            Value::String(s) => Err(Some(String::from_utf8_lossy(&s.val).into_owned())),
+            _ => Err(None),
+        },
     }
 }
 
@@ -331,7 +325,10 @@ fn main() {
                 }
             }
             Err(e) => {
-                println!("Error [{}]", e);
+                // ↔ sq_getlasterror + scprintf("Error [%s]\n")，仅字符串可打印
+                if let Some(msg) = e {
+                    println!("Error [{}]", msg);
+                }
                 retval = -2;
             }
         }

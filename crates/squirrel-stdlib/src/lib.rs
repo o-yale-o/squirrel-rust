@@ -362,37 +362,65 @@ fn v_take(vm: &mut VmData) -> Value {
     vm.pop_get()
 }
 
-/// ↔ sqstd_loadfile：读文件 → 嗅探（.cnut/BOM 暂不支持）→ 编译 → 压栈闭包
-fn io_loadfile(v: &mut VmData) -> SQInteger {
-    let path = v.stack_get(2);
-    let filename = String::from_utf8_lossy(path.as_bytes()).into_owned();
-    let data = match std::fs::read(&filename) {
+/// ↔ sqstd_loadfile：嗅探字节码 / UTF-8 BOM / UCS2 → 编译 → 把闭包压栈。
+/// `printerror` 即 C++ 的 raiseerror：为真时调用 compilererrorhandler。
+/// 失败时已设置 lasterror，调用方直接返回 SQ_ERROR。
+pub fn sqstd_load_file(v: &mut VmData, filename: &str, printerror: bool) -> Result<(), ()> {
+    let data = match std::fs::read(filename) {
         Ok(d) => d,
-        Err(e) => return throw_error(v, &format!("cannot open file '{} ({})'", filename, e)),
+        Err(_) => {
+            v.raise_error_str("cannot open the file");
+            return Err(());
+        }
     };
-    let ss = v.ss.clone();
-    // ↔ 嗅探：前 2 字节 0xFAFA → .cnut 字节码
-    if data.len() >= 2 && data[0] == 0xFA && data[1] == 0xFA {
+    // 前两字节按小端 u16 读（↔ sqstd_fread(&us,1,2,file)）
+    let us: u16 = if data.len() >= 2 {
+        u16::from_le_bytes([data[0], data[1]])
+    } else {
+        0 // 空文件
+    };
+    if us == 0xFAFA {
+        // BYTECODE：回到偏移 0 再反序列化
         return match squirrel::serialization::read_closure(v, &data) {
             Ok(clo) => {
                 v.push(clo);
-                1
+                Ok(())
             }
-            Err(e) => throw_error(v, &e),
+            Err(e) => {
+                v.raise_error_str(&e);
+                Err(())
+            }
         };
     }
+    // 词法输入：UCS2 下喂完整码元（与 C++ 的 SQLEXREADFUNC 返回 SQInteger 一致）
+    let units: Vec<SQInteger> = match us {
+        0xFEFF => ucs2_units(&data[2..], false), // UTF-16LE
+        0xFFFE => ucs2_units(&data[2..], true),  // UTF-16BE
+        0xBBEF => {
+            if data.len() < 3 {
+                v.raise_error_str("io error");
+                return Err(());
+            }
+            if data[2] != 0xBF {
+                v.raise_error_str("Unrecognized encoding");
+                return Err(());
+            }
+            data[3..].iter().map(|b| *b as SQInteger).collect() // UTF-8 BOM（非 UNICODE 构建按字节流）
+        }
+        _ => data.iter().map(|b| *b as SQInteger).collect(),
+    };
     let mut pos = 0usize;
-    let src = data.clone();
     let readf = Box::new(move || {
-        if pos < src.len() {
-            let c = src[pos];
+        if pos < units.len() {
+            let c = units[pos];
             pos += 1;
-            c as SQInteger
+            c
         } else {
             0
         }
     });
-    match squirrel::compiler::compile(v, readf, path.as_bytes(), true, ss.debuginfo.get()) {
+    let ss = v.ss.clone();
+    match squirrel::compiler::compile(v, readf, filename.as_bytes(), printerror, ss.debuginfo.get()) {
         Ok(proto) => {
             let fp = match &proto {
                 Value::FuncProto(f) => f.clone(),
@@ -404,26 +432,51 @@ fn io_loadfile(v: &mut VmData) -> SQInteger {
             };
             let clo = squirrel::closure::SQClosure::create(&ss, fp, root_weak);
             v.push(Value::Closure(clo));
-            1
+            Ok(())
         }
+        // 编译错误：lasterror 与 compilererrorhandler 已由 compiler 处理
+        Err(()) => Err(()),
+    }
+}
+
+/// ↔ _io_file_lexfeed_UCS2_LE/BE：每 2 字节一个码元；BE 需交换字节序
+fn ucs2_units(tail: &[u8], swap: bool) -> Vec<SQInteger> {
+    tail.chunks_exact(2)
+        .map(|p| {
+            let mut c = u16::from_le_bytes([p[0], p[1]]);
+            if swap {
+                c = c.swap_bytes();
+            }
+            c as SQInteger
+        })
+        .collect()
+}
+
+/// ↔ _g_io_loadfile：loadfile(path [, printerror])（printerror 默认 false）
+fn io_loadfile(v: &mut VmData) -> SQInteger {
+    let path = v.stack_get(2);
+    let filename = String::from_utf8_lossy(path.as_bytes()).into_owned();
+    let printerror = v.top - v.stackbase >= 3 && v.stack_get(3).as_bool();
+    match sqstd_load_file(v, &filename, printerror) {
+        Ok(()) => 1,
         Err(()) => SQ_ERROR,
     }
 }
 
-/// ↔ sqstd_dofile：loadfile + call + 返回值
+/// ↔ _g_io_dofile + sqstd_dofile：loadfile + 以调用者 this 为环境调用
 fn io_dofile(v: &mut VmData) -> SQInteger {
-    let nparams = v.top - v.stackbase;
-    // ↔ sqstd_dofile(v, filename, retval, printerror)
-    if io_loadfile(v).to_le() == SQ_ERROR.to_le() {
+    let printerror = v.top - v.stackbase >= 3 && v.stack_get(3).as_bool();
+    let env = v.stack_get(1); // ↔ _g_io_dofile 的 sq_push(v,1)：环境 = 调用者 this
+    let path = v.stack_get(2);
+    let filename = String::from_utf8_lossy(path.as_bytes()).into_owned();
+    if sqstd_load_file(v, &filename, printerror).is_err() {
         return SQ_ERROR;
     }
     let clo = v.pop_get();
-    // 调用：[closure, this]
-    v.push(v.roottable.clone());
+    v.push(env);
     let clo2 = clo.clone();
     match v.call_value(&clo2, 1, v.top - 1, true) {
         Ok(r) => {
-            let _ = nparams;
             v.push(r);
             1
         }
