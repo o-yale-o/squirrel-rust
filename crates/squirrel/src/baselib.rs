@@ -2248,6 +2248,16 @@ fn class_setattributes(v: &mut VmData) -> NativeResult {
     let key = v.get_up(-2);
     let val = v.get_up(-1);
     if let Value::Class(c) = &self_ {
+        // ↔ sq_setattributes：key 为 **null** 表示设**类级**属性
+        // （`C.setattributes(null, {...})`，用 `C.getattributes(null)` 读回）；
+        // 返回的是**旧的** attributes，不是 null（P1-7 抓到的差异）。
+        if key.is_null() {
+            let old = c.borrow().attributes.clone();
+            c.borrow_mut().attributes = val;
+            v.pop();
+            v.push(old);
+            return 1;
+        }
         let old = c.borrow().get_attributes(&key);
         match old {
             Some(old) => {

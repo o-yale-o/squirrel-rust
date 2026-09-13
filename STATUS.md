@@ -812,6 +812,47 @@ LOCALS
 `tools/errmsg_matrix.py` 补 2 条（`local f = function named() {}` 在表达式位置
 是语法错 `expected '('`），现 **57/57 一致**。
 
+## 三·补15、第十五轮（P1-7）：类成员属性（`</ … />`）矩阵
+
+`tools/gen_attrmap.py` → `tests-corpus/t_attrmap.nut`：**40 条**，两侧逐字节一致。
+
+### 抓到的真实差异：`setattributes(null, …)` 设**类级**属性
+
+↔ `sq_setattributes` 的 `key == OT_NULL` 分支：
+
+```nut
+local C = class { </ a = 1 /> v = 1; };
+local old = C.setattributes(null, { z = 9 });   // 参考实现：返回**旧的**类级 attributes
+C.getattributes(null)                            // → {z=9}
+```
+
+本实现原来对 null key 报 `wrong index`（`getattributes(null)` 早就支持了，写侧漏了）。
+另外确认：**返回值是旧的 attributes**，不是 `null` —— 成员级与类级都是这个语义。
+
+### 顺带固化的语法事实（`errmsg_matrix.py` 60/60 一致）
+
+| 写法 | 结果 |
+|---|---|
+| `</ a = 1 /> v = 1;` | 正常，属性挂在 `v` 上 |
+| `</ />`（空块） | 正常（`getattributes` 得到 `{}`） |
+| `</ class = 1 />`（关键字当属性名） | **语法错** `expected 'IDENTIFIER'` |
+| `v = 1; </ a = 1 />`（成员之后） | **语法错** |
+| 单行里写第二个属性块 `x = 1; </ b = 2 /> y = 2;` | **语法错** |
+| 多行、每块独占一行 | 正常，多个成员各自的属性都在 |
+
+> 这几条的报错**行号会指到下一行**（编译器把位置记在了消费完属性块之后的 token 上），
+> 排查时别被行号带偏 —— 我是先怀疑空块、再怀疑关键字、最后才定位到"必须独占一行"。
+
+### 其它已对齐的点
+
+属性**不是成员**：`foreach`/`in`/`rawget` 都看不到；继承时派生类能读到基类属性、
+覆盖后读新值；`missing` → `wrong index`；非表值也能设（原样存）；
+`getattributes` 支持成员名 / `null`（类级）/ 非字符串键。
+
+### 固化
+
+`crates/squirrel-stdlib/tests/attributes_semantics.rs`（2 个测试：读、写）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
