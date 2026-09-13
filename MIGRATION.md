@@ -115,6 +115,12 @@ python tools/cnut_matrix.py tests-corpus   # 字节一致 + 双向交叉执行�
 | `abs()` 只吃整数 | `abs(-7.9)`→`7`（先截断再绝对值，返回 **integer**）；浮点版是 `fabs`。`floor`/`ceil` 返回的也是 **float** 而不是 int |
 | 数学函数定义域外**不报错** | `sqrt(-1)`/`log(-1)`/`asin(2)`/`pow(-1,0.5)` → NaN（打印成 MSVC 的 `-nan(ind)`）、`log(0)`→`-inf`、`exp(f32::MAX)`→`inf` |
 | `format` 的数字走 **f32** | `format("%.17g", 2147483647)` 是 `2147483648`（整数被转成 `SQFloat`）——想精确打印整数就别套 `%g` |
+| `assert` 的数字 0 是**假** | 判假用 `SQVM::IsFalse`：`null`/`false`/**`0`**/**`0.0`** 为假，而 `""`/`[]`/`{}`/`function(){}`/`blob(0)` 都是**真**（`assert("")` 通过） |
+| `assert(cond, msg)` 的消息会先 `tostring` | `assert(false, 123)` 的错误文本是 `123`；`sq_tostring` 对容器给的是 `(table : 0x…)`，**不调 `_tostring`** |
+| `error(msg)` **不抛异常** | 只调 errorfunc（打到 stderr）然后返回 `null`，脚本继续往下跑；参数个数严格为 2 |
+| `array(size, fill?)` | `size` 走 `tointeger` 截断（`array(2.9)` 长度 2、`array(0.5)` 空）；多余实参忽略；`array` 没有 `getclass` |
+| 非引用类型的 `weakref()` 返回**自身** | `(5).weakref()` 还是 `5`（`type()` 给 `integer`）；只有 table/array/… 才真给 weakref |
+| `dummy(...)` 不做参数个数检查 | 它是 `nparams=0`，`dummy(1,2,3,…)` 恒返回 `null` |
 
 ## 5. 迁移检查清单
 

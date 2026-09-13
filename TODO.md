@@ -15,10 +15,28 @@
 > | P4 | 文档（README 对齐实测 + 迁移指南 `MIGRATION.md`） | ✅ 本节之后 |
 > | P5 | string 库全局函数语义（**新发现的一整族未覆盖面**） | ✅ 见下 |
 > | P6 | math 库定义域/边界（**验证型：逐位一致，无需修改**） | ✅ 见下 |
+> | P7 | base 库零覆盖全局（`assert`/`error`/`array`/`type`/`dummy`） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
-> 基线：语料 **70/70**、samples **17/17**、编译错误对拍 **60/60**、
-> `.cnut` **70/70**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **124/124**、lint 0。
+> 基线：语料 **71/71**、samples **17/17**、编译错误对拍 **60/60**、
+> `.cnut` **71/71**（字节一致 + 双向交叉执行）、opcode **61/61**、`cargo test` **129/129**、lint 0。
+>
+> **覆盖面扫描工具**：`tools/global_coverage.py` —— 把 62 个已注册全局函数逐个对照语料
+> 调用次数，直接列出"零覆盖/低覆盖"。P7 的 5 个项就是它扫出来的（当时只有这 5 个是 0 次）。
+
+### P7 完成情况（base 库零覆盖全局）
+
+`tools/global_coverage.py` 的结果：62 个全局里只有 5 个在语料中出现 0 次 ——
+`assert` / `error` / `array` / `type` / `dummy`，全是 `sqbaselib.cpp` 里的错误与构造路径。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P7-1 | `tools/gen_baselibmap.py` → `tests-corpus/t_baselibmap.nut`（90 行） | **stdout 与 stderr 都逐字节一致，0 差异** |
+| P7-2 | `assert` 判假：`null`/`false`/**`0`**/**`0.0`** 为假，`""`/`[]`/`{}`/函数/blob 为真 | 实测纠正了我的源码推断（我以为只认 null/false），已记入 `MIGRATION.md` |
+| P7-3 | `assert(cond, msg)` 的消息先 `sq_tostring`；容器给 `(table : 0x…)` 且**不调 `_tostring`** | 同上 |
+| P7-4 | `error(msg)` **不抛异常**：调 errorfunc（stderr）后返回 `null`，脚本继续；`array(size)` 的 `tointeger` 截断与多余实参忽略；`type` 是 `typeof` 别名；`dummy` 的 `nparams=0` 不检查个数 | 同上 |
+| P7-5 | 守门测试 `crates/squirrel-stdlib/tests/baselib_semantics.rs`（5 个） | `cargo test` 124 → 129 |
+| P7-6 | 生成器踩坑：`class` 声明不能当表达式（`type(class C {})` → 两侧同样报 `expected '{'`） | 改成顶层声明 + 按名引用 |
 
 ### P6 完成情况（math 库定义域/边界，验证型）
 
