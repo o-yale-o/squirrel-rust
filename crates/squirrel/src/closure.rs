@@ -83,12 +83,16 @@ impl SQClosure {
 }
 
 /// ↔ SQOuter：闭包捕获的外部变量。
-/// C++ 用 `_valptr`（指向栈槽或自身 `_value`）；Rust 用栈槽绝对索引，
+/// C++ 用 `_valptr`（指向栈槽或自身 `_value`）；Rust 用「宿主 VM + 栈槽索引」，
 /// 栈扩容不再需要 RelocateOuters。
 pub struct SQOuter {
-    /// ↔ _valptr 语义：Some(idx)=打开（指向栈槽），None=已关闭（值在 value 里）
-    pub open_idx: Option<usize>,
-    /// ↔ _idx 备用（Rust 下无需重定位，仅供调试）
+    /// ↔ `_valptr`：Some(cell)=打开，值与宿主 VM 的栈槽共享同一个单元；None=已关闭。
+    ///
+    /// 共享单元（而不是「宿主 VM + 索引」）是为了**跨线程**：闭包可能被另一个线程执行
+    /// （`newthread(f)`），那时若去借宿主 VM 的 `RefCell`，而宿主正在执行自己的代码
+    /// （可变借用中），就会 panic。C++ 用裸指针直接指向栈槽，不存在这个问题。
+    pub open: Option<std::rc::Rc<std::cell::RefCell<Value>>>,
+    /// ↔ _idx：宿主栈槽索引（打开时有效，供内部簿记/调试）
     pub idx: SQInteger,
     /// ↔ _value：帧关闭后的值
     pub value: Value,
@@ -96,10 +100,14 @@ pub struct SQOuter {
 }
 
 impl SQOuter {
-    pub fn create(ss: &crate::state::SharedState, open_idx: usize) -> crate::object::OuterRef {
+    pub fn create(
+        ss: &crate::state::SharedState,
+        cell: std::rc::Rc<std::cell::RefCell<Value>>,
+        open_idx: usize,
+    ) -> crate::object::OuterRef {
         let rc = crate::object::OuterRef::new(std::cell::RefCell::new(SQOuter {
-            open_idx: Some(open_idx),
-            idx: 0,
+            open: Some(cell),
+            idx: open_idx as SQInteger,
             value: Value::Null,
             weakref_slot: std::cell::RefCell::new(None),
         }));
@@ -108,7 +116,16 @@ impl SQOuter {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.open_idx.is_none()
+        self.open.is_none()
+    }
+
+    /// 打开时的宿主栈槽索引（未打开返回 None）
+    pub fn open_idx(&self) -> Option<usize> {
+        if self.open.is_some() {
+            Some(self.idx as usize)
+        } else {
+            None
+        }
     }
 
     /// ↔ SQOuter::Finalize

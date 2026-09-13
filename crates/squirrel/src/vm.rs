@@ -87,6 +87,8 @@ pub struct VmData {
     pub nmetamethodscall: SQInteger,
     /// >0 时给错误处理器/调试钩子额外留栈余量（见 enter_frame）
     pub reserve_stack_headroom: SQInteger,
+    /// 打开的 outer 对应的共享单元：栈槽索引 → 单元（↔ `_valptr` 指向的槽）
+    pub open_cells: Vec<(usize, std::rc::Rc<std::cell::RefCell<Value>>)>,
     pub releasehook: Option<crate::userdata::ReleaseHook>,
     pub suspended: bool,
     pub suspended_root: bool,
@@ -156,6 +158,7 @@ impl VmData {
             nnativecalls: 0,
             nmetamethodscall: 0,
             reserve_stack_headroom: 0,
+            open_cells: Vec::new(),
             releasehook: None,
             suspended: false,
             suspended_root: false,
@@ -270,12 +273,25 @@ impl VmData {
     }
 
     fn stk(&self, a: SQInteger) -> Value {
-        self.stack[(self.stackbase + a) as usize].clone()
+        let i = (self.stackbase + a) as usize;
+        // 被闭包捕获（open outer）的局部变量以共享单元为准：可能被别的线程改过
+        for (slot, cell) in &self.open_cells {
+            if *slot == i {
+                return cell.borrow().clone();
+            }
+        }
+        self.stack[i].clone()
     }
 
     fn stk_set(&mut self, a: SQInteger, v: Value) {
         let i = (self.stackbase + a) as usize;
         self.ensure_stack(i);
+        for (slot, cell) in &self.open_cells {
+            if *slot == i {
+                *cell.borrow_mut() = v.clone();
+                break;
+            }
+        }
         self.stack[i] = v;
     }
 
@@ -809,48 +825,64 @@ impl VmData {
     /// ↔ SQVM::CloseOuters（关闭所有指向 >= stackindex 的 outer）
     pub fn close_outers(&mut self, stackindex: usize) {
         let mut keep = Vec::with_capacity(self.openouters.len());
+        let mut closed_slots = Vec::new();
         for o in std::mem::take(&mut self.openouters) {
-            let idx = o.borrow().open_idx;
+            let idx = o.borrow().open_idx();
             match idx {
                 Some(i) if i >= stackindex => {
-                    let val = self.stack[i].clone();
                     let mut ob = o.borrow_mut();
-                    ob.value = val;
-                    ob.open_idx = None;
+                    // ↔ _value = *_valptr（值以共享单元为准，可能是别的线程最后写入的）
+                    ob.value = match &ob.open {
+                        Some(cell) => cell.borrow().clone(),
+                        None => ob.value.clone(),
+                    };
+                    ob.open = None;
+                    closed_slots.push(i);
                 }
                 _ => keep.push(o),
             }
         }
         self.openouters = keep;
+        if !closed_slots.is_empty() {
+            self.open_cells.retain(|(slot, _)| !closed_slots.contains(slot));
+        }
     }
 
     /// ↔ FindOuter（无序 Vec + 精确匹配；语义等价）
     pub fn find_outer(&mut self, stackindex: usize) -> OuterRef {
         for o in self.openouters.iter() {
-            if o.borrow().open_idx == Some(stackindex) {
+            if o.borrow().open_idx() == Some(stackindex) {
                 return o.clone();
             }
         }
-        let newo = crate::closure::SQOuter::create(&self.ss, stackindex);
+        // 值与栈槽共享单元：宿主的局部变量读写走 stk/stk_set（会更新单元），
+        // 别的线程读 outer 时只碰单元，不碰宿主 VM
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(
+            self.stack.get(stackindex).cloned().unwrap_or(Value::Null),
+        ));
+        let newo = crate::closure::SQOuter::create(&self.ss, cell.clone(), stackindex);
         self.openouters.push(newo.clone());
+        self.open_cells.push((stackindex, cell));
         newo
     }
 
-    fn outer_read(&self, otr: &OuterRef) -> Value {
-        let o = otr.borrow();
-        match o.open_idx {
-            Some(i) => self.stack[i].clone(),
-            None => o.value.clone(),
+    /// ↔ `_valptr` 解引用：打开时读共享单元（可能是别的线程最后写入的值）
+    pub fn outer_read(&self, otr: &OuterRef) -> Value {
+        let (open, closed) = {
+            let o = otr.borrow();
+            (o.open.clone(), o.value.clone())
+        };
+        match open {
+            Some(cell) => cell.borrow().clone(),
+            None => closed,
         }
     }
 
     fn outer_write(&mut self, otr: &OuterRef, v: Value) {
-        let i = otr.borrow().open_idx;
-        match i {
-            Some(i) => {
-                let idx = (self.stackbase + i as SQInteger) as usize;
-                let _ = idx;
-                self.stack[i] = v;
+        let open = { otr.borrow().open.clone() };
+        match open {
+            Some(cell) => {
+                *cell.borrow_mut() = v;
             }
             None => {
                 otr.borrow_mut().value = v;

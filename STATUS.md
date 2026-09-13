@@ -406,6 +406,73 @@ function f(n) { local x = f(n + 1); return x; }    // 漏了 base case
    一小时的"神秘卡死"（ddmin 缩到"删掉任意一条就不卡"这种自相矛盾的结论）。
    现在用独立线程并发读干管道。**教训**：测量工具本身也要先自证。
 
+## 三·补7、第七轮：生成器/线程语义矩阵（跨 VM outer 的真实 panic + 三处栈纪律）
+
+### 语料
+
+`tools/gen_genmatrix.py` → `tests-corpus/t_genmatrix.nut`：**130 条**用例，全自动生成，
+每轮都能重跑。覆盖 10 组：resume 次数 × 状态机、resume 作用于 13 种非生成器值、
+11 种 yield 值形态、8 种 suspend 值形态、线程 4 状态 × 5 操作、参数/返回值边界、
+错误传播、**跨 VM outer**、生成器/线程作为值（表/数组/类成员/嵌套/foreach）、
+线程栈状态（失败/正常结束后再 call、wakeup 的栈纪律）。全部 130 条 stdout 逐字节一致
+（`python tools/line_diff.py tests-corpus/t_genmatrix.nut`）。
+
+### 1. 跨 VM 的 open outer：从"读不到"到 panic，再到正确的共享单元
+
+**现象**：`newthread(function() { … inner.call() … })` 报
+`the index 'call' does not exist`——闭包捕获的局部变量（open outer）在另一个线程里读到了 null。
+
+**根因**：C++ 的 `SQOuter::_valptr` 是**指向创建者 VM 栈槽的裸指针**。本实现当初把
+open outer 存成「宿主 VM + 槽位索引」，跨线程时去 `borrow()` 对方的 `RefCell`，而对方
+正在执行自己的代码（可变借用中）→ 直接 panic
+（`RefCell already mutably borrowed`，`vm.rs:860`）。
+
+**修复**（`closure.rs` + `vm.rs`）：栈槽与 outer **共享一个 `Rc<RefCell<Value>>` 单元**：
+
+| 位置 | 做法 |
+|---|---|
+| `SQOuter::open` | `Option<Rc<RefCell<Value>>>`（不再是「宿主 VM + 索引」） |
+| `VmData::open_cells` | 槽位 → 单元 的表；`find_outer` 建单元并登记 |
+| `stk` / `stk_set` | 本 VM 读写被抓取的局部变量时**同步单元**（表空则零开销直通） |
+| `outer_read` / `outer_write` | 只碰单元，**绝不碰对方的 VM 结构** → 跨线程安全 |
+| `close_outers` | 从单元取值写回 `outer.value`、断开、清表 |
+
+语义与 C++ 等价（线程读到的就是宿主栈槽的当前值，宿主也能看到线程的写入），
+且不再有任何跨 VM 借用。
+
+### 2. `thread_call` 的栈纪律：两处真实缺陷
+
+↔ `sq_call` 的 `if(!v->_suspended) v->Pop(params)` + `thread_call` 的
+`sq_move(v,thread,-1); sq_pop(thread,1)`。原来的实现**成功路径只弹 1 格**、
+**失败路径一格不弹**，于是线程栈每次调用都长高：
+
+| 场景 | 参考实现 | 修复前 | 修复后 |
+|---|---|---|---|
+| `t.call(1,2)` 后再 `t.call()` | `r1` / `r2` | 第二次 `attempt to call 'table'` | 一致 |
+| 抛错的线程再 `call()` | 再次执行闭包、再次抛 `boom3` | `attempt to call 'table'` | 一致 |
+| 挂起中的线程 `wakeup()` | 保留 suspend 现场 | 一致 | 一致（按 `suspended` 分支保留） |
+
+### 3. `wakeup()` 不带值时，`suspend()` 的返回值应为 `null`
+
+↔ `sq_wakeupvm` 的 `else if(target != -1) v->GetAt(…).Null()`。本实现漏了这一支，
+于是 `local v = suspend("x"); … t.wakeup()`（不传值）拿到的是槽里残留的对象——
+实测是 `suspend` 那个 native 闭包（`got:(function : 0x…)`）。参考实现给 `got:null`。
+
+### 4. 方法学：矩阵自己也会有"空洞"
+
+写完矩阵后逐条核对输出，发现**整整一组用例是退化的**：这些用例先对 **fresh** 线程
+`wakeup()` 想到达挂起态，而 fresh 线程的 `wakeup()` 必然报
+`cannot wakeup a idle thread`——两侧报同一个错，于是"全绿"，但根本没测到挂起态。
+改成先用 `call()` 跑到挂起态之后，立刻抓出上面第 2、3 条真实缺陷。
+**教训**：组合矩阵要核对"每一行是否真的走到了预期路径"，而不只是"两侧是否一致"。
+
+### 5. 固化
+
+`crates/squirrel-stdlib/tests/thread_semantics.rs`：5 个 Rust 测试把本轮结论钉死
+（跨 VM outer 读写、失败后重跑、实参/变长/挂起的栈纪律、`wakeup()` 无值传 null、
+线程里创建生成器再回主线程 resume）。期望值全部先用**参考实现**实测确认
+（`python tmp-c2/check_thread_tests.py` 把测试里的脚本抽出来两侧对跑）。
+
 ## 四、残留差异（参考实现自身是 UB / 无法复刻的部分）
 
 | 项 | 说明 |
@@ -421,7 +488,7 @@ function f(n) { local x = f(n + 1); return x; }    // 漏了 base case
 | `escape` 高位字节 | C++ 用 `(char)c` 传给 `%02x`：≥0x80 输出 8 位补码（`\xffffffe9`）。当字符串很短、scratchpad 不够时参考实现会越界写出**不确定内容**（实测 `escape("\xe9")` 输出 `\xffaaaaa\xffffffe9`）。本实现取确定性的补码值，短字符串场景与参考不同 |
 | `date` 上界 | UCRT 的上界常量未逐秒定位：实测 32536800000（3001-01-19）可用、32536857599 失败。本实现取前者为上界 |
 | `getstackinfos(-1)` | 参考实现 `_callsstack[cssize]` 越界读（UB，实测返回一个表）；本实现返回 `null`，不 panic |
-| 挂起线程上再 `call()` | 参考实现的 `suspend` 不关帧，故错误文本是 `attempt to call 'string'`；本实现关帧后取到的是环境表，文本为 `attempt to call 'table'`（都用 `wakeup` 时行为一致） |
+| 挂起线程上再 `call()` | 参考实现的 `suspend` 不关帧，`sq_call` 取 `GetUp(-(nparams+1))` 拿到的正是**挂起值**（实测无论传几个实参都是 `attempt to call 'string'`）；本实现关帧后取到的是环境表，文本为 `attempt to call 'table'`。两者都是可捕获错误，只有类型名不同；`wakeup`/`getstatus`/`getstackinfos` 等合法操作两侧完全一致（`tmp-c2/layout.nut`） |
 | REPL 读到 EOF | 参考实现在 EOF 后死循环（`getchar()` 返回 −1 被当作字符累积）；本实现直接退出 |
 | UCS2 非 ASCII 内容 | 参考实现在非 UNICODE 构建下把码元交给 `isalnum` 等（越界 UB）；本实现按码元喂词法器，ASCII 等价 |
 | 空正则模式 `regexp("")` | 参考实现写 NULL 崩溃（弹模态崩溃框）；本实现报 `letter expected`，不复刻该 UB |

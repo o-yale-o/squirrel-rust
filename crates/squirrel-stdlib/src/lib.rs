@@ -1066,7 +1066,8 @@ pub fn register_bloblib(vm: &mut VmData) {
     }
 
     // ↔ init_streamclass：`stream` 基类先于 blob 的全局函数进 root
-    let (stream_cls, file_cls, blob_cls) = crate::stream::make_stream_classes(vm);
+    // （file/blob 两个子类在各自的 register 里用缓存的类，不再重复构造）
+    let (stream_cls, _file_cls, blob_cls) = crate::stream::make_stream_classes(vm);
     crate::stream::register_class(vm, "stream", &stream_cls);
 
     bfn!("casti2f", "n", |v: &mut VmData| {

@@ -562,16 +562,8 @@ pub fn get_local_at(v: &mut VmData, level: SQInteger, nseq: SQInteger) -> Option
             _ => return None,
         };
         // ↔ *_outer(...)->_valptr：打开的 outer 取栈槽，已关闭的取自身 _value
-        let (open_idx, closed) = {
-            let o = outer.borrow();
-            (o.open_idx, o.value.clone())
-        };
-        let val = match open_idx {
-            // 栈槽索引来自 outer 记录，可能因为栈被重建/关闭而失效：越界一律退化为 null，
-            // 不允许直接索引（否则宿主机直接 panic）
-            Some(i) => v.stack.get(i).cloned().unwrap_or(Value::Null),
-            None => closed,
-        };
+        // ↔ _valptr：open outer 的值可能在别的线程的 VM 栈上（见 VmData::outer_read）
+        let val = v.outer_read(&outer);
         v.push(val);
         return match proto.outervalues.get(nseq as usize).map(|ov| &ov.name) {
             Some(Value::String(s)) => Some(String::from_utf8_lossy(&s.val).into_owned()),
@@ -1968,6 +1960,10 @@ fn thread_call(v: &mut VmData) -> NativeResult {
     let o = v.stack_get(1);
     if let Value::Thread(t) = &o {
         let nparams = v.top - v.stackbase;
+        // ↔ sq_call 失败时也会 Pop(params)、LeaveFrame 会把 _top 还原到进入前的值：
+        // 记下调用前的栈顶，出错时把线程栈还原（否则再次 call 时
+        // GetUp(-(nparams+1)) 会读到我们刚压入的 roottable）
+        let pre_top = t.borrow().top;
         let root = t.borrow().roottable.clone();
         t.borrow_mut().push(root);
         for i in 2..(nparams + 1) {
@@ -1990,10 +1986,37 @@ fn thread_call(v: &mut VmData) -> NativeResult {
             }
         };
         if ok {
-            t.borrow_mut().pop();
+            // ↔ sq_call 成功路径：`if(!v->_suspended) v->Pop(params)`，随后
+            // thread_call 再 `sq_move(v,thread,-1); sq_pop(thread,1)`。
+            // 即：挂起时保留 suspend 现场、只取走栈顶值；正常返回则把本帧压入的
+            // roottable/实参全部弹掉，线程栈回到调用前（再 call 才会读到原闭包）。
+            let suspended = {
+                let tv = t.borrow();
+                tv.suspended
+            };
+            {
+                let mut tv = t.borrow_mut();
+                if suspended {
+                    if tv.top > 0 {
+                        tv.pop();
+                    }
+                } else {
+                    while tv.top > pre_top && tv.top > 0 {
+                        tv.pop();
+                    }
+                }
+            }
             v.push(out);
             1
         } else {
+            // 还原到调用前：只收不放（正常形态下 execute 已把 top 还原到入参时刻，
+            // 这里再弹掉本帧压入的 roottable/实参）
+            {
+                let mut tv = t.borrow_mut();
+                while tv.top > pre_top && tv.top > 0 {
+                    tv.pop();
+                }
+            }
             let e = t.borrow().lasterror.clone();
             v.raise_error_obj(e);
             SQ_ERROR
@@ -2153,6 +2176,16 @@ fn wakeup_vm(
             vm.stack[slot] = val;
         }
         vm.pop();
+    } else if target != -1 {
+        // ↔ `else if(target != -1) v->GetAt(v->_stackbase+v->_suspended_target).Null();`
+        // 没有 wakeup 值时，suspend() 的**返回值槽**要写 null，而不是保留槽里原有的值
+        // （否则 `local v = suspend(); v` 在线程被 `wakeup()` 唤醒后拿到的是别的对象）
+        let slot = vm.stackbase + target;
+        if slot >= 0 && slot < crate::config::MAX_STACK_SLOTS {
+            let slot = slot as usize;
+            vm.ensure_stack(slot);
+            vm.stack[slot] = Value::Null;
+        }
     }
     let et = if throwerror {
         crate::vm::ExecutionType::ResumeThrowVm
