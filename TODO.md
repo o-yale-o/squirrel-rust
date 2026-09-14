@@ -29,6 +29,7 @@
 > | P18 | 容器回调乱来（比较器返回值 / 回调形参个数 / 回调抛异常） | ✅ 见下 |
 > | P19 | 索引值边界 + 容器分配上限（健壮性缺口） | ✅ 见下 |
 > | P20 | 委托链动力学 + foreach 期间容器变更（验证型） | ✅ 见下 |
+> | P21 | 生成器/线程 × 挂起-恢复 × 异常交错（验证型 + 1 个参考 UB 归档） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -169,6 +170,20 @@ INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本
 | P20-3 | foreach 期间的容器变更 | 表：删当前键计数照旧、删别的键**跳过其后**、`clear()` 即停；数组：`append` **延长**迭代、`remove`/缩容**提前结束**、变长按旧长度走。参考实现全程不崩（逐条隔离验证），结果逐字节一致 |
 | P20-4 | 新语料 + 守门测试 | `tools/gen_delegiter.py` → `tests-corpus/t_delegiter.nut`（**59 条**）；`deleg_iter_semantics.rs`（3 个测试：赋值时环检测 / 链上查找与可见性 / 迭代期变更） |
 | P20-5 | 工具坑（再记） | ① `base` 是关键字不能当变量名；② class 不能写成表达式当实参；③ PowerShell 往返改 .nut 会把中文注释搞成乱码（Get-Content 默认编码）——修 .nut 一律用 write 工具 |
+
+#### P21 完成情况（生成器/线程 × 挂起-恢复 × 异常交错）
+
+`t_suspmap`（16 条）/`t_threadmap`（162 条）测的是状态机主干；"**异常与挂起交错**"
+（yield 在 try 里、恢复点在 try 里、死态复活、wakeupthrow 注入、错误后重启…）
+没有用例。**验证型轮**：探针 34 + 7 条两侧逐字节一致，无引擎差异。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P21-1 | 生成器死态与异常交错（验证型） | 死后 `resume` 一律 `resuming dead generator`（跑完/抛错两种死法）；体内抛错传到**恢复点**的 catch；`yield` 在 try 里 + 体内 throw → 走生成器**自己的** catch（还能连续 yield）；**`yield` 是语句不是表达式**（`local a = yield x` 编译错）；含 yield 的普通函数自动成为生成器 |
+| P21-2 | 线程状态与注入（验证型） | 状态串 `idle/suspended/…`——**没有 "dead"**，跑完回 idle 且**可再 `call()` 重跑**；`wakeup`/`wakeupthrow` 打在 idle 报 `cannot wakeup a idle thread`；**`wakeupthrow` 注入的错误被挂起点外层的 try 接住**；`wakeup` 无参 → suspend 表达式得 `null`、多参忽略；挂起线程 `getstackinfos` → null；**主线程 `suspend()` 两侧同样静默退出**（try 接不住，一致） |
+| P21-3 | **`newthread(<原生闭包>)`**（参考 UB，归档） | 参考实现**创建时即崩溃**（实测 WER 弹窗 ×3、无输出；逐条隔离见 `tmp-c2/gt_isolate.py`）。本实现正常创建、调用报 `wrong number of parameters` —— 安全超集，已记 MIGRATION 偏离表并有守门测试钉住 |
+| P21-4 | 新语料 + 守门测试 | `tools/gen_gtmatrix.py` → `tests-corpus/t_gtmap.nut`（**37 条**，不含两个会中止/挂死参考实现的形态）；`gt_semantics.rs`（3 个测试：生成器生命周期与交错 / 线程 wakeup 与注入 / newthread 原生闭包的安全偏离） |
+
 
 
 **新增守门（本轮）**：`tools/check_generators.py`（已接进 check_all 成第 9 步）—— 跑一遍全部
