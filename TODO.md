@@ -28,6 +28,7 @@
 > | P17 | 数值字面量（词法器路径，与 `tointeger` **不是**同一条路） | ✅ 见下 |
 > | P18 | 容器回调乱来（比较器返回值 / 回调形参个数 / 回调抛异常） | ✅ 见下 |
 > | P19 | 索引值边界 + 容器分配上限（健壮性缺口） | ✅ 见下 |
+> | P20 | 委托链动力学 + foreach 期间容器变更（验证型） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -153,6 +154,22 @@ INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本
 | P19-3 | 索引值语义（验证型） | `slice` 负数/夹取/start>end→空、`find` 偏移夹取、`insert` 允许 `idx==len`、`remove` 不允许、`resize` 负值错误、浮点截断 —— 两侧本来一致；blob 的 seek 越界/写入增长（`seek(4)`+写→len 5）也一致 |
 | P19-4 | 新语料 + 守门测试 | `tools/gen_idxmatrix.py` → `tests-corpus/t_idxmap.nut`（**128 条**：slice 双参 18 组 ×2 + 单参极值 ×2 + find 偏移 13 + insert/remove ×2 + resize 安全值 ×2 + 下标极值 + blob seek/增长/readblob）。`robustness.rs` 加 `container_allocations_are_bounded_and_catchable`（9 条超限必须 `container too big`、3 条负值保持原语义、3 条合法尺寸照常，且测试必须**秒回**——守卫在分配前拒绝） |
 | P19-5 | 探针纪律的再确认 | 参考实现跑危险值会**整机挂死**（WER 弹窗阻塞）——必须逐条隔离 + 每条带超时（`Start-Process` + `WaitForExit`），绝不能整文件跑。这轮已经被弹窗坑过一次 |
+
+#### P20 完成情况（委托链动力学 + foreach 期间容器变更）
+
+两族都是现有生成器结构性地碰不到的：`t_delmatrix` 测"方法 × 实参类型"、
+`t_meta3` 测"单个元方法"，链与迭代的**动力学**（深度/循环/跨类型/raw*；
+增/删/缩/清期间迭代）没有用例。**验证型轮**：探针 40 + 20 条两侧逐字节
+一致（含 12 种循环委托形态、foreach-mutation 逐条隔离跑通）。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P20-1 | **循环委托在赋值时被拒** | `setdelegate` 的环检测发生在**赋值当下**（`b.setdelegate(a)` 在 `a` 已挂 `b` 时抛 `delegate cycle`），不是查找时才发现；自挂/三角环同理。语料夹具曾试图在顶层造环，脚本直接死——顺带把这条语义钉死了 |
+| P20-2 | raw*/`<-`/`delete` 与链的关系 | `rawget/rawin/rawset` 不穿链；`<-` 挂**接收者自身**；**`delete` 也不穿链**（穿链要靠 `_delslot`）——最后这条初版期望就写反了，靠差分语料纠正 |
+| P20-3 | foreach 期间的容器变更 | 表：删当前键计数照旧、删别的键**跳过其后**、`clear()` 即停；数组：`append` **延长**迭代、`remove`/缩容**提前结束**、变长按旧长度走。参考实现全程不崩（逐条隔离验证），结果逐字节一致 |
+| P20-4 | 新语料 + 守门测试 | `tools/gen_delegiter.py` → `tests-corpus/t_delegiter.nut`（**59 条**）；`deleg_iter_semantics.rs`（3 个测试：赋值时环检测 / 链上查找与可见性 / 迭代期变更） |
+| P20-5 | 工具坑（再记） | ① `base` 是关键字不能当变量名；② class 不能写成表达式当实参；③ PowerShell 往返改 .nut 会把中文注释搞成乱码（Get-Content 默认编码）——修 .nut 一律用 write 工具 |
+
 
 **新增守门（本轮）**：`tools/check_generators.py`（已接进 check_all 成第 9 步）—— 跑一遍全部
 `tools/gen_*.py`，比对内容哈希，抓"生成物被手改 / 生成器忘记重新生成"。第一次跑就抓到
