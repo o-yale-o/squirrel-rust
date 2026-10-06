@@ -378,3 +378,80 @@ fn backend_released_when_instance_dies() {
     assert_eq!(out, "churn=32000\nafter=8\n");
     let _ = std::fs::remove_file(&dir);
 }
+
+/// P31：`dofile`/`loadfile` 的**边界形态**（语料 `t_dofilemap.nut`，23 条，验证型
+/// ——两侧逐字节一致）。守门核心：
+///
+/// 1. 打不开（不存在/空串/**目录**）一律 `cannot open the file`，**loadfile 也是
+///    抛错而非返回 null**；
+/// 2. 第 2 参（printerror）只控制 stderr 打印，**不影响抛错**；
+/// 3. dofile 返回文件的 return 值、文件里 `<-` 的槽进根表、文件中途抛错
+///    **穿透**到调用方、loadfile 的闭包可重复调用。
+#[test]
+fn dofile_loadfile_boundaries() {
+    let dir = std::env::temp_dir();
+    let ok_path = dir.join("sqrust_dm_ok.nut");
+    std::fs::write(&ok_path, "return 41 + 1;").unwrap();
+    let throw_path = dir.join("sqrust_dm_throw.nut");
+    std::fs::write(&throw_path, "print(\"before\\n\"); throw \"mid\"; print(\"after\\n\");").unwrap();
+    let syntax_path = dir.join("sqrust_dm_syn.nut");
+    std::fs::write(&syntax_path, "local x = ;").unwrap();
+    let empty_path = dir.join("sqrust_dm_empty.nut");
+    std::fs::write(&empty_path, "").unwrap();
+    let pok = ok_path.to_string_lossy().replace('\\', "/");
+    let pthrow = throw_path.to_string_lossy().replace('\\', "/");
+    let psyn = syntax_path.to_string_lossy().replace('\\', "/");
+    let pempty = empty_path.to_string_lossy().replace('\\', "/");
+    let src = format!(
+        r#"
+function t(tag, f) {{
+    try {{ local v = f(); print(tag + "=" + (typeof v == "string" ? v : "" + v) + "|" + typeof v + "\n"); }}
+    catch (e) {{ print(tag + "!" + e + "\n"); }}
+}}
+t("df_missing", function() {{ return dofile("no_such_file_xy.nut"); }});
+t("df_empty_path", function() {{ return dofile(""); }});
+t("lf_missing", function() {{ local f = loadfile("no_such_file_xy.nut"); return f == null ? "null" : "closure"; }});
+t("lf_empty_path", function() {{ local f = loadfile(""); return f == null ? "null" : "closure"; }});
+t("df_dir", function() {{ return dofile("{dir}"); }});
+t("df_ok", function() {{ local r = dofile("{pok}"); return "ret=" + r; }});
+t("lf_twice", function() {{ local f = loadfile("{pok}"); local a = f(); local b = f(); return "a=" + a + " b=" + b; }});
+t("df_throw", function() {{ local r = dofile("{pthrow}"); return "ret=" + r; }});
+t("df_throw_caught", function() {{ try {{ dofile("{pthrow}"); }} catch (e) {{ return "E:" + e; }} return "no"; }});
+t("df_syntax", function() {{ local r = dofile("{psyn}"); return "ret=" + r; }});
+t("df_emptyfile", function() {{ local r = dofile("{pempty}"); return "ret=" + r; }});
+t("df_raise_false", function() {{ local r = dofile("no_such_xy2.nut", false); return "ret=" + r; }});
+t("df_raise_true", function() {{ local r = dofile("no_such_xy3.nut", true); return "ret=" + r; }});
+"#,
+        dir = dir.to_string_lossy().replace('\\', "/"),
+    );
+    let (out, _err) = run_capture(&src);
+    let _ = std::fs::remove_file(&ok_path);
+    let _ = std::fs::remove_file(&throw_path);
+    let _ = std::fs::remove_file(&syntax_path);
+    let _ = std::fs::remove_file(&empty_path);
+    assert_eq!(line(&out, "df_missing"), "df_missing!cannot open the file");
+    assert_eq!(line(&out, "df_empty_path"), "df_empty_path!cannot open the file");
+    assert_eq!(
+        line(&out, "lf_missing"),
+        "lf_missing!cannot open the file",
+        "loadfile 打不开是**抛错**，不是返回 null"
+    );
+    assert_eq!(line(&out, "lf_empty_path"), "lf_empty_path!cannot open the file");
+    assert_eq!(line(&out, "df_dir"), "df_dir!cannot open the file", "目录作为路径不特殊报错");
+    assert_eq!(line(&out, "df_ok"), "df_ok=ret=42|string");
+    assert_eq!(line(&out, "lf_twice"), "lf_twice=a=42 b=42|string", "loadfile 闭包可重复调用");
+    assert_eq!(line(&out, "df_throw"), "df_throw!mid", "文件中途抛错穿透到调用方");
+    assert_eq!(line(&out, "df_throw_caught"), "df_throw_caught=E:mid|string");
+    assert_eq!(line(&out, "df_syntax"), "df_syntax!expression expected", "编译错误穿透");
+    assert_eq!(line(&out, "df_emptyfile"), "df_emptyfile=ret=null|string");
+    // 第 2 参（printerror）只控制 stderr 打印，不影响抛错
+    assert_eq!(line(&out, "df_raise_false"), "df_raise_false!cannot open the file");
+    assert_eq!(line(&out, "df_raise_true"), "df_raise_true!cannot open the file");
+}
+
+/// 便捷：从行首找 `tag=` / `tag!` 行
+fn line<'a>(out: &'a str, tag: &str) -> &'a str {
+    out.lines()
+        .find(|l| l.starts_with(&format!("{tag}=")) || l.starts_with(&format!("{tag}!")))
+        .unwrap_or_else(|| panic!("没有 {tag} 行：\n{out}"))
+}
