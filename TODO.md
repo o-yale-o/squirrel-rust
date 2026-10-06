@@ -33,6 +33,8 @@
 > | P22 | 类属性：时序/共享/继承边界（验证型） | ✅ 见下 |
 > | P23 | 编译期折叠 / switch 值形态 / 链式赋值（真 bug：DMOVE 顺序） | ✅ 见下 |
 > | P23 | 编译期折叠 / switch 值形态 / 链式赋值（**1 个真 bug：DMOVE 顺序**） | ✅ 见下 |
+> | P24 | 错误转储 × 复杂帧（线程/生成器/原生回调边界，验证型） | ✅ 见下 |
+> | P24 | 错误转储 × 复杂帧（线程/生成器/原生回调边界，验证型） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -214,6 +216,21 @@ INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本
 | P23-3 | 编译期折叠边界（验证型） | `7 % 0` → **7**（% 被编译期折叠，早前已记录）；整数 `/` **不**折叠（运行时 `division by zero`）；浮点折叠 `1.0/0.0`→inf、`1.0%0.0`→nan；INT64 字面量折叠**回绕**；`1<<64`→1、`1<<-1`→INT64_MIN |
 | P23-4 | `&&`/`||` 返回操作数值本身（验证型） | `true && 2`→2、`"" && 5`→5（`""` 真值）、`false && side()` **不调用** side；`1 && 2 \|\| 3 && 4` → 2 且右半整体被短路。守门测试用 `side()` 打点 + 出现次数断言精确验证"谁被调用了几次" |
 | P23-5 | 新语料 + 守门测试 | `tools/gen_evalmatrix.py` → `tests-corpus/t_evalmap.nut`（**50 条**）；`eval_semantics.rs`（3 个测试：链式赋值 / 逻辑操作符与短路 / switch 与折叠）。调试用转储测试 `dump_chain.rs` 用完即删 |
+
+#### P24 完成情况（错误转储 × 复杂帧）
+
+`t_errdump1-3` 各自只有**一个**顶层 throw 的转储（第一个抛错就中止脚本，一个文件
+只能钉一条）。本轮钉的是**错误跨越边界时**的转储行为。**验证型**：16 + 6 条探针
+（逐条隔离，stdout + stderr + 退出码三方对拍）两侧逐字节一致，无引擎差异。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P24-1 | **转储只在跨界时打印**（验证型） | 错误跨越**线程边界**（含 wakeupthrow 注入、生成器在线程内抛错）与**原生调用边界**（sort/map 比较器回调）时：即使外层 try/catch 接住，stderr 照样打印 `AN ERROR HAS OCCURRED + CALLSTACK + LOCALS`（含脚本相对路径），脚本**继续跑完**；纯脚本帧之间被 catch → **stderr 干净** |
+| P24-2 | `_get` 元方法的名字解析递归（验证型） | 委托链的 `_get` 调用外部 local 函数 `boom4(k)`，而 `boom4` 的解析又落回委托链 → 无限递归 → `Native stack overflow`，**两侧一致**（连被 catch 后继续跑都一致），照实入语料 |
+| P24-3 | 其余 14 种帧形态（验证型） | 生成器抛错（纯脚本帧，无转储）、rethrow、嵌套 try、多 local、构造器抛错、`_nexti` 抛错、varargs、default 参数表达式抛错、具名 `compilestring` 源（转储中的源名一致）、深层调用链——全部一致 |
+| P24-4 | 新语料 + 守门测试 | `tools/gen_errdumpframes.py` → `tests-corpus/t_errdumpframes.nut`（**13 条**：5 条跨界转储 + 8 条脚本帧无转储，脚本不中止、有 DONE 标记）；`exception_semantics.rs` 追加 `stderr_dump_applies_at_thread_and_native_boundaries` |
+| P24-5 | 工具提示 | `tools/safe_run.py` 里已有 `suppress_crash_dialogs()`（corpus_health 在用）——以后给参考实现喂危险值的探针应该复用它，而不是手动点弹窗 |
+
 
 
 

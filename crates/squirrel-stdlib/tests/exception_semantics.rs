@@ -150,3 +150,48 @@ fn getstackinfos_negative_level_is_null() {
     let (out, _err) = run_capture(src);
     assert_eq!(out, "null/null\ntable\n");
 }
+
+/// P24：错误**跨越线程/原生调用边界**时的 stderr 转储（语料
+/// `t_errdumpframes.nut`，13 条，验证型——两侧逐字节一致）。
+///
+/// 钉住的语义：错误跨越**线程边界**（含 `wakeupthrow` 注入、生成器在线程内
+/// 抛错）与**原生调用边界**（sort/map 比较器回调）时，即使外层脚本
+/// try/catch 接住，stderr 照样有 `AN ERROR HAS OCCURRED [msg]` + CALLSTACK
+/// 转储，且脚本**继续跑完**；纯脚本帧之间被 catch 的抛错**不产生任何转储**。
+/// `_get` 元方法里解析落回委托链的名字会递归到 `Native stack overflow`——
+/// 两侧一致，照实钉住。
+#[test]
+fn stderr_dump_applies_at_thread_and_native_boundaries() {
+    let src = r#"
+        function s(tag, f) {
+            try { f(); print(tag + "=no-dump\n"); }
+            catch (e) { print(tag + "=caught:" + e + "\n"); }
+        }
+        function boom4(k) { throw "mm:" + k; }
+        s("thread_throw", function() { local th = newthread(function() { local lv = "L"; throw "tb"; }); th.call(); th.wakeup(); });
+        s("thread_wakeupthrow", function() { local th = newthread(function() { suspend("s"); }); th.call(); th.wakeupthrow("inj"); });
+        s("gen_in_thread", function() { local th = newthread(function() { local g = (function() { local gg = 9; throw "git"; })(); resume g; }); th.call(); th.wakeup(); });
+        s("native_frame_sort", function() { local a = [1, 2]; a.sort(function(x, y) { local sc = 1; throw "sortcb"; }); });
+        s("plain_catch", function() { local lo = 1; throw "plain"; });
+        s("mm_chain_overflow", function() { local d = { _get = function(k) { return boom4(k); } }; local o = {}; o.setdelegate(d); return o.zz; });
+        print("ERRDUMP-DONE\n");
+    "#;
+    let (out, err) = run_capture(src);
+    // stdout：全部被 catch，脚本跑完
+    assert!(out.ends_with("ERRDUMP-DONE\n"), "{out}");
+    assert!(out.contains("thread_throw=caught:tb"));
+    assert!(out.contains("thread_wakeupthrow=caught:inj"));
+    assert!(out.contains("gen_in_thread=caught:git"));
+    assert!(out.contains("native_frame_sort=caught:sortcb"));
+    assert!(out.contains("plain_catch=caught:plain"));
+    assert!(out.contains("mm_chain_overflow=caught:Native stack overflow"));
+    // stderr：线程/生成器边界各触发一次转储（含消息与调用栈）
+    assert!(err.contains("AN ERROR HAS OCCURRED [tb]"), "{err}");
+    assert!(err.contains("AN ERROR HAS OCCURRED [inj]"), "{err}");
+    assert!(err.contains("AN ERROR HAS OCCURRED [git]"), "{err}");
+    assert!(err.contains("CALLSTACK"), "{err}");
+    // 纯脚本帧 + sort 比较器被 catch 的：**不**进 stderr
+    assert!(!err.contains("[plain]"), "脚本帧被 catch 不应有转储\n{err}");
+    assert!(!err.contains("[sortcb]"), "{err}");
+    assert!(!err.contains("[mm:"), "{err}");
+}
