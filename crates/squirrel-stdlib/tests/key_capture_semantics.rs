@@ -141,3 +141,58 @@ t("cap_delegate", function() { local fs = []; local tbl = { n = 0 }; for (local 
     assert_eq!(line(&out, "cap_two_shared"), "cap_two_shared=2,102,102,202,|string", "共享 i 的修改互相可见");
     assert_eq!(line(&out, "cap_delegate"), "cap_delegate=1,1,|string", "成员不快照，读的是最终值");
 }
+
+/// **表迭代顺序** = 哈希表布局：混合键型下的顺序、以及"插入/覆盖/删除"随机序列
+/// 后的顺序，都必须与参考逐字节一致（`t_iterorder.nut` 的 12 条序列是
+/// 生成式差分 80 个随机程序零差异后固定下来的代表）。
+/// 这里在 Rust 侧再钉两个**确定性**形态：扩容后顺序、删除后顺序。
+#[test]
+fn table_iteration_order_matches_reference_layout() {
+    let out = run_lines(
+        r#"
+t("grow_order", function() {
+    local t = {};
+    for (local i = 0; i < 40; i++) t[i * 7] <- i;
+    local o = "";
+    foreach (k, v in t) o += k + ",";
+    return o;
+});
+t("del_order", function() {
+    local t = {};
+    for (local i = 0; i < 20; i++) t["k" + i] <- i;
+    for (local i = 0; i < 20; i += 2) delete t["k" + i];
+    local o = "";
+    foreach (k, v in t) o += k + ",";
+    return o;
+});
+t("str_order", function() {
+    local t = {};
+    local names = ["alpha", "beta", "gamma", "delta", "eps"];
+    foreach (n in names) t[n] <- n;
+    local o = "";
+    foreach (k, v in t) o += k + ",";
+    return o;
+});
+t("mixed_order", function() {
+    local t = {};
+    t[1] <- "i1"; t["1"] <- "s1"; t[1.5] <- "f"; t[true] <- "b"; t[-3] <- "i-3";
+    local o = "";
+    foreach (k, v in t) o += typeof k + ",";
+    return o;
+});
+"#,
+    );
+    // 这些顺序由哈希函数/探测/扩容决定，任何一侧改动都会立即暴露
+    assert_eq!(
+        line(&out, "grow_order"),
+        "grow_order=0,259,196,133,70,7,266,203,140,77,14,273,210,147,84,21,217,154,91,28,224,161,98,35,231,168,105,42,238,175,112,49,245,182,119,56,252,189,126,63,|string",
+        "40 个 i*7 键扩容后的哈希序（两侧逐字节一致）"
+    );
+    assert_eq!(
+        line(&out, "del_order"),
+        "del_order=k19,k15,k17,k9,k1,k3,k13,k11,k7,k5,|string",
+        "删除偶数键后的哈希序（空洞处理一致）"
+    );
+    assert_eq!(line(&out, "str_order"), "str_order=beta,eps,gamma,delta,alpha,|string", "字符串键的哈希序");
+    assert_eq!(line(&out, "mixed_order"), "mixed_order=string,integer,integer,float,bool,|string", "混合键型的哈希序");
+}
