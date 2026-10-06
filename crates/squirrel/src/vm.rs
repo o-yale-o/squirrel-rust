@@ -2554,9 +2554,13 @@ fn run_instructions(
                 vm.stk_set(arg0, Value::Bool(arg1 != 0));
             }
             Op::DMove => {
+                // ↔ `STK(arg0)=STK(arg1); STK(arg2)=STK(arg3);`：**严格顺序**执行。
+                // 不能先把两个源快照再写——链式赋值 `x = y = z` 的 DMOVE 是
+                // `y←z; x←y`，arg3 与 arg1 是同一个寄存器，第二读必须看到第一写
+                // （否则 x 拿到旧 y）。实测参考实现给 x=3，快照式给 x=0。
                 let a = vm.stk(arg1);
-                let b = vm.stk(arg3);
                 vm.stk_set(arg0, a);
+                let b = vm.stk(arg3);
                 vm.stk_set(arg2, b);
             }
             Op::Jmp => {

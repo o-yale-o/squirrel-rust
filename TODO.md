@@ -31,6 +31,8 @@
 > | P20 | 委托链动力学 + foreach 期间容器变更（验证型） | ✅ 见下 |
 > | P21 | 生成器/线程 × 挂起-恢复 × 异常交错（验证型 + 1 个参考 UB 归档） | ✅ 见下 |
 > | P22 | 类属性：时序/共享/继承边界（验证型） | ✅ 见下 |
+> | P23 | 编译期折叠 / switch 值形态 / 链式赋值（真 bug：DMOVE 顺序） | ✅ 见下 |
+> | P23 | 编译期折叠 / switch 值形态 / 链式赋值（**1 个真 bug：DMOVE 顺序**） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -199,6 +201,20 @@ INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本
 | P22-3 | 边界形态（验证型） | `newmember` 4 参 `(name, val, attrs, isstatic)`；`clone` 一个 **class** 报 `cloning a class`；实例没有 `setattributes/getattributes`；`delete C.v` 报 `attempt to delete a slot from a class`；`rawset` 新成员属性 null；`_tostring` 挂属性后 `getattributes("_tostring")` 报 `wrong index`（参考如此）；两个方法的参数个数都是死规矩 |
 | P22-4 | 新语料 + 守门测试 | `tools/gen_attrtiming.py` → `tests-corpus/t_attrtiming.nut`（**28 条**，独立自洽）；`attributes_semantics.rs` 追加 `attribute_timing_sharing_and_inheritance`（24 条断言整段对拍） |
 | P22-5 | 顺带发现的既有隐患 | `tools/gen_attrmap.py` 的用例源是 **gitignored 的 `tmp-c2/attrprobe.nut`**——本地丢了生成器就废。本轮没动它（避免节外生枝），已在此记录 |
+
+#### P23 完成情况（编译期折叠 / switch 值形态 / 链式赋值）
+
+`t_ops`（4533 条）测的是**运行时**运算符 × 类型；编译期折叠边界、switch 值形态、
+短路求值顺序、赋值作表达式都没有用例。探针 55 条抓到 **1 个真 bug**。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P23-1 | **DMOVE 执行顺序**（**真 bug**，已修） | 窥孔把连续两条 MOVE 合并成一条 `DMOVE(d0←s0, d1←s1)`；参考实现**严格顺序**执行（`STK(arg0)=STK(arg1); STK(arg2)=STK(arg3);`）。链式赋值 `x = y = z` 恰好是 `DMOVE(y←z, x←y)`——arg3 与 arg1 **同一寄存器**，第二读必须看到第一写。我们把两个源先快照再写（并行语义），链式赋值的外层拿到**旧值**：`local x=0;local y=0;local z=3; x=y=z;` 参考给 x=3、我们给 **x=0**。RHS 是字面量时碰巧没事（常量直接 Load），所以一直没暴露。定位路径：差分 → 逐条二分（`constant too long` 是 **`'..'` 字符字面量**的报错，绕开）→ `tests/dump_chain.rs` 转储字节码发现 DMOVE 参数正确、执行错误 → vm.rs |
+| P23-2 | switch 值形态（验证型） | case 标签可以是**任意表达式**（含变量）；重复 case **先到先得**；浮点/整数 case 交叉匹配；**case 在 default 之后是语法错**（`expected '}'`，default 在前合法）；switch 里的 `break` 归 switch；case 体可声明 local；`case null`/`case true` 都行 |
+| P23-3 | 编译期折叠边界（验证型） | `7 % 0` → **7**（% 被编译期折叠，早前已记录）；整数 `/` **不**折叠（运行时 `division by zero`）；浮点折叠 `1.0/0.0`→inf、`1.0%0.0`→nan；INT64 字面量折叠**回绕**；`1<<64`→1、`1<<-1`→INT64_MIN |
+| P23-4 | `&&`/`||` 返回操作数值本身（验证型） | `true && 2`→2、`"" && 5`→5（`""` 真值）、`false && side()` **不调用** side；`1 && 2 \|\| 3 && 4` → 2 且右半整体被短路。守门测试用 `side()` 打点 + 出现次数断言精确验证"谁被调用了几次" |
+| P23-5 | 新语料 + 守门测试 | `tools/gen_evalmatrix.py` → `tests-corpus/t_evalmap.nut`（**50 条**）；`eval_semantics.rs`（3 个测试：链式赋值 / 逻辑操作符与短路 / switch 与折叠）。调试用转储测试 `dump_chain.rs` 用完即删 |
+
 
 
 
