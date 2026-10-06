@@ -36,6 +36,7 @@
 > | P25 | 表键身份 + 循环变量闭包捕获（验证型） | ✅ 见下 |
 > | P26 | clone 深度/共享 + getstackinfos locals 内容（验证型） | ✅ 见下 |
 > | P27 | 高位字节 × 字符串库（**参考 UB 沼泽**，不做语料、只划边界） | ✅ 见下 |
+> | P28 | bindenv × 编译闭包（**未修的引擎分歧**，已精确记录） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -244,6 +245,21 @@ INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本
 | P27-2 | **`escape` 越界读污染后续输出**（早前已归档的偏离，本轮补实证） | 同一个字符串 `"\xff"`：字面量直写、经变量、放在不同长度的输出里，参考的 escape 输出形态**各不相同**（`\xff`/`\xffff`/`\xffffffff`…）——越界读把**之前 stdout 的碎片**漏进来了。本实现的确定性 32 位补码形态即早前归档的偏离 |
 | P27-3 | 安全子集（验证型，与参考一致） | **比较是逐字节 memcmp**（`"\xff" <=> "\xffx"` = −1、前缀短者小、`"\xc1" <=> "\xdc"` 按字节）；高位字节字符串**可以当表键**（按内容哈希，`("\xff" in x)` 为 true）；`len` 正常计数 |
 | P27-4 | 方法论 | 一旦某族的输出要经过"参考实现 UB 的函数"，**后续所有输出都不可信**（越界读会串行）——这类族只能划边界 + 文档，不能造语料。判别方法：同一输入分别以"字面量/变量/不同长度"三种形态跑，输出形态不同即 UB 实锤 |
+
+#### P28 完成情况（bindenv × 编译闭包：未修的引擎分歧，已精确记录）
+
+探针目标：compilestring 诊断一致性（源名/行号经 getstackinfos 与错误传播）。
+大部分一致（源名归属、行号、同名/空名/无名、嵌套编译、编译产物与线程/生成器
+交互——`cs_gen` 还钉了"compilestring 产出的 yield 函数**不会**自动变生成器，
+resume 报 `trying to resume a 'function'`"），但抓到 **1 个未修的引擎分歧**：
+
+| # | 项 | 结果 |
+|---|---|---|
+| P28-1 | **bindenv × 编译闭包的裸自由标识符**（**未修**） | `compilestring("return marker", "X").bindenv(env)()`：参考报 `the index 'marker' does not exist`（裸标识符读 root，env 的槽看不见；`setdelegate` 有无无关——A/B/C/E 四形态复现见 `tmp-c2/bind_iso.nut`）；本实现读 env 给 `env-ok`。**普通（文件）闭包** bindenv 两侧都正常。修复需动自由标识符解析与 `_env` 调用路径，超出本轮预算——**延后**，精确复现已入 MIGRATION |
+| P28-2 | `t_surface2` 的盲区（方法论） | 既有用例 `compilestring_env` 只钉了 `return this` 是 **table**——root 也是 table，**区分不了 this=env 还是 this=root**，所以这条分歧躲过了全部既有语料。教训：身份断言要用**独占槽**（如 `("marker" in this)`）而不是 typeof |
+| P28-3 | 一致子集入语料 | `tools/gen_bindenv.py` → `tests-corpus/t_bindenv.nut`（**6 条**：普通闭包 bindenv、编译闭包不 bindenv 时 this=root、bindenv 返回新闭包、编译闭包读全局、bindenv(root)、this==env 判别）；本轮其余一致语义：源名归属（`getstackinfos(1).src`=给定名）、行号（多行源第 3 行抛错 `L3`、`getstackinfos(1).line`=3）、同名/空名/无名（无名源的 src 是 `unnamedbuffer`）、嵌套编译（源名 INNER/OUTER 各自正确）、编译产物与线程/生成器交互 |
+| P28-4 | 附带发现 | `compilestring("return function() { yield 1; }")` 产出的**yield 函数不自动变生成器**：`resume` 报 `trying to resume a 'function',only genenerator can be resumed`（两侧一致）——对比：直接 `function() { yield 1; }` 字面量调用就是生成器。已入语料 `cs_gen` |
+
 
 
 #### P25 完成情况（表键身份 + 循环变量闭包捕获）
