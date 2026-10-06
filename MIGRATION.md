@@ -76,7 +76,9 @@ target\release\sq.exe --mem-limit 64 tmp-c2\p3_mem.nut       # 进程被截停
 | 不可 seek 流上的 `len()/eos()/tell()` | 靠 CRT `ftell`/`fseek`：管道上 `fseek(SEEK_END)` 失败并**丢弃已缓冲输入**（实测 8 字节管道读完 2 字节后剩 6 字节消失），`len()` 返回内部状态（904 等） | `tell()`=已消费字节数、不可 seek 时 `len()`=0；文件重定向下与参考逐字节一致 |
 | `.cnut` 里 outer 类型字段的高 4 字节 | 写 8 字节、字段 4 字节 → 高 4 字节是**未初始化内存**（同脚本连编两次都不同） | 写确定的 0（低 32 位与参考逐位相同，其余字段全同） |
 | `date()` 上界 | UCRT 常量未逐秒定位（32536800000 可用、32536857599 失败） | 取前者为上界 |
+| `escape()` 遇 ≥0x80 字节 | 用 `(char)c` 喂 `%02x`，越界写 scratchpad：**输出串行**、混进别的错误消息片段 | 确定性 32 位补码（`\xffffffe9`），但**我们也不再复刻那次越界** |
 | **容器的超大一次分配**（`array(N)` / `resize(N)` / `blob(N)` 的 N ≥ 2³¹） | 无任何守卫：`array(9223372036854775807)`、`resize(0x7FFFFFFF)` → `0xC0000005` **崩溃**；`resize(4294967296)` → 分配几十 GB，Windows 错误报告把整台机器挂死；`blob(4).readblob(-1)` 同样挂死（负尺寸转无符号后巨型分配） | 按 `MAX_CONTAINER_BYTES`（2 GiB）封顶：超限报**可捕获**的 `container too big`，不 panic、不挂死（`robustness.rs` 的 `container_allocations_are_bounded_and_catchable` 守门）；负尺寸维持原有语义（`resizing to negative length` / `cannot create blob with negative size` / readblob 夹 0）。合法大分配（如 `array(100000, 7)`）不受影响；要更紧的进程级上限用 CLI 的 `--mem-limit` |
+| **高位字节 × 字符串库整体是参考 UB 沼泽** | `toupper/tolower` 把 `(signed char)` 高位字节当负数喂 CRT（UB，输出乱码碎片）；`escape` 的越界读会**污染其后所有 stdout**（同样的字符串，字面量直写、经变量、不同长度，输出的乱码形态都不同、不可复现）；连普通 `len` 的表现都随上下文漂移 | 安全子集与参考一致：**比较是逐字节 memcmp**（`"\xff" <=> "\xffx"` = −1，前缀短者小）、高位字节字符串**可以当表键**（按内容哈希）、`len` 正常。除此之外这一族**不做差分语料**（参考输出不可复现，语料会变成摆设）；本实现侧全部给确定性输出 |
 | **`newthread(<原生闭包>)`** | **创建时即崩溃**（实测 WER 弹窗、无任何输出；`tmp-c2/gt_isolate.py` 逐条隔离）—— 给线程装原生闭包当函数体，参考实现取函数信息时走的是脚本闭包的路径 | 正常创建线程对象（`typeof` = `thread`），调用时报可捕获的 `wrong number of parameters`（`gt_semantics.rs` 的 `newthread_with_native_closure_is_safe_here` 钉住）。正常脚本不会这么写，属安全超集 |
 
 ```bash
