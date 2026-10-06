@@ -30,6 +30,7 @@
 > | P19 | 索引值边界 + 容器分配上限（健壮性缺口） | ✅ 见下 |
 > | P20 | 委托链动力学 + foreach 期间容器变更（验证型） | ✅ 见下 |
 > | P21 | 生成器/线程 × 挂起-恢复 × 异常交错（验证型 + 1 个参考 UB 归档） | ✅ 见下 |
+> | P22 | 类属性：时序/共享/继承边界（验证型） | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
 > 基线：语料 **74/74**、samples **17/17**、编译错误对拍 **60/60**、
@@ -183,6 +184,22 @@ INT64 极值、浮点索引、find 起始偏移都是空白）。索引语义本
 | P21-2 | 线程状态与注入（验证型） | 状态串 `idle/suspended/…`——**没有 "dead"**，跑完回 idle 且**可再 `call()` 重跑**；`wakeup`/`wakeupthrow` 打在 idle 报 `cannot wakeup a idle thread`；**`wakeupthrow` 注入的错误被挂起点外层的 try 接住**；`wakeup` 无参 → suspend 表达式得 `null`、多参忽略；挂起线程 `getstackinfos` → null；**主线程 `suspend()` 两侧同样静默退出**（try 接不住，一致） |
 | P21-3 | **`newthread(<原生闭包>)`**（参考 UB，归档） | 参考实现**创建时即崩溃**（实测 WER 弹窗 ×3、无输出；逐条隔离见 `tmp-c2/gt_isolate.py`）。本实现正常创建、调用报 `wrong number of parameters` —— 安全超集，已记 MIGRATION 偏离表并有守门测试钉住 |
 | P21-4 | 新语料 + 守门测试 | `tools/gen_gtmatrix.py` → `tests-corpus/t_gtmap.nut`（**37 条**，不含两个会中止/挂死参考实现的形态）；`gt_semantics.rs`（3 个测试：生成器生命周期与交错 / 线程 wakeup 与注入 / newthread 原生闭包的安全偏离） |
+
+#### P22 完成情况（类属性：时序/共享/继承边界）
+
+`t_attrmap`（40 条）测的是**形态**（`</ ... />` 写法、基本 get/set、可见性）；
+本轮补**动力学**：实例化后改属性、继承后改父类、给继承来的成员 set/get、
+属性表共享引用、newmember 4 参、clone 边界、参数个数。**验证型**：30 条探针
+两侧逐字节一致，无引擎差异。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P22-1 | 时序与继承（验证型） | 属性挂类上、实例不快照（`setattributes` 后实例透过 `getclass()` 立即可见）；**继承后改父类属性子类不受影响**（extend 拷贝）；父类成员属性在子类**可读可设**；三层继承看最近的重写层；**类级属性（null 键）不随 extends 继承** |
+| P22-2 | 属性表共享引用（验证型） | `getattributes("v").a.n = 42` 对后续读取可见；给属性表**加新键** `x.same = "yes"` 报 `the index does not exist` —— 这是核心语义"普通 `=` 不建新槽"，不是属性特有（初看以为是属性实现差异，隔离后确认是核心语义） |
+| P22-3 | 边界形态（验证型） | `newmember` 4 参 `(name, val, attrs, isstatic)`；`clone` 一个 **class** 报 `cloning a class`；实例没有 `setattributes/getattributes`；`delete C.v` 报 `attempt to delete a slot from a class`；`rawset` 新成员属性 null；`_tostring` 挂属性后 `getattributes("_tostring")` 报 `wrong index`（参考如此）；两个方法的参数个数都是死规矩 |
+| P22-4 | 新语料 + 守门测试 | `tools/gen_attrtiming.py` → `tests-corpus/t_attrtiming.nut`（**28 条**，独立自洽）；`attributes_semantics.rs` 追加 `attribute_timing_sharing_and_inheritance`（24 条断言整段对拍） |
+| P22-5 | 顺带发现的既有隐患 | `tools/gen_attrmap.py` 的用例源是 **gitignored 的 `tmp-c2/attrprobe.nut`**——本地丢了生成器就废。本轮没动它（避免节外生枝），已在此记录 |
+
 
 
 
