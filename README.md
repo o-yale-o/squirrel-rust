@@ -1,8 +1,12 @@
 # squirrel-rust
 
-Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实现
+**Pure-Rust reimplementation of the Squirrel 3.2 scripting language** — Squirrel 3.2 脚本引擎的 Rust 复刻（仅 Windows），基于官方 C++ 实现
 [albertodemichelis/squirrel](https://github.com/albertodemichelis/squirrel)
 逐模块移植，目标是**行为与字节码级兼容**。
+
+> Squirrel VM / interpreter / compiler in pure Rust · byte-identical bytecode & behavior to the C++ reference · embeddable scripting language for games · differential-tested against the original (91-file corpus, 178 tests)
+>
+> **Keywords**: squirrel, squirrel-lang, squirrel VM, rust, rust port, interpreter, virtual machine, bytecode, scripting language, embeddable, game scripting, differential testing, reimplementation, language implementation, sq.exe
 
 ## 兼容性验证（对齐 C++ Win64 默认构建：`_SQ64`、`SQFloat=f32`、非 UNICODE）
 
