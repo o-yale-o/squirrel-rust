@@ -11,3 +11,9 @@ __pycache__/
 diff_test_rw.txt
 diff_test_seekneg.txt
 streammap_tmp.bin
+
+fm_probe_*.bin
+app_t*.bin
+fm_t.bin
+fm_z.bin
+fm_bt.bin
