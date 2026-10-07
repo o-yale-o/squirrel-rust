@@ -195,3 +195,29 @@ fn stderr_dump_applies_at_thread_and_native_boundaries() {
     assert!(!err.contains("[sortcb]"), "{err}");
     assert!(!err.contains("[mm:"), "{err}");
 }
+
+/// P33：compilestring/dofile 的**诊断归属**（语料 `t_diagmap.nut`，10 条，
+/// 验证型——两侧含 stderr 逐字节一致）。钉住：编译代码内
+/// `getstackinfos(1).line` 返回**实际行号**、`.src` 返回给定源名、
+/// 编译错误的 catch 文本不含行号（就是消息本身）。
+#[test]
+fn compilestring_line_and_src_attribution() {
+    let src = r#"
+        function t(tag, f) {
+            try { local v = f(); print(tag + "=ok:" + (typeof v == "string" ? v : "" + v) + "\n"); }
+            catch (e) { print(tag + "=caught:" + e + "\n"); }
+        }
+        t("si_line", function() { local f = compilestring("local a = 1\nlocal b = 2\nreturn getstackinfos(1).line", "SI"); return f(); });
+        t("si_src", function() { local f = compilestring("return getstackinfos(1).src", "SI2"); return f(); });
+        t("cs_syn", function() { local f = compilestring("local a = 1\nlocal b = 2\nlocal c = (", "S3"); return "compiled"; });
+        t("cs_syn_deep", function() { local f = compilestring("\n\n\n\n\n\n\n\n\n\nbad(", "SDEEP"); return "compiled"; });
+    "#;
+    let (out, _err) = run_capture(src);
+    assert_eq!(out.lines().find(|l| l.starts_with("si_line=")).unwrap(), "si_line=ok:3", "第 3 行的 getstackinfos(1).line 返回 3");
+    assert_eq!(out.lines().find(|l| l.starts_with("si_src=")).unwrap(), "si_src=ok:SI2", ".src 返回给定的源名");
+    assert!(
+        out.lines().find(|l| l.starts_with("cs_syn=")).unwrap().starts_with("cs_syn=caught:expression expected"),
+        "编译错误 catch 文本不含行号"
+    );
+    assert!(out.lines().find(|l| l.starts_with("cs_syn_deep=")).unwrap().starts_with("cs_syn_deep=caught:expression expected"));
+}

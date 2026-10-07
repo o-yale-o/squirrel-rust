@@ -41,6 +41,8 @@
 > | P30 | 表迭代顺序 × 随机变更序列（生成式差分 80 程序零差异，验证型） | ✅ 见下 |
 > | P31 | dofile/loadfile 边界矩阵（验证型） | ✅ 见下 |
 > | P32 | **file 文本模式翻译**（真 bug：`\n` 不落盘 `\r\n`）+ b+t 拒绝 | ✅ 见下 |
+> | P33 | compilestring/dofile 诊断归属（验证型） | ✅ 见下 |
+> | P33 | compilestring/dofile 诊断归属（验证型） | ✅ 见下 |
 > | P29 | bindenv 分歧的**根因收敛**：参考侧行为随调用结构漂移，判定不复刻 | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
@@ -302,6 +304,22 @@ file 的模式串只出现过 5 种（wb+/rb/wb/w/ab）——**文本模式**（
 | P32-2 | **`b` 与 `t` 同用**（参考崩溃 → 有意偏离） | `file(p,"wbt")`：参考 fopen 判无效参数 → `0xC0000409` 崩溃（实测 rc=3221226505）；本实现给可捕获的 `cannot open file`。`mode_is_valid` 拒绝 b+t 组合 |
 | P32-3 | 新语料 + 守门测试 | `tools/gen_filemodes.py` → `tests-corpus/t_filemodes.nut`（**15 种模式** × 写入/tell/len/读回，`wbt` 按纪律剔除——参考崩溃无法对拍）；`stream_semantics.rs` 追加 `text_mode_translation_and_bt_rejection` |
 | P32-4 | 驱动纪律（再记） | file_modes 驱动初版 16 用例**共享同一个探针文件**且顺序执行——追加模式的历史在两侧分叉（尤其 wbt 崩溃后），制造出假差异。修法：每用例独立文件名 + 脚本内自删；与前几轮的"逐条隔离"互补 |
+
+#### P33 完成情况（compilestring/dofile 诊断归属：验证型）
+
+`errmsg_matrix` 测**文件编译**的错误文本、`t_errdumpframes` 测**线程/原生边界**
+的转储——**compilestring/dofile 的源名与行号归属**（多行源的运行期错误行号、
+`getstackinfos(1).line` 在编译代码内的取值、嵌套 dofile 的转储源名链）没有用例。
+**验证型**：12 行 stdout + 完整 stderr（含跨 dofile 嵌套的转储）两侧逐字节一致，
+无引擎差异。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P33-1 | `getstackinfos(1).line` 在编译代码内返回**实际行号** | 多行源第 3 行 → 3；`.src` 返回 `compilestring` 给定的源名。`si_line`/`si_src` 钉住 |
+| P33-2 | 编译错误的 catch 文本**不含行号** | 就是 `expression expected` 这类消息本身；行号只在 stderr 的编译处理器输出里（`行 = (N) 列 = (M)` 格式），且多行源与单行源形态一致 |
+| P33-3 | **嵌套 dofile** 的转储源名链 | `d4.nut`→`dofile()`→`d3.nut`→`dofile()`→主脚本，逐层 CALLSTACK/LOCALS 逐字节一致（`df_nested` 钉住） |
+| P33-4 | 新语料 + 守门测试 | `tools/gen_diagmap.py` → `tests-corpus/t_diagmap.nut`（**10 条**，脚本自建自删伴生文件）；`exception_semantics.rs` 追加 `compilestring_line_and_src_attribution` |
+
 
 
 
