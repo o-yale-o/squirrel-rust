@@ -208,6 +208,16 @@ pub struct FileBackend {
     pos: SQInteger,
     /// 标准流是否为可 seek 的磁盘文件（重定向自文件时为真）
     std_disk_size: Option<SQInteger>,
+    /// **文本模式**（模式串无 `b`，或显式 `t` 且无 `b`）：写入 LF→CRLF、读取
+    /// CRLF→LF 且遇 Ctrl+Z 截断、seek 后读裸字节。参考实现走 CRT 文本流。
+    text: bool,
+    /// 文本读的**单字节回推**：翻译需要偷看下一字节（\r 后面是不是 \n），
+    /// 而偷看的字节已从队列消费时暂存于此
+    pushback: Vec<u8>,
+    /// 文本读：已遇 Ctrl+Z，后续读取直接 EOF（CRT 文本流语义）
+    text_eof: bool,
+    /// seek 之后参考实现读出的是**裸字节**（绕过翻译，实测 seek(2) 读到 10）
+    raw_after_seek: bool,
 }
 
 /// 标准流句柄信息：是否是磁盘文件、文件多大
@@ -271,6 +281,11 @@ fn mode_is_valid(mode: &str) -> bool {
             _ => return false,
         }
     }
+    // ↔ `b` 与 `t` 同用：参考实现把模式串交给 fopen 后 CRT 判为无效参数 →
+    // `0xC0000409` 崩溃（实测 `file(p,"wbt")`）。本实现给**可捕获**错误。
+    if mode.contains('b') && mode.contains('t') {
+        return false;
+    }
     true
 }
 
@@ -320,6 +335,11 @@ impl FileBackend {
                 std_fd: None,
                 pos: 0,
                 std_disk_size: None,
+                // ↔ CRT：模式串无 `b` 即文本模式（`t` 显式指定也是文本）
+                text: !mode.contains('b'),
+                pushback: Vec::new(),
+                text_eof: false,
+                raw_after_seek: false,
             }),
             Err(_) => None,
         }
@@ -331,13 +351,87 @@ impl FileBackend {
             std_fd: Some(fd),
             pos: 0,
             std_disk_size: size,
+            // 标准流保持二进制语义（控制台/管道已由 stdin_eof 等测试钉住）
+            text: false,
+            pushback: Vec::new(),
+            text_eof: false,
+            raw_after_seek: false,
         }
     }
 }
 
 impl StreamBackend for FileBackend {
     fn read(&mut self, out: &mut [u8]) -> SQInteger {
+        // 文本模式且刚 seek 过：参考实现读出的是**裸字节**（绕过翻译，实测
+        // seek(2) 后读到物理字节 10）。保持 raw 直到关闭/重写。
+        let raw = !self.text || self.raw_after_seek;
+        if self.text && self.text_eof && !raw {
+            return 0;
+        }
         let n = if let Some(h) = &self.handle {
+            if self.text && !raw && !self.text_eof {
+                // ↔ CRT 文本读：CRLF→LF、遇 Ctrl+Z（0x1A）按 EOF 截断。
+                // 实现：把原始块读进队列，翻译写进 out；**没消费完的原始字节**
+                // 存回 pushback（下轮优先），跨块 CRLF 天然正确。
+                let mut logical = 0usize;
+                let mut leftover: Vec<u8> = Vec::new();
+                while logical < out.len() && !self.text_eof {
+                    let mut queue: Vec<u8> = std::mem::take(&mut self.pushback);
+                    queue.extend_from_slice(&leftover);
+                    leftover.clear();
+                    if queue.is_empty() {
+                        let mut buf = [0u8; 4096];
+                        let n = match h.borrow_mut().read(&mut buf) {
+                            Ok(n) => n,
+                            Err(_) => 0,
+                        };
+                        self.pos += n as SQInteger;
+                        if n == 0 {
+                            self.text_eof = true;
+                            break;
+                        }
+                        queue.extend_from_slice(&buf[..n]);
+                    }
+                    while logical < out.len() {
+                        let c = match queue.first() {
+                            Some(c) => *c,
+                            None => break,
+                        };
+                        queue.remove(0);
+                        if c == 0x1A {
+                            self.text_eof = true;
+                            break;
+                        }
+                        if c == b'\r' {
+                            let nxt = queue.first().copied();
+                            match nxt {
+                                Some(b'\n') => {
+                                    queue.remove(0);
+                                    out[logical] = b'\n';
+                                    logical += 1;
+                                }
+                                Some(n2) => {
+                                    queue.remove(0);
+                                    out[logical] = b'\r';
+                                    logical += 1;
+                                    leftover.push(n2);
+                                }
+                                None => {
+                                    // 队列耗尽：\r 先输出（其后是否有 \n 下轮再定）
+                                    out[logical] = b'\r';
+                                    logical += 1;
+                                }
+                            }
+                        } else {
+                            out[logical] = c;
+                            logical += 1;
+                        }
+                    }
+                    queue.extend_from_slice(&leftover);
+                    self.pushback = queue;
+                }
+                return logical as SQInteger;
+            }
             match h.borrow_mut().read(out) {
                 Ok(n) => n as SQInteger,
                 Err(_) => 0,
@@ -366,9 +460,29 @@ impl StreamBackend for FileBackend {
     }
     fn write(&mut self, data: &[u8]) -> SQInteger {
         let n = if let Some(h) = &self.handle {
-            match h.borrow_mut().write(data) {
-                Ok(n) => n as SQInteger,
-                Err(_) => 0,
+            if self.text {
+                // ↔ CRT 文本模式写：`\n`（0x0A）落盘为 `\r\n`。实测：
+                // file(p,"w") 写 97,10,98 → 磁盘 97,13,10,98；tell/len 报物理字节数。
+                let mut phys: Vec<u8> = Vec::with_capacity(data.len() + 8);
+                for &c in data {
+                    if c == b'\n' {
+                        phys.push(b'\r');
+                    }
+                    phys.push(c);
+                }
+                self.raw_after_seek = false;
+                let n = match h.borrow_mut().write(&phys) {
+                    Ok(n) => n as SQInteger,
+                    Err(_) => 0,
+                };
+                self.pos += n;
+                n
+            } else {
+                self.raw_after_seek = false;
+                match h.borrow_mut().write(data) {
+                    Ok(n) => n as SQInteger,
+                    Err(_) => 0,
+                }
             }
         } else if self.std_fd.is_some() {
             let r = match self.std_fd {
@@ -448,6 +562,10 @@ impl StreamBackend for FileBackend {
             match f.seek(pos) {
                 Ok(p) => {
                     self.pos = p as SQInteger;
+                    // ↔ 实测：文本模式 seek 之后读出的是**裸字节**（seek(2) 读到
+                    // 物理字节 10，未经 CRLF→LF 翻译）。保持 raw 直到下一次写入。
+                    self.raw_after_seek = true;
+                    self.pushback.clear();
                     0
                 }
                 Err(_) => -1,

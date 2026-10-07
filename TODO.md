@@ -40,7 +40,7 @@
 > | P29 | bindenv 分歧的**根因收敛**：参考侧行为随调用结构漂移，判定不复刻 | ✅ 见下 |
 > | P30 | 表迭代顺序 × 随机变更序列（生成式差分 80 程序零差异，验证型） | ✅ 见下 |
 > | P31 | dofile/loadfile 边界矩阵（验证型） | ✅ 见下 |
-> | P31 | dofile/loadfile 边界矩阵（验证型） | ✅ 见下 |
+> | P32 | **file 文本模式翻译**（真 bug：`\n` 不落盘 `\r\n`）+ b+t 拒绝 | ✅ 见下 |
 > | P29 | bindenv 分歧的**根因收敛**：参考侧行为随调用结构漂移，判定不复刻 | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
@@ -290,6 +290,19 @@ MIGRATION（新增"参考侧行为随调用结构漂移"一行）。
 | P31-2 | 第 2 参语义 | printerror 只控制 stderr 打印，**不影响抛错**——`false` 也照样抛 `cannot open the file`；`loadfile` 的第 2 参同理 |
 | P31-3 | 穿透与副作用 | dofile 返回文件的 return 值、文件里 `<-` 的槽进**根表**、文件中途抛错**穿透**到调用方（before 打印 after 不打印）；loadfile 闭包**可重复调用**（每次完整重跑）；语法错文件的编译错误同样穿透 |
 | P31-4 | 新语料 + 守门测试 | `tools/gen_dofilemap.py` → `tests-corpus/t_dofilemap.nut`（**23 条**，脚本自建自删伴生文件、无残留）；`stream_semantics.rs` 追加 `dofile_loadfile_boundaries` |
+
+#### P32 完成情况（file 文本模式翻译：真 bug）
+
+file 的模式串只出现过 5 种（wb+/rb/wb/w/ab）——**文本模式**（无 `b` 的所有模式）
+完全没测过。file_modes 驱动（逐条隔离 + 弹窗抑制）一跑就抓到 **10/16 形态差异**。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P32-1 | **文本模式翻译缺失**（**真 bug**，已修） | 参考实现走 CRT 文本流：写入 `\n` 落盘 `\r\n`（`file(p,"w")` 写 97,10,98 → 磁盘 97,**13**,10,98）、读取 CRLF→LF、**遇 Ctrl+Z（0x1A）截断**（读短 → readn 报 `io error`）；seek 后读**裸字节**（绕过翻译，实测 seek(2) 读到物理 10）；`tell/len` 报**物理字节数**。我们永远二进制——写文本文件的真实脚本落盘字节与参考不同。已实现（`FileBackend` 的 `text/pushback/text_eof/raw_after_seek` 状态 + LF→CRLF 写翻译 + CRLF→LF 读翻译 + Ctrl+Z 截断 + seek 后 raw） |
+| P32-2 | **`b` 与 `t` 同用**（参考崩溃 → 有意偏离） | `file(p,"wbt")`：参考 fopen 判无效参数 → `0xC0000409` 崩溃（实测 rc=3221226505）；本实现给可捕获的 `cannot open file`。`mode_is_valid` 拒绝 b+t 组合 |
+| P32-3 | 新语料 + 守门测试 | `tools/gen_filemodes.py` → `tests-corpus/t_filemodes.nut`（**15 种模式** × 写入/tell/len/读回，`wbt` 按纪律剔除——参考崩溃无法对拍）；`stream_semantics.rs` 追加 `text_mode_translation_and_bt_rejection` |
+| P32-4 | 驱动纪律（再记） | file_modes 驱动初版 16 用例**共享同一个探针文件**且顺序执行——追加模式的历史在两侧分叉（尤其 wbt 崩溃后），制造出假差异。修法：每用例独立文件名 + 脚本内自删；与前几轮的"逐条隔离"互补 |
+
 
 
 

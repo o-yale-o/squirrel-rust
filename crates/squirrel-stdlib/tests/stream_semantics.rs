@@ -379,6 +379,76 @@ fn backend_released_when_instance_dies() {
     let _ = std::fs::remove_file(&dir);
 }
 
+/// **文本模式**（模式串无 `b`）：写入 LF→CRLF、读取 CRLF→LF 且遇 Ctrl+Z 截断、
+/// seek 后读裸字节、tell/len 报物理字节数——全部与参考逐字节一致
+/// （语料 `t_filemodes.nut`，15 种模式）。
+///
+/// `b` 与 `t` 同用（`"wbt"`）：参考实现 fopen 判无效参数 → `0xC0000409`
+/// **崩溃**（`tmp-c2/file_modes.py` 实测 rc=3221226505）；本实现给**可捕获**的
+/// `cannot open file`——有意偏离（与偏离表"非法模式串"条目同类），在此钉住。
+#[test]
+fn text_mode_translation_and_bt_rejection() {
+    let src = r#"
+        function t(tag, f) {
+            try { local v = f(); print(tag + "=" + (typeof v == "string" ? v : "" + v) + "\n"); }
+            catch (e) { print(tag + "!" + e + "\n"); }
+        }
+        t("w_text", function() {
+            local f = file("tmp_st_txt.bin", "w");
+            f.writen(97, 'b'); f.writen(10, 'b'); f.writen(98, 'b');
+            return f.tell() + "/" + f.len();
+        });
+        t("r_text_short", function() {
+            local f = file("tmp_st_txt.bin", "r");
+            local a = f.readn('b'); local b = f.readn('b'); local c = f.readn('b'); local d = f.readn('b');
+            return a + "," + b + "," + c + "," + d;
+        });
+        t("ctrlz_bin", function() {
+            local f = file("tmp_st_cz.bin", "wb");
+            f.writen(65, 'b'); f.writen(26, 'b'); f.writen(66, 'b');
+            f.close();
+            local g = file("tmp_st_cz.bin", "rb");
+            local a = g.readn('b'); local b = g.readn('b'); local c = g.readn('b');
+            return a + "," + b + "," + c;
+        });
+        t("ctrlz_text", function() {
+            local g = file("tmp_st_cz.bin", "r");
+            local a = g.readn('b'); local b = g.readn('b'); local c = g.readn('b');
+            return a + "," + b + "," + c;
+        });
+        t("wbt", function() {
+            local f = file("tmp_st_bt.bin", "wbt");
+            f.writen(97, 'b'); f.writen(10, 'b'); f.writen(98, 'b');
+            f.close();
+            local g = file("tmp_st_bt.bin", "rb");
+            local n = g.len();
+            g.close();
+            remove("tmp_st_bt.bin");
+            return "opened len=" + n;
+        });
+        remove("tmp_st_txt.bin");
+        remove("tmp_st_cz.bin");
+    "#;
+    let (out, _err) = run_capture(src);
+    assert_eq!(line(&out, "w_text"), "w_text=4/4", "文本写 tell/len 报物理字节数");
+    assert_eq!(
+        line(&out, "r_text_short"),
+        "r_text_short!io error",
+        "CRLF→LF 翻译后 4 字节请求只得 3 → io error"
+    );
+    assert_eq!(line(&out, "ctrlz_bin"), "ctrlz_bin=65,26,66");
+    assert_eq!(
+        line(&out, "ctrlz_text"),
+        "ctrlz_text!io error",
+        "文本读遇 Ctrl+Z 截断 → io error"
+    );
+    assert_eq!(
+        line(&out, "wbt"),
+        "wbt!cannot open file",
+        "b+t 同用：参考实现崩溃，本实现给可捕获错误（有意偏离）"
+    );
+}
+
 /// P31：`dofile`/`loadfile` 的**边界形态**（语料 `t_dofilemap.nut`，23 条，验证型
 /// ——两侧逐字节一致）。守门核心：
 ///
