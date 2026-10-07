@@ -42,7 +42,7 @@
 > | P31 | dofile/loadfile 边界矩阵（验证型） | ✅ 见下 |
 > | P32 | **file 文本模式翻译**（真 bug：`\n` 不落盘 `\r\n`）+ b+t 拒绝 | ✅ 见下 |
 > | P33 | compilestring/dofile 诊断归属（验证型） | ✅ 见下 |
-> | P33 | compilestring/dofile 诊断归属（验证型） | ✅ 见下 |
+> | P34 | enum/const 语义矩阵（验证型） | ✅ 见下 |
 > | P29 | bindenv 分歧的**根因收敛**：参考侧行为随调用结构漂移，判定不复刻 | ✅ 见下 |
 > | P0 | **C ABI**（141 个 `sq_*` + 33 个 `sqstd_*`） | ⏸ 等确认：只用命令行→不需要；要嵌 C/C++ 宿主→主线 |
 >
@@ -319,6 +319,23 @@ file 的模式串只出现过 5 种（wb+/rb/wb/w/ab）——**文本模式**（
 | P33-2 | 编译错误的 catch 文本**不含行号** | 就是 `expression expected` 这类消息本身；行号只在 stderr 的编译处理器输出里（`行 = (N) 列 = (M)` 格式），且多行源与单行源形态一致 |
 | P33-3 | **嵌套 dofile** 的转储源名链 | `d4.nut`→`dofile()`→`d3.nut`→`dofile()`→主脚本，逐层 CALLSTACK/LOCALS 逐字节一致（`df_nested` 钉住） |
 | P33-4 | 新语料 + 守门测试 | `tools/gen_diagmap.py` → `tests-corpus/t_diagmap.nut`（**10 条**，脚本自建自删伴生文件）；`exception_semantics.rs` 追加 `compilestring_line_and_src_attribution` |
+
+#### P34 完成情况（enum/const 语义矩阵：验证型）
+
+enum/const 在语料里只有零星主干（t_const/t_surface4/5 共 ~8 条）——**编译期
+内联语义**完全没钉。本轮为**验证型**：25 条探针两侧逐字节一致，无引擎差异。
+
+| # | 项 | 结果 |
+|---|---|---|
+| P34-1 | **enum/const 是纯编译期内联** | 声明后**连根表槽都没有**——`("E_AUTO" in getroottable())` 为 false，值直接替换进字节码。反直觉（初看以为 enum 会建一个根表槽） |
+| P34-2 | **显式值不带动后续递增**（反直觉） | `{A = 5, B, C}` → B=0, C=1（**不是** 6/7！）；浮点值 `{A=1.5,B}` → B=0。两侧一致 |
+| P34-3 | **重复项后值覆盖** | `{A = 1, A = 2}` → A=2（**不是**先到先得）。两侧一致 |
+| P34-4 | **成员值必须是字面量** | 表达式 `A = 1 + 2` 报 `expected 'IDENTIFIER'`；自引用 `B = A + 10` 报 `scalar expected : integer, float, or string`（const 引用 enum 成员同报错）；字符串/浮点/INT64_MAX 字面量合法 |
+| P34-5 | **函数体内 enum 合法**（与 const 不同） | `function() { enum Q { A } return Q.A; }` 编译通过且 Q.A=0 |
+| P34-6 | const 特有 | 值不接受表达式（`1+2` 报 `end of statement expected`）；重定义不报错（后值覆盖）；`delete const名` 报 `can't delete an expression`；局部可遮蔽 |
+| P34-7 | 新语料 + 守门测试 | `tools/gen_enummap.py` → `tests-corpus/t_enummap.nut`（**25 条**）；新增 `enum_const_semantics.rs`（enum + const 两个测试，22 条断言） |
+| P34-8 | 生成器纪律 | 语料的 enum/const 声明**直接写在函数体里**（编译期内联）——不能经 compilestring 的用例（成员值表达式等编译错形态）必须走 compilestring 让错误可 catch，否则编译错杀死整个语料文件（初版踩过） |
+
 
 
 
